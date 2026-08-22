@@ -11,6 +11,11 @@
 # The Gatekeeper paragraph is appended rather than kept in the changelog: it is
 # about the download, not about the version, and stays true of every build until
 # one is notarized.
+#
+# The output is reflowed to one line per paragraph. GitHub renders a release
+# body with hard breaks on -- a single newline is a <br>, the way it is in a
+# comment -- so the changelog's 76-column wrapping would show up as a ragged
+# break after every line. The file stays wrapped for reading in the repo.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,7 +40,20 @@ if [ -z "$BODY" ]; then
   exit 1
 fi
 
-cat <<EOF
+# Rejoin what the changelog wrapped. A blank line, a heading and the start of a
+# list item each begin something new; anything else is a continuation of the
+# line above and is folded into it. Fenced code is passed through untouched --
+# its line breaks are the point.
+cat <<EOF | awk '
+  function flush() { if (buf != "") { print buf; buf = "" } }
+  /^[[:space:]]*```/                             { flush(); fence = !fence; print; next }
+  fence                                          { print; next }
+  /^[[:space:]]*$/                               { flush(); print ""; next }
+  /^#+ /                                          { flush(); print; next }
+  /^[[:space:]]*([-*+]|[0-9]+\.)[[:space:]]/     { flush(); buf = $0; next }
+  { line = $0; sub(/^[[:space:]]+/, "", line); buf = (buf == "" ? line : buf " " line) }
+  END { flush() }
+'
 $BODY
 
 ---
