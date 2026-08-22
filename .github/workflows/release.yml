@@ -35,10 +35,14 @@ jobs:
 
       - run: scripts/build-app.sh
 
+      # Notes come from CHANGELOG.md, so a release says what the changelog
+      # says. A tag with no section there fails here rather than publishing
+      # an empty release.
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          scripts/release-notes.sh "$(node -p "require('./package.json').version")" > dist/release-notes.md
           gh release create "${GITHUB_REF_NAME}" dist/Caden-*.dmg \
             --title "Caden ${GITHUB_REF_NAME}" \
-            --notes "First launch is blocked by Gatekeeper (the app is not notarized): open it once, then System Settings → Privacy & Security → Open Anyway. See the README for details."
+            --notes-file dist/release-notes.md

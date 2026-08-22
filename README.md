@@ -195,7 +195,8 @@ app/verify/            tooling for diffing Caden's DOM against a live Cursor
 server/heartbeat.py    the daemon: sessions, engines, SSE, installs (stdlib only)
 server/bootstrap.sh    provisioning: finds python3, starts heartbeat, returns a token
 server/supervise.sh    crash/reboot supervision: systemd user service or cron watchdog
-scripts/               build-app.sh, provision.sh, dev-seed.sh, screenshots.mjs
+scripts/               build-app.sh, provision.sh, dev-seed.sh, screenshots.mjs,
+                       release-notes.sh (the notes a release carries, from CHANGELOG.md)
 tests/                 run-all.sh, the client suite and the offline-install suite
 docs/ARCHITECTURE.md   how the pieces fit, and the event vocabulary
 docs/API.md            the daemon's HTTP surface

@@ -147,7 +147,8 @@ app/verify/            把 Caden 的 DOM 和一个真实 Cursor 做对比的工�
 server/heartbeat.py    daemon：会话、引擎、SSE、安装（只用标准库）
 server/bootstrap.sh    provision：找到 python3、启动 heartbeat、返回 token
 server/supervise.sh    崩溃/重启看护：systemd user service 或 cron 看门狗
-scripts/               build-app.sh、provision.sh、dev-seed.sh、screenshots.mjs
+scripts/               build-app.sh、provision.sh、dev-seed.sh、screenshots.mjs、
+                       release-notes.sh（release 用的说明，取自 CHANGELOG.md）
 tests/                 run-all.sh、客户端测试套件、离线安装测试套件
 docs/ARCHITECTURE.md   各部分如何拼在一起，以及事件词汇表
 docs/API.md            daemon 的 HTTP 接口
