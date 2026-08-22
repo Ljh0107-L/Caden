@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest and newest: the daemon claims Python 3.6+ on the server, but
+        # setup-python cannot reliably provision 3.6 on modern runners, so 3.9
+        # is the floor here (it also matches the author's machine). Bump the
+        # README claim down to 3.9+ or add a 3.6 job if that matters.
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Syntax check
+        run: |
+          set -e
+          python3 -m py_compile server/heartbeat.py tests/*.py app/verify/*.py
+          for f in app/*.js app/web/*.js tests/*.mjs; do node --check "$f"; done
+          bash -n server/bootstrap.sh scripts/*.sh tests/run-all.sh
+
+      - name: Test suite
+        run: bash tests/run-all.sh
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Playwright is the only node_modules piece this job needs; skip the
+      # Electron binary download it would otherwise pull.
+      - run: ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm install
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e

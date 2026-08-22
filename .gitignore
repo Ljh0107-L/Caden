@@ -1,0 +1,18 @@
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
+out/
+dist/
+artifacts/
+*.tgz
+*.tar.gz
+*.tar.xz
+
+# Style-parity reference captures: probes of a live app, taken locally.
+# They carry whatever was on screen when captured, so they stay out of git.
+app/verify/baseline/

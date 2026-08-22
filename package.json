@@ -1,0 +1,19 @@
+{
+  "name": "caden",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A desktop console for running Claude Code and Codex on your servers.",
+  "main": "app/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "scripts/build-app.sh",
+    "dev": "node app/server.js 8790",
+    "test": "tests/run-all.sh",
+    "test:e2e": "node tests/e2e/session.mjs"
+  },
+  "devDependencies": {
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "electron": "^33.0.0",
+    "playwright": "^1.58.0"
+  }
+}

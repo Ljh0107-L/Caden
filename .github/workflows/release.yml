@@ -1,0 +1,44 @@
+name: Release
+
+# Build the DMG and publish a GitHub Release. Tag a commit with the version
+# from package.json:
+#
+#   git tag v0.1.0 && git push --tags
+#
+# The app is ad-hoc signed and not notarized, so first launch on another
+# machine is the Privacy & Security "Open Anyway" dance -- the release notes
+# say so, and README walks through it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Version matches the tag
+        run: |
+          V="v$(node -p "require('./package.json').version")"
+          [ "$V" = "${GITHUB_REF_NAME}" ] \
+            || { echo "tag ${GITHUB_REF_NAME} does not match package.json ($V)"; exit 1; }
+
+      - run: npm install
+
+      - run: scripts/build-app.sh
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/Caden-*.dmg \
+            --title "Caden ${GITHUB_REF_NAME}" \
+            --notes "First launch is blocked by Gatekeeper (the app is not notarized): open it once, then System Settings → Privacy & Security → Open Anyway. See the README for details."

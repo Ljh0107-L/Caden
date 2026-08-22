@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!-- Copyright (c) 2026 Ljh0107-L. SPDX-License-Identifier: MIT -->
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Caden</title>
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:;">
+  <!-- Declared first = lowest layer priority: bare-element resets must never
+       beat the component rules that follow. -->
+  <style>@layer caden-reset;</style>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-sidebar-position="left">
+  <div id="app">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="main" id="main"></div>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
