@@ -43,6 +43,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           scripts/release-notes.sh "$(node -p "require('./package.json').version")" > dist/release-notes.md
-          gh release create "${GITHUB_REF_NAME}" dist/Caden-*.dmg \
-            --title "Caden ${GITHUB_REF_NAME}" \
-            --notes-file dist/release-notes.md
+
+          # Create on the first run, update on a re-run. A run that uploaded the
+          # DMG and then failed afterwards used to be unrepeatable: the retry hit
+          # "release already exists" and stopped. Re-running is now the fix for a
+          # half-finished publish rather than another way to fail.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "Caden ${GITHUB_REF_NAME}" \
+              --notes-file dist/release-notes.md
+            gh release upload "${GITHUB_REF_NAME}" dist/Caden-*.dmg --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/Caden-*.dmg \
+              --title "Caden ${GITHUB_REF_NAME}" \
+              --notes-file dist/release-notes.md
+          fi
