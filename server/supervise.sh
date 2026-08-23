@@ -104,8 +104,32 @@ cron_line_watch() {
     "$HOME_DIR" "$HOME_DIR" "$PORT" "$TAG"
 }
 
+# A line is ours only if it carries our tag *and* names our home. The tag
+# alone is not enough: every home whose basename falls outside the
+# `.caden-<flavor>` convention shares `heartbeat-supervise` with `~/.caden`,
+# so uninstalling supervision for, say, `~/.caden-test/supervise` used to grep
+# production's two lines out along with its own -- and with nothing left,
+# `cron_uninstall` went on to remove the whole crontab. The lines have carried
+# `--home <dir> --port` since the first release, so an existing crontab
+# written by an older build still matches.
+#
+# `case` rather than `grep`, because a home path is not a regular expression.
+is_our_cron_line() {
+  case "$1" in
+    *"# $TAG") ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *" --home $HOME_DIR --port "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 cron_current() {
-  "$CRON" -l 2>/dev/null | grep -v "$TAG" || true
+  "$CRON" -l 2>/dev/null | while IFS= read -r line; do
+    is_our_cron_line "$line" && continue
+    printf '%s\n' "$line"
+  done
 }
 
 cron_install() {

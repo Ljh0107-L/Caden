@@ -99,8 +99,25 @@ def main():
     for name in ("heartbeat.py", "bootstrap.sh", "supervise.sh"):
         shutil.copy(os.path.join(SERVER, name), os.path.join(home, name))
     tmp = tempfile.mkdtemp(prefix="caden-sup-")
-    fake_cron = write_fake(tmp, "crontab", FAKE_CRONTAB)
+    # The fake crontab goes on PATH as well as being passed by name, because
+    # naming it is not enough. `supervise.sh uninstall` tears down both
+    # mechanisms whichever one installed the supervision, so the systemd walk
+    # reaches the crontab too -- and its env set CADEN_SYSTEMCTL but not
+    # CADEN_CRON_CMD, which left `crontab` resolving to the real binary. On a
+    # machine whose own `~/.caden` is supervised by cron that is not a stray
+    # write, it is the developer's production watchdog: same tag, so uninstall
+    # stripped those lines, and with nothing left it ran `crontab -r`.
+    #
+    # A shim directory means a walk that forgets the variable still cannot
+    # reach the real one, which is the property worth having -- the next walk
+    # someone adds will forget it too.
+    shim = os.path.join(tmp, "shim")
+    os.makedirs(shim)
+    fake_cron = write_fake(shim, "crontab", FAKE_CRONTAB)
     fake_sys = write_fake(tmp, "systemctl", FAKE_SYSTEMCTL)
+    os.environ["PATH"] = shim + os.pathsep + os.environ["PATH"]
+    # And somewhere for the shim to write when nobody said where.
+    os.environ["CADEN_FAKE_CRONTAB"] = os.path.join(tmp, "crontab-unclaimed.txt")
 
     # ------------------------------------------------------- cron watchdog
     print("== cron watchdog")
@@ -253,6 +270,33 @@ def main():
     check("removing dev leaves production's crontab lines",
           len(lines) == 2 and all("heartbeat-supervise" in l for l in lines),
           str(lines))
+    subprocess.run(sup + ["uninstall", "--home", prod_home],
+                   env=env, capture_output=True, text=True)
+
+    # A home outside the `.caden-<flavor>` convention -- a test home, a custom
+    # one -- gets no suffix, so it carries the *same* tag as `~/.caden`.
+    # Removing its supervision used to grep out every line with that tag,
+    # production's included, and then delete the crontab because nothing was
+    # left. The tag cannot be the discriminator; the home has to be.
+    odd_home = os.path.join(two, "somewhere-else")
+    os.makedirs(odd_home)
+    cron_tab = os.path.join(tmp, "crontab-shared-tag.txt")
+    env = dict(os.environ, CADEN_SUPERVISOR="cron", CADEN_CRON_CMD=fake_cron,
+               CADEN_FAKE_CRONTAB=cron_tab,
+               CADEN_UNIT_DIR=os.path.join(tmp, "no-unit-here"))
+    for h, p_ in ((prod_home, port + 6), (odd_home, port + 7)):
+        subprocess.run(sup + ["install", "--home", h, "--port", str(p_),
+                              "--python", sys.executable],
+                       env=env, capture_output=True, text=True)
+    check("both homes install under one tag",
+          sum("heartbeat-supervise" in l for l in cron_lines(cron_tab)) == 4,
+          str(cron_lines(cron_tab)))
+    subprocess.run(sup + ["uninstall", "--home", odd_home],
+                   env=env, capture_output=True, text=True)
+    lines = cron_lines(cron_tab) if os.path.exists(cron_tab) else []
+    check("removing a same-tag home leaves the other's lines",
+          len(lines) == 2 and all(prod_home in l for l in lines), str(lines))
+    check("and does not delete the crontab", os.path.exists(cron_tab))
     subprocess.run(sup + ["uninstall", "--home", prod_home],
                    env=env, capture_output=True, text=True)
 
