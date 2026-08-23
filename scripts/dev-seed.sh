@@ -1,17 +1,25 @@
 #!/bin/bash
 # Copyright (c) 2026 Ljh0107-L. SPDX-License-Identifier: MIT
 
-# Development helper: runs a heartbeat instance locally and points the app at it in
-# "direct HTTP" mode, so the UI can be exercised without a server or a tunnel.
+# Development helper: runs a heartbeat instance locally, so the UI can be
+# exercised without a server or a tunnel.
 #
 #   scripts/dev-seed.sh            # seed the development install
 #   scripts/dev-seed.sh --clean    # undo it
 #
-# Everything it writes belongs to the development flavor: the config under
+# Everything it touches belongs to the development flavor: the config under
 # "Application Support/Caden Dev" and a daemon in ~/.caden-dev. It used to write
 # the real config.json and set `lastServer`, so running it once pointed the app
 # you actually use at a throwaway daemon. See app/flavor.js -- the paths below
 # come from there rather than being spelled out again.
+#
+# It deliberately does not add a server. The app adds this machine itself, as
+# "This Mac", the first time it starts against an empty config
+# (`ensureLocalServer` in app/host.js). Seeding an entry of our own used to
+# stand in front of that: the app found a direct server already there and left
+# its own path unrun, so the development install showed a "localhost (dev)" that
+# production has no equivalent of -- a difference in the one place that exists
+# to behave exactly like production.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -43,40 +51,24 @@ mkdir -p "$DEV_HOME" "$SUPPORT"
 cp server/heartbeat.py "$DEV_HOME/heartbeat.py"
 CADEN_HOME="$DEV_HOME" sh server/bootstrap.sh --home "$DEV_HOME" --port "$PORT" >/dev/null
 
-python3 - "$CONFIG" "$PORT" "$DEV_HOME" <<'PY'
-import json, os, sys, uuid
-config_path, port, dev_home = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+# The defaults only -- `servers` stays empty and unset, which is the condition
+# `ensureLocalServer` adds "This Mac" under.
+python3 - "$CONFIG" <<'PY'
+import json, os, sys
+config_path = sys.argv[1]
 cfg = {}
 if os.path.exists(config_path):
     try:
         cfg = json.load(open(config_path))
     except Exception:
         cfg = {}
-servers = cfg.get("servers") or []
-dev = next((s for s in servers if s.get("name") == "localhost (dev)"), None)
-if dev is None:
-    dev = {"id": str(uuid.uuid4()).upper(), "name": "localhost (dev)"}
-    servers.append(dev)
-dev.update({
-    "mode": "direct",
-    "directURL": "http://127.0.0.1:%d" % port,
-    "sshUser": "", "sshHost": "", "sshPort": 22,
-    "identityFile": "", "jumpHost": "", "sshExtraArgs": "",
-    "remoteHome": dev_home, "remotePort": port, "localPort": 0,
-    # Point straight at the daemon's own token file, so the dev profile needs
-    # no keychain item at all.
-    "tokenFile": os.path.join(dev_home, "token"),
-    "provisioned": True,
-})
-cfg["servers"] = servers
 cfg.setdefault("models", [])
 cfg.setdefault("defaultWorkdir", os.path.expanduser("~"))
 cfg.setdefault("defaultPermissionMode", "bypassPermissions")
-cfg["lastServer"] = dev["id"]
 json.dump(cfg, open(config_path, "w"), indent=2, sort_keys=True)
 PY
 
 echo "$LABEL: daemon on 127.0.0.1:$PORT  (home $DEV_HOME)"
 echo "config: $CONFIG"
 echo
-echo "Start it with:  npm start"
+echo "Start it with:  npm start   — it adds this machine as \"This Mac\" itself."

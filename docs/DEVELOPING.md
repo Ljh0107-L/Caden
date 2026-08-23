@@ -14,7 +14,7 @@ The answer is two installs that share nothing.
 | bundle identifier | `app.caden.desktop` | `app.caden.dev` |
 | config, keychain | `Application Support/Caden`, `app.caden.secrets` | `Application Support/Caden Dev`, `app.caden.dev.secrets` |
 | local ports | from 7838 | from 7938 |
-| daemon on a server | `~/.caden`, port 7838 | `~/.caden-dev`, port 7839 |
+| daemon on a server | `~/.caden`, port 7838 | `~/.caden-dev`, port 7938 |
 | systemd unit | `heartbeat.service` | `heartbeat-dev.service` |
 
 All of it derives from one place — [`app/flavor.js`](../app/flavor.js). Production's
@@ -52,8 +52,15 @@ Same flavor, same config, same daemon — just Electron running the checkout.
 
 ## Giving it something to talk to
 
-**Locally.** `scripts/dev-seed.sh` starts a daemon in `~/.caden-dev` and writes a
-`localhost (dev)` server into the development config. `--clean` undoes both.
+**Locally.** `scripts/dev-seed.sh` starts a daemon in `~/.caden-dev`. It adds no
+server: the app adds this machine itself, as `This Mac`, the first time it starts
+against an empty config — the same `ensureLocalServer` path production runs, just
+pointed at the development home. `--clean` stops the daemon and drops the config.
+
+That the two look identical is the point. An earlier version of this script
+seeded a server of its own called `localhost (dev)`, which stood in front of
+`ensureLocalServer` and left the development install showing something production
+has no equivalent of.
 
 **On a real server**, one flag:
 
@@ -61,7 +68,7 @@ Same flavor, same config, same daemon — just Electron running the checkout.
 scripts/provision.sh --dev user@host
 ```
 
-That installs a second daemon in `~/.caden-dev` on port 7839, with its own
+That installs a second daemon in `~/.caden-dev` on port 7938, with its own
 sessions, its own engine binaries and its own token. The production daemon in
 `~/.caden` beside it does not notice.
 
