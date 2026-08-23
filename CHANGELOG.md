@@ -3,6 +3,42 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 until 1.0 the minor number carries breaking changes.
 
+## 0.2.0
+
+Caden on a phone.
+
+Three of these were only true on a desktop.
+
+- **The console works on a phone.** The stylesheet had exactly one media query
+  in it, for dark mode, and at 375px the main column's 424px floor pushed the
+  composer off the side of the screen. Below 760px the sidebar is now an
+  overlay over the canvas instead of a column beside it — the same two states
+  the desktop toggle already had, laid over each other rather than side by
+  side — and picking a session puts it away again. Nothing new to install:
+  the renderer was always a plain web page.
+- **Hover-only controls are reachable with a finger.** Archive and pin on a
+  session row were `opacity: 0` *and* `pointer-events: none` until the pointer
+  hovered, so on a phone they could not be reached at all — the only way in
+  was a long press nothing advertises. On a pointer that cannot hover they are
+  shown outright, along with the chevron that says a tool call opens.
+- **A session's files belong to whoever started the daemon.** `sessions/` was
+  0755 and every `meta.json` under it 0644, with the provider's API key in
+  clear — meta is written verbatim, and the key has to persist for a session
+  to resume after a restart. The tree is 0700 and the meta files 0600 now, and
+  a home provisioned by 0.1.0 is narrowed on the way up rather than left as it
+  was found.
+
+And one that was not about screens at all:
+
+- **Tearing down one daemon home's supervision no longer takes another's with
+  it.** The watchdog's crontab lines are tagged, and every home outside the
+  `~/.caden-<flavor>` convention carries the *same* tag as `~/.caden` — so
+  uninstalling supervision for a second home grepped production's two lines
+  out along with its own, and then removed the whole crontab because nothing
+  was left. A line is matched on the home it names now, not on the tag alone.
+  Found because `tests/supervise_test.py` could reach the real `crontab` from
+  its systemd walk, which no walk can do any more.
+
 ## 0.1.0
 
 First release.
