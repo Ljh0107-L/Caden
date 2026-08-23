@@ -1242,3 +1242,94 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
 .ctx-cat[data-color=orange] .ctx-cat-swatch { background: var(--running); }
 .ctx-cat-label { flex: 1 1 auto; color: var(--text-3); }
 .ctx-cat-value { flex: none; color: var(--text-4); font-variant-numeric: tabular-nums; }
+
+/* ---------- narrow screens ---------- */
+/*
+   Everything above is the desktop window this was drawn from. Below 760px the
+   same markup has to work on a phone held in one hand, and exactly two things
+   stand in the way: the main column's 424px floor, and a 260px sidebar parked
+   beside a 375px viewport.
+
+   Neither needs new machinery. The sidebar already collapses -- the desktop
+   has a toggle for it, and `collapsedStrip()` puts that toggle back in the
+   titlebar when it is gone. So the phone gets the collapsed state as its
+   default and the open state as an overlay, which is the same two states the
+   desktop has, laid over each other instead of side by side.
+*/
+
+.sidebar-scrim { display: none; }
+
+@media (max-width: 760px) {
+  /* The floor is there so the composer is not the first thing to collapse
+     when a desktop window is dragged narrow. A phone has no such choice to
+     protect, and 424px is wider than the screen. */
+  .main { min-width: 0; }
+
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 40;
+    /* Room for the canvas behind it to read as still being there. */
+    width: min(var(--sidebar-w), 84vw);
+    box-shadow: var(--shadow-float);
+  }
+
+  .sidebar-scrim {
+    display: block;
+    position: fixed; inset: 0; z-index: 39;
+    background: rgb(0 0 0 / 0.4);
+  }
+
+  /* 24px each side out of 375 is most of a word. */
+  .conversation-inner { padding-left: 16px; padding-right: 16px; }
+  .composer-area { padding-left: 16px; padding-right: 16px; }
+
+  /* Under 16px, iOS zooms the page when the field takes focus and never
+     zooms back out. The line box grows with it. */
+  .composer textarea, .composer-editor {
+    font-size: 16px; line-height: 24px; min-height: 24px;
+  }
+
+  /* Home-screen use later: with no viewport-fit=cover these resolve to 0, so
+     this costs nothing today and is right if a manifest ever lands. */
+  .composer-area { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+  .sidebar { padding-bottom: env(safe-area-inset-bottom); }
+
+  /* The address bar shrinks as you scroll, and 100% of the layout viewport
+     leaves the composer under it until the reflow catches up. */
+  @supports (height: 100dvh) {
+    html, body { height: 100dvh; }
+  }
+}
+
+/* ---------- touch ---------- */
+/*
+   Three controls here are revealed by hover, which a finger does not have.
+   The worst is the pin/archive pair on a session row: it is `opacity: 0` and
+   `pointer-events: none`, so on a phone it was not merely invisible, it was
+   unreachable -- the only way to archive a session was the context menu,
+   which is a long press nothing advertises. The other two, the chevron that
+   says a tool call can be expanded and the fold control on a section heading,
+   are visible-only problems, but the fix is the same: on a pointer that
+   cannot hover, show the hovered state.
+
+   Keyed on the pointer and not on the width. A touchscreen laptop at 1200px
+   has exactly this problem, and a tablet with a mouse attached does not.
+*/
+@media (hover: none) {
+  .nav-row-actions { opacity: 1; pointer-events: auto; }
+  .fold .chev { opacity: 1; }
+  /* The two share one gutter, so revealing the chevron means hiding the
+     folder -- the same swap hover performs. */
+  .section-head-fold { opacity: 1; }
+  .section-head .section-head-icon { opacity: 0; }
+}
+
+@media (pointer: coarse) {
+  /* 24x22 is a mouse target. This is not the 44px a fingertip is usually
+     given -- at that size the icons in the sidebar topbar overlap each other
+     and start stealing taps -- but it is enough to hit reliably, and it costs
+     the layout nothing that the narrow-screen test does not check. */
+  .icon-btn { width: 32px; height: 30px; }
+  .icon-btn.sm { width: 28px; height: 28px; }
+}

@@ -23,6 +23,20 @@ import { cacheLoad, cacheSave, cacheClear } from './cache.js';
 /// ring (2048) so the fetch costs no file I/O server-side either.
 const TAIL_EVENTS = 300;
 
+// Whether the sidebar is a column beside the canvas or an overlay on top of
+// it. Same 760px as the media query in styles.css -- the two have to agree,
+// and matchMedia is the only way to ask the stylesheet's question in JS.
+const NARROW = window.matchMedia('(max-width: 760px)');
+
+/// Crossing the breakpoint changes what the sidebar *is*, so it also changes
+/// what "open" should mean: a window dragged wide should show the list back,
+/// and one dragged narrow should not have it covering the canvas.
+NARROW.addEventListener('change', ev => {
+  state.sidebarOpen = !ev.matches;
+  renderSidebar();
+  renderMain();
+});
+
 const state = {
   config: { servers: [], models: [], defaults: {} },
   servers: new Map(),          // id -> {profile, api, status, facts, sessions, error}
@@ -30,7 +44,7 @@ const state = {
   selectedServerId: null,
   selectedSessionId: null,
   pane: null,                  // 'models' | {sessionDetail: id}
-  sidebarOpen: true,
+  sidebarOpen: !NARROW.matches,   // a phone opens on the content, not the list
   // Archived starts folded: it is where sessions go to stop taking up room.
   foldedRepos: new Set(['Archived']),
   // The whole repository list folds too, from its group heading.
@@ -530,12 +544,14 @@ function select(sessionId, serverId) {
   state.pane = null;
   state.selectedSessionId = sessionId;
   if (serverId) state.selectedServerId = serverId;
+  dismissOverlaySidebar();
   renderSidebar();
   renderMain();
 }
 
 function openPane(pane) {
   state.pane = pane;
+  dismissOverlaySidebar();
   if (pane === 'servers') {
     sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
     for (const p of state.config.servers) checkServer(p.id);
@@ -549,11 +565,36 @@ function openPane(pane) {
 // Built from DOM templates extracted from the running Cursor Agents window:
 // Cursor's own markup, Cursor's own stylesheet, our data and handlers.
 
+/// Below the breakpoint the sidebar covers the canvas, so tapping the canvas
+/// has to put it away again. A real element rather than a pseudo-element on
+/// the body, so the dismissing click has something unambiguous to land on;
+/// `display: none` outside the media query keeps it out of the desktop's row.
+function syncScrim() {
+  const want = state.sidebarOpen && NARROW.matches;
+  const existing = document.getElementById('sidebar-scrim');
+  if (!want) { existing?.remove(); return; }
+  if (existing) return;
+  $sidebar.after(el('div', {
+    class: 'sidebar-scrim', id: 'sidebar-scrim',
+    onclick: () => { if (dismissOverlaySidebar()) { renderSidebar(); renderMain(); } },
+  }));
+}
+
+/// Picking a session or a pane replaces whatever the overlay was covering, so
+/// leaving it up would hide the thing that was just asked for. No-op on a
+/// desktop, where the sidebar is a column and nothing is being covered.
+function dismissOverlaySidebar() {
+  if (!NARROW.matches || !state.sidebarOpen) return false;
+  state.sidebarOpen = false;
+  return true;
+}
+
 function renderSidebar() {
   // Deferred, not dropped: whatever changed is still there when the edit ends.
   if (state.editing) { state.sidebarStale = true; return; }
   $sidebar.classList.toggle('hidden', !state.sidebarOpen);
   document.body.classList.toggle('sidebar-hidden', !state.sidebarOpen);
+  syncScrim();
   if (!state.sidebarOpen) { $sidebar.replaceChildren(); return; }
 
   const nav = el('nav', { class: cls('sidebarClasses') });

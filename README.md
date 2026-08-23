@@ -182,6 +182,29 @@ reads; anything else — an archive, a video, a 40 MB png — is pushed to the
 server and the message carries the path the agent can open. Attachments are
 capped at 50 MB.
 
+## From a phone
+
+The renderer is a plain web page, so the console works on a phone: below 760px
+the sidebar becomes an overlay over the transcript rather than a column beside
+it, picking a session puts it away again, and the controls that a desktop only
+reveals on hover are simply always there.
+
+Reaching it is the part that is not finished. The host server binds `127.0.0.1`
+and has no login of its own, and inside the packaged app it takes a random port
+— so today this means running it from a checkout and putting that one port on a
+tailnet:
+
+```
+node app/server.js 8790
+tailscale serve --bg 8790
+```
+
+Your own devices and nothing else, which is the whole of the access control:
+do not put that port on a public address. And the Mac has to stay awake, which
+is the opposite of what a daemon on a server is for. Serving the console from
+the daemon itself, so a phone works with the laptop shut, is what 0.2.0 is
+about.
+
 ## Layout
 
 ```

@@ -131,6 +131,8 @@ step "end-to-end (renderer in a real browser, mock engine)"
 if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
   node tests/e2e/session.mjs
   result $? "e2e (playwright)"
+  node tests/e2e/narrow.mjs
+  result $? "e2e narrow (phone-sized viewport, touch pointer)"
 else
   echo "   skip  e2e -- npm install && npx playwright install chromium"
 fi
