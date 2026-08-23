@@ -91,7 +91,8 @@ xattr -dr com.apple.quarantine /Applications/Caden.app
 
 The DMG is Apple silicon only. On Intel, or to track development, run from
 source (`npm install && npm start` above) — a locally built app is never
-quarantined, so Gatekeeper never enters into it.
+quarantined, so Gatekeeper never enters into it. A source run is the *development*
+install, separate from the app you use; see [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 ## Connecting to a server
 
@@ -132,6 +133,9 @@ The app does not manage the forward itself yet, so keep that running (or use an
 ```bash
 scripts/dev-seed.sh
 ```
+
+That one seeds the development install, not the app you use. Which is the point:
+see [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 ## Installing the engines
 
@@ -201,15 +205,26 @@ tests/                 run-all.sh, the client suite and the offline-install suit
 docs/ARCHITECTURE.md   how the pieces fit, and the event vocabulary
 docs/API.md            the daemon's HTTP surface
 docs/DESIGN.md         the visual system
+docs/DEVELOPING.md     working on Caden while using Caden: the two installs
 ```
 
 ## Development
 
+Caden installs twice: the app you use, and a development build beside it with
+its own config, keychain items, ports and daemon home. Nothing is shared, so a
+change that wedges the daemon costs you nothing you were working on.
+
 ```bash
-scripts/dev-seed.sh    # runs a local daemon and points the app at it
-npm test               # full sweep
+scripts/build-app.sh --dev   # dist/Caden Dev.app, its own icon, beside the real one
+npm start                    # the same install, straight from the checkout
+scripts/dev-seed.sh          # gives it a local daemon to talk to
+npm test                     # full sweep
 scripts/dev-seed.sh --clean
 ```
+
+[docs/DEVELOPING.md](docs/DEVELOPING.md) has the whole picture, including the one
+rule worth memorising: only provision `~/.caden` from a checkout of a released
+tag.
 
 The test suite needs no model credentials: the session pipeline is exercised
 through a built-in mock engine and the installer through synthetic artifacts.

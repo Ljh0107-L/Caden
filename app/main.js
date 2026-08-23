@@ -9,6 +9,7 @@ const { app, BrowserWindow, nativeTheme } = require('electron');
 const path = require('path');
 const { start } = require('./server');
 const host = require('./host');
+const flavor = require('./flavor');
 
 async function createWindow() {
   const port = await start(0);
@@ -34,9 +35,11 @@ async function createWindow() {
 }
 
 // A packaged build takes its icon from the bundle; `npm start` runs inside
-// Electron's own bundle and would otherwise show Electron's.
+// Electron's own bundle and would otherwise show Electron's. Which icon is the
+// flavor's: from source that is the development one, and seeing it in the Dock
+// is how you know this window is not the app holding your work.
 if (!app.isPackaged && process.platform === 'darwin') {
-  app.whenReady().then(() => app.dock.setIcon(path.join(__dirname, 'icon.png')));
+  app.whenReady().then(() => app.dock.setIcon(path.join(__dirname, flavor.icon)));
 }
 
 app.whenReady().then(createWindow);

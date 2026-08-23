@@ -189,6 +189,73 @@ def main():
     check("unit removed", not os.path.exists(unit_path))
     check("service disabled", "disable" in open(sys_log).read())
 
+    # ------------------------------------------- two homes on the same box
+    #
+    # A development daemon in `~/.caden-dev` beside the real one in `~/.caden`.
+    # Both used to install `heartbeat.service`, so supervising the second
+    # rewrote the first's ExecStart and left the real daemon unsupervised: the
+    # next reboot brought back only whichever had been installed last, pointing
+    # at the wrong home, with production's sessions sitting in the other one.
+    print("== two daemon homes on one box")
+    two = os.path.join(tmp, "two")
+    prod_home = os.path.join(two, ".caden")
+    dev_home = os.path.join(two, ".caden-dev")
+    unit_dir = os.path.join(tmp, "systemd-two")
+    for h in (prod_home, dev_home):
+        os.makedirs(h)
+        shutil.copy(os.path.join(SERVER, "heartbeat.py"), os.path.join(h, "heartbeat.py"))
+    env = dict(os.environ, CADEN_SUPERVISOR="systemd", CADEN_UNIT_DIR=unit_dir,
+               CADEN_SYSTEMCTL=fake_sys, CADEN_LOGINCTL="true",
+               CADEN_FAKE_SYS_LOG=os.path.join(tmp, "sys2.log"),
+               CADEN_FAKE_SYS_STATE=os.path.join(tmp, "sys2.state"))
+    for h, p in ((prod_home, port + 6), (dev_home, port + 7)):
+        subprocess.run(sup + ["install", "--home", h, "--port", str(p),
+                              "--python", "/usr/bin/python3"],
+                       env=env, capture_output=True, text=True)
+
+    prod_unit = os.path.join(unit_dir, "heartbeat.service")
+    dev_unit = os.path.join(unit_dir, "heartbeat-dev.service")
+    check("the default home keeps heartbeat.service", os.path.exists(prod_unit))
+    check("the dev home gets its own unit", os.path.exists(dev_unit))
+    if os.path.exists(prod_unit) and os.path.exists(dev_unit):
+        check("each unit runs its own home",
+              prod_home in open(prod_unit).read()
+              and dev_home in open(dev_unit).read()
+              and ".caden-dev" not in open(prod_unit).read().replace(dev_home, ""))
+
+    # Uninstalling one must leave the other supervised.
+    subprocess.run(sup + ["uninstall", "--home", dev_home],
+                   env=env, capture_output=True, text=True)
+    check("removing dev leaves production's unit", os.path.exists(prod_unit)
+          and not os.path.exists(dev_unit))
+    subprocess.run(sup + ["uninstall", "--home", prod_home],
+                   env=env, capture_output=True, text=True)
+
+    # Same question for the crontab, where both tags live in one file. The
+    # discriminator sits in the middle of the tag so that grepping one out
+    # cannot also strip the other's lines.
+    cron_tab = os.path.join(tmp, "crontab-two.txt")
+    env = dict(os.environ, CADEN_SUPERVISOR="cron", CADEN_CRON_CMD=fake_cron,
+               CADEN_FAKE_CRONTAB=cron_tab,
+               CADEN_UNIT_DIR=os.path.join(tmp, "no-unit-here"))
+    for h, p in ((prod_home, port + 6), (dev_home, port + 7)):
+        subprocess.run(sup + ["install", "--home", h, "--port", str(p),
+                              "--python", sys.executable],
+                       env=env, capture_output=True, text=True)
+    lines = cron_lines(cron_tab)
+    check("four crontab lines, two per home", len(lines) == 4, str(len(lines)))
+    check("distinct tags",
+          sum("heartbeat-supervise" in l for l in lines) == 2
+          and sum("heartbeat-dev-supervise" in l for l in lines) == 2, str(lines))
+    subprocess.run(sup + ["uninstall", "--home", dev_home],
+                   env=env, capture_output=True, text=True)
+    lines = cron_lines(cron_tab) if os.path.exists(cron_tab) else []
+    check("removing dev leaves production's crontab lines",
+          len(lines) == 2 and all("heartbeat-supervise" in l for l in lines),
+          str(lines))
+    subprocess.run(sup + ["uninstall", "--home", prod_home],
+                   env=env, capture_output=True, text=True)
+
     # ------------------------------------------------------ foreground mode
     print("== heartbeat --foreground")
     fg_home = os.path.join(tmp, "fg-home")

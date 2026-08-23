@@ -16,3 +16,6 @@ artifacts/
 # Style-parity reference captures: probes of a live app, taken locally.
 # They carry whatever was on screen when captured, so they stay out of git.
 app/verify/baseline/
+
+# Written into a build by scripts/build-app.sh; a checkout has no flavor.
+app/flavor.json

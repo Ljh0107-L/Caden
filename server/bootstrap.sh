@@ -75,8 +75,15 @@ chmod 700 "$DAEMON"
 # it back on a different start path, and starting a second one loses the port
 # fight. Route lifecycle through systemctl in that case. The unit file is the
 # record of which mechanism supervise.sh installed.
+# The unit name is per-home; supervise.sh derives it the same way and the two
+# have to agree, or bootstrap would look for production's unit while asking
+# systemd about the development one.
+case "$(basename "$HOME_DIR")" in
+  .caden-*) SERVICE="heartbeat-$(basename "$HOME_DIR" | sed 's/^\.caden-//')" ;;
+  *)        SERVICE="heartbeat" ;;
+esac
 SYSTEMCTL="${CADEN_SYSTEMCTL:-systemctl}"
-UNIT="${CADEN_UNIT_DIR:-$HOME/.config/systemd/user}/heartbeat.service"
+UNIT="${CADEN_UNIT_DIR:-$HOME/.config/systemd/user}/$SERVICE.service"
 
 systemd_supervised() {
   [ -f "$UNIT" ] && command -v "$SYSTEMCTL" >/dev/null 2>&1
@@ -92,7 +99,7 @@ stop_foreign_daemon() {
 case "$ACTION" in
   stop)
     if systemd_supervised; then
-      "$SYSTEMCTL" --user stop heartbeat >/dev/null 2>&1 || true
+      "$SYSTEMCTL" --user stop "$SERVICE" >/dev/null 2>&1 || true
     else
       "$PY" "$DAEMON" --stop --port "$PORT" || true
     fi
@@ -102,10 +109,10 @@ case "$ACTION" in
     exit $? ;;
   restart)
     if systemd_supervised; then
-      "$SYSTEMCTL" --user is-active --quiet heartbeat 2>/dev/null || stop_foreign_daemon
-      "$SYSTEMCTL" --user reset-failed heartbeat >/dev/null 2>&1 || true
-      "$SYSTEMCTL" --user restart heartbeat || \
-        emit_error "systemd could not restart heartbeat (journalctl --user -u heartbeat)"
+      "$SYSTEMCTL" --user is-active --quiet "$SERVICE" 2>/dev/null || stop_foreign_daemon
+      "$SYSTEMCTL" --user reset-failed "$SERVICE" >/dev/null 2>&1 || true
+      "$SYSTEMCTL" --user restart "$SERVICE" || \
+        emit_error "systemd could not restart $SERVICE (journalctl --user -u $SERVICE)"
     else
       "$PY" "$DAEMON" --stop --port "$PORT" >/dev/null 2>&1 || true
       CADEN_STOPPED=1
@@ -212,9 +219,9 @@ if [ "$RUNNING" -eq 0 ]; then
   if systemd_supervised; then
     # The unit pins the port and owns the process; starting it ourselves would
     # only lose the bind to systemd's copy.
-    "$SYSTEMCTL" --user reset-failed heartbeat >/dev/null 2>&1 || true
-    "$SYSTEMCTL" --user start heartbeat || \
-      emit_error "systemd could not start heartbeat (journalctl --user -u heartbeat)"
+    "$SYSTEMCTL" --user reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    "$SYSTEMCTL" --user start "$SERVICE" || \
+      emit_error "systemd could not start $SERVICE (journalctl --user -u $SERVICE)"
   else
     [ -n "${CADEN_STOPPED:-}" ] && wait_port_free "$PORT"
   # Ports come from a pool this home keeps, rather than a fresh walk forward

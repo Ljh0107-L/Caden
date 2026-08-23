@@ -14,6 +14,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
+import { createRequire } from 'node:module';
+
+// The host server under test resolves its paths from the flavor, and so must
+// the expectations here -- otherwise this file asserts production's values
+// against a checkout, which is the development install.
+const flavor = createRequire(import.meta.url)('../app/flavor');
 
 const arg = name => {
   const i = process.argv.indexOf(name);
@@ -617,14 +623,17 @@ if (process.platform === 'darwin') {
         .find(x => x.mode === 'direct' && !x.sshHost) || {};
       check('servers: as a direct loopback server the local shell can install into',
             /^http:\/\/127\.0\.0\.1:\d+$/.test(written.directURL || '')
-            && written.remoteHome === '~/.caden',
+            && written.remoteHome === flavor.remoteHome,
             JSON.stringify({ directURL: written.directURL, home: written.remoteHome }));
       check('servers: and only ever one of it',
             (cfg2.servers || []).filter(x => x.mode === 'direct' && !x.sshHost).length === 1);
     }
   } finally {
     child.kill();
-    try { execSync('security delete-generic-password -s app.caden.secrets -a provider.prov-test',
+    // The flavor's own service: the host filed the key under it, and deleting
+    // from the other one would quietly leave this test's key in the keychain.
+    try { execSync(`security delete-generic-password -s ${flavor.keychainService} `
+                   + '-a provider.prov-test',
                    { stdio: 'ignore', timeout: 5000 }); } catch {}
     fs.rmSync(tmp, { recursive: true, force: true });
   }

@@ -16,17 +16,20 @@ const net = require('net');
 const os = require('os');
 const path = require('path');
 
-// Still `Caden`: this directory holds the configured servers and providers, and
-// the keychain items are filed under `app.caden.*` beside them. The app's name
-// changed; where it keeps its things did not, because moving it would strand
-// every machine and key already set up.
-const SUPPORT = path.join(os.homedir(), 'Library', 'Application Support', 'Caden');
+// Everything this install keeps on the Mac, and the daemon home it provisions
+// on a server, comes from the flavor -- so a development build beside the real
+// app shares no config, no keychain item, no local port and no session with it.
+// Production's values are still the original literals (`Application
+// Support/Caden`, `app.caden.secrets`, `~/.caden`): the app's name changed once
+// and where it keeps its things did not, because moving it would strand every
+// machine and key already set up. See flavor.js.
+const flavor = require('./flavor');
+const SUPPORT = flavor.support;
 const CONFIG_PATH = process.env.CADEN_CONFIG || path.join(SUPPORT, 'config.json');
-// Short on purpose: %C is a 40-char hash and ssh appends a ~17-char suffix,
-// against a ~104-byte ceiling on unix socket paths.
-const CONTROL_DIR = path.join(os.homedir(), '.caden-ssh');
+const CONTROL_DIR = flavor.controlDir;
 const DAEMON_DIR = path.join(__dirname, '..', 'server');
-const KEYCHAIN_SERVICE = 'app.caden.secrets';
+const KEYCHAIN_SERVICE = flavor.keychainService;
+const REMOTE_HOME = flavor.remoteHome;
 
 /// Fingerprint of the daemon this build ships, to compare against what a
 /// server is actually running. See _source_revision() in heartbeat.py: an old
@@ -39,7 +42,7 @@ const bundledRevision = (() => {
       .digest('hex').slice(0, 12);
   } catch { return null; }
 })();
-const DEFAULT_PORT = 7838;
+const DEFAULT_PORT = flavor.defaultPort;
 
 // A shared master connection means provisioning, the forward and every status
 // check reuse one authentication instead of asking ssh to redo it each time.
@@ -304,7 +307,7 @@ function addLocalServer() {
     id: newId(), name: 'This Mac', mode: 'direct',
     sshUser: '', sshHost: '', sshPort: 22,
     identityFile: '', jumpHost: '', sshExtraArgs: '',
-    remoteHome: '~/.caden', remotePort: port, localPort: port,
+    remoteHome: REMOTE_HOME, remotePort: port, localPort: port,
     directURL: `http://127.0.0.1:${port}`, tokenFile: '', provisioned: false,
   };
   servers.push(entry);
@@ -324,7 +327,7 @@ function addServer(alias) {
     id: newId(), name: alias, mode: 'tunnel',
     sshUser: '', sshHost: alias, sshPort: 22,
     identityFile: '', jumpHost: '', sshExtraArgs: '',
-    remoteHome: '~/.caden', remotePort: DEFAULT_PORT, localPort,
+    remoteHome: REMOTE_HOME, remotePort: DEFAULT_PORT, localPort,
     directURL: '', tokenFile: '', provisioned: false,
   };
   servers.push(entry);
@@ -347,7 +350,7 @@ const findServer = id => (readConfig().servers || []).find(s => s.id === id);
 // ---------------------------------------------------------------- provisioning
 
 /// Push the daemon and start it. One ssh round-trip carries the three files and
-/// runs bootstrap; nothing is left on the box outside `~/.caden`.
+/// runs bootstrap; nothing is left on the box outside the server's home.
 ///
 /// `restart` matters: bootstrap.sh is idempotent and reuses a daemon that is
 /// already running, which is what you want when setting a server up but means
@@ -380,7 +383,19 @@ function buildProvisionScript(home, files, port, restart) {
 }
 
 async function provision(server, { restart = false } = {}, onStep = () => {}) {
-  const home = server.remoteHome || '~/.caden';
+  const home = server.remoteHome || REMOTE_HOME;
+  // The one crossing that cannot be allowed to happen quietly. A development
+  // build writing heartbeat.py into `~/.caden` takes effect even without
+  // `--restart`: the supervisor's ExecStart names the file, not the build that
+  // put it there, so the next crash or reboot brings the daemon back on
+  // untrusted code -- with the real sessions still in that home. A config
+  // pointed at the wrong home is a plausible slip; this turns it into a
+  // message instead of a silent takeover.
+  if (flavor.id !== 'prod' && home === flavor.all.prod.remoteHome) {
+    throw new Error(`${flavor.label} will not provision ${home} — that is the `
+                    + 'production daemon home. Point this server at '
+                    + `${flavor.remoteHome}, or use the release build.`);
+  }
   const sh = provisionShell(server);
   const files = [];
   for (const name of ['heartbeat.py', 'bootstrap.sh', 'supervise.sh']) {
@@ -1222,5 +1237,5 @@ async function ensureLocalServer() {
 
 module.exports = {
   route, readConfig, daemonBase, daemonToken, providerKey, expandTilde,
-  buildProvisionScript, shutdown, ensureLocalServer,
+  buildProvisionScript, provision, shutdown, ensureLocalServer,
 };

@@ -78,6 +78,10 @@ pkill -f "$OLD/" >/dev/null 2>&1 || true
 
 pkill -f "$BOOT/" >/dev/null 2>&1 || true
 
+step "flavors (the dev install shares nothing, the real one has not moved)"
+node tests/flavor_test.cjs
+result $? "flavor_test.cjs"
+
 step "SSH provisioning payload (exact file bytes)"
 node tests/provision-upload_test.cjs
 result $? "provision-upload_test.cjs"

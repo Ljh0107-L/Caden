@@ -4,8 +4,9 @@
 # Install or remove the supervision that brings heartbeat back after a crash or a
 # server reboot. Two mechanisms, chosen per host:
 #
-#   systemd -- a user service (heartbeat.service) with Restart=always and linger
-#              on. heartbeat runs in --foreground under it, so the journald gets
+#   systemd -- a user service (heartbeat.service, or heartbeat-<flavor> for a
+#              home beside the default one) with Restart=always and linger on.
+#              heartbeat runs in --foreground under it, so the journald gets
 #              its logs and `systemctl stop` is a clean shutdown.
 #   cron    -- @reboot plus a one-minute watchdog that re-runs bootstrap, which
 #              is a no-op while the daemon is alive. The fallback for hosts
@@ -45,12 +46,29 @@ done
 [ -n "$ACTION" ] || { echo "usage: supervise.sh install|uninstall --home DIR ..." >&2; exit 2; }
 [ -n "$HOME_DIR" ] || { echo "supervise.sh: --home is required" >&2; exit 2; }
 
+# One box can run two daemons -- the real `~/.caden` and a `~/.caden-dev`
+# beside it -- so the unit and the crontab tag are per-home. They used to be
+# fixed names: installing supervision for the development home rewrote
+# production's ExecStart and left the real daemon unsupervised, and the next
+# reboot brought back only whichever home had been installed last.
+#
+# `~/.caden` keeps the original names, and so does any other home. Renaming the
+# unit under an install already running would orphan the service it is running
+# under, so only the `~/.caden-<flavor>` siblings this convention introduces
+# take a suffix. The suffix sits in the middle of the crontab tag rather than at
+# the end, so that grepping one tag out never also strips the other's lines.
+case "$(basename "$HOME_DIR")" in
+  .caden-*) SUFFIX="-$(basename "$HOME_DIR" | sed 's/^\.caden-//')" ;;
+  *)        SUFFIX="" ;;
+esac
+SERVICE="heartbeat$SUFFIX"
+
 UNIT_DIR="${CADEN_UNIT_DIR:-$HOME/.config/systemd/user}"
-UNIT="$UNIT_DIR/heartbeat.service"
+UNIT="$UNIT_DIR/$SERVICE.service"
 SYSTEMCTL="${CADEN_SYSTEMCTL:-systemctl}"
 LOGINCTL="${CADEN_LOGINCTL:-loginctl}"
 CRON="${CADEN_CRON_CMD:-crontab}"
-TAG="heartbeat-supervise"
+TAG="heartbeat$SUFFIX-supervise"
 SUPERVISOR="none"
 
 systemctl_usable() {
@@ -124,7 +142,7 @@ cron_uninstall() {
 want_unit() {
   cat <<EOF
 [Unit]
-Description=Caden daemon (heartbeat)
+Description=Caden daemon ($SERVICE, $HOME_DIR)
 After=network-online.target
 Wants=network-online.target
 
@@ -143,7 +161,7 @@ EOF
 systemd_install() {
   systemctl_usable || { echo "supervise.sh: systemd forced but systemctl is unavailable" >&2; exit 1; }
   mkdir -p "$UNIT_DIR"
-  tmp="$UNIT_DIR/heartbeat.service.tmp"
+  tmp="$UNIT_DIR/$SERVICE.service.tmp"
   want_unit > "$tmp"
   if [ -f "$UNIT" ] && cmp -s "$tmp" "$UNIT"; then
     changed=0
@@ -159,25 +177,25 @@ systemd_install() {
     "$LOGINCTL" enable-linger "${USER:-root}" >/dev/null 2>&1 || true
   fi
   "$SYSTEMCTL" --user daemon-reload
-  "$SYSTEMCTL" --user enable heartbeat.service >/dev/null 2>&1 || true
+  "$SYSTEMCTL" --user enable "$SERVICE.service" >/dev/null 2>&1 || true
   # A daemon started the old way (bootstrap's own daemonize) may hold the
   # port. systemd cannot kill what it did not start, so stop it explicitly;
   # then (re)start. When the service already owns the port, restart is a
   # clean stop+start of the systemd process.
-  if [ "$changed" -eq 1 ] || ! "$SYSTEMCTL" --user is-active --quiet heartbeat 2>/dev/null; then
+  if [ "$changed" -eq 1 ] || ! "$SYSTEMCTL" --user is-active --quiet "$SERVICE" 2>/dev/null; then
     "$PY" "$HOME_DIR/heartbeat.py" --stop --port "$PORT" >/dev/null 2>&1 || true
-    "$SYSTEMCTL" --user reset-failed heartbeat >/dev/null 2>&1 || true
-    "$SYSTEMCTL" --user restart heartbeat
+    "$SYSTEMCTL" --user reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    "$SYSTEMCTL" --user restart "$SERVICE"
   fi
   SUPERVISOR="systemd"
 }
 
 systemd_uninstall() {
   systemctl_usable || return 0
-  "$SYSTEMCTL" --user disable --now heartbeat >/dev/null 2>&1 || true
+  "$SYSTEMCTL" --user disable --now "$SERVICE" >/dev/null 2>&1 || true
   rm -f "$UNIT"
   "$SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
-  "$SYSTEMCTL" --user reset-failed heartbeat >/dev/null 2>&1 || true
+  "$SYSTEMCTL" --user reset-failed "$SERVICE" >/dev/null 2>&1 || true
 }
 
 # --------------------------------------------------------------------- action
