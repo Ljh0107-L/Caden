@@ -109,17 +109,31 @@ PATH_PORT = home("heartbeat.port")
 
 
 def ensure_dirs():
-    for d in (CADEN_HOME, DIR_BIN, DIR_RUNTIME, DIR_ENGINES, DIR_SESSIONS,
-              DIR_UPLOADS, DIR_TMP):
+    for d in (CADEN_HOME, DIR_BIN, DIR_RUNTIME, DIR_ENGINES):
         mkdirp(d)
+    # Transcripts, workspaces and anything uploaded belong to whoever started
+    # the daemon, not to every account on the box.
+    for d in (DIR_SESSIONS, DIR_UPLOADS, DIR_TMP):
+        mkdirp(d, 0o700)
 
 
-def mkdirp(path):
+def mkdirp(path, mode=None):
+    """Create `path` if it is missing, and tighten it if `mode` says so.
+
+    The chmod runs whether or not this call created the directory: the session
+    tree shipped as 0755 for the first release, and the daemons already out
+    there only get fixed if a later boot narrows what it finds.
+    """
     try:
         os.makedirs(path)
     except OSError as exc:
         if exc.errno != errno.EEXIST:
             raise
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError as exc:
+            log("warn", "could not chmod %s: %s", path, exc)
     return path
 
 
@@ -169,8 +183,12 @@ def read_text(path, default=""):
 _tmp_seq = itertools.count()
 
 
-def atomic_write(path, data):
+def atomic_write(path, data, mode=None):
     """Replace `path` in one step.
+
+    `mode` is applied to the scratch file before the rename, so the contents
+    are never briefly readable at the final name under whatever the umask
+    happens to be.
 
     The scratch name is unique per call, not per process.  Keyed on the pid
     alone, two threads writing the same file shared one `.tmp.<pid>`: they
@@ -188,6 +206,8 @@ def atomic_write(path, data):
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.rename(tmp, path)
     except Exception:
         try:
@@ -3380,8 +3400,18 @@ class Session(object):
         self.engine = None
         self._draining = False
         self.verbose_logs = bool(meta.get("verbose_logs"))
+        # The session's own directory too, and on load as well as on create:
+        # a home provisioned before sessions went 0700 still has 0755 ones in
+        # it, and this is the pass that narrows them. The meta file is named
+        # outright rather than left to heal on the next save, so an archived
+        # session nothing will write again is narrowed too.
+        mkdirp(self.path(), 0o700)
         for sub in ("logs", "engine", "tmp", "images"):
-            mkdirp(self.path(sub))
+            mkdirp(self.path(sub), 0o700)
+        try:
+            os.chmod(self.path("meta.json"), 0o600)
+        except OSError:
+            pass    # on create there is nothing to chmod yet; save() sets it
         # Any pid recorded here belongs to a process this daemon did not
         # spawn -- take it over if it is still ours, and only stop it when it
         # is not. A turn in flight then survives the daemon being replaced,
@@ -3447,7 +3477,9 @@ class Session(object):
         self.meta["updated_at"] = now_ms()
         snapshot = dict(self.meta)
         public = dict((k, v) for k, v in snapshot.items() if not k.startswith("_"))
-        atomic_write(self.path("meta.json"), json_dumps(public))
+        # The provider credential the session runs under is in here, so this
+        # is the one session file that must not be readable by other accounts.
+        atomic_write(self.path("meta.json"), json_dumps(public), mode=0o600)
 
     def append_stderr(self, line):
         try:
@@ -4102,7 +4134,7 @@ class SessionManager(object):
             "turns": 0,
             "totals": {},
         }
-        mkdirp(os.path.join(DIR_SESSIONS, sid))
+        mkdirp(os.path.join(DIR_SESSIONS, sid), 0o700)
         sess = Session(self, meta)
         with self.lock:
             self.sessions[sid] = sess

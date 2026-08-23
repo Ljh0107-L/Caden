@@ -278,7 +278,9 @@ cp node_modules/@fontsource/jetbrains-mono/LICENSE app/web/fonts/LICENSE
   daemon, the same way it injects the daemon token. Keys are passed to the
   engine as process environment and never written into a session's own
   engine config (the session's `meta.json` does carry them, server-side, so a
-  session can resume after a daemon restart).
+  session can resume after a daemon restart — that file is 0600 and the
+  session tree around it 0700, so on a shared box it is not readable by
+  another account).
 - `POST /v1/exec` and the agents themselves run commands on the server. That is
   the product, not a bug — treat a Caden server as a machine you have handed the
   agent. Default permission mode is full access; the composer can drop a session

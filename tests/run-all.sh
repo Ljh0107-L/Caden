@@ -94,6 +94,10 @@ step "supervision (systemd unit, cron watchdog, crash recovery)"
 python3 tests/supervise_test.py --home "$HOME_DIR/supervise" --port $((PORT + 3)) >/dev/null 2>&1
 result $? "supervise_test.py"
 
+step "file permissions (a shared box cannot read the session tree)"
+python3 tests/permissions_test.py >/dev/null 2>&1
+result $? "permissions_test.py"
+
 step "event stream (the terminal event survives the close)"
 python3 tests/stream_close_test.py
 result $? "stream_close_test.py"
