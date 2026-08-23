@@ -76,6 +76,24 @@ The two daemons cost a few hundred MB per server, because each home installs its
 own `claude` and `codex`. That is the point: an engine upgrade you trigger while
 testing cannot reach the sessions you are working in.
 
+## Agents develop against the development install, never production
+
+Anything with a shell — a coding agent working in this repository, a script it
+writes, a `curl` it sends — belongs to `Caden Dev`, `~/.caden-dev` and port
+7938. Not `~/.caden`, not port 7838, not `Application Support/Caden`, not
+`app.caden.secrets`. [`CLAUDE.md`](../CLAUDE.md) states this where an agent
+picks it up without being told.
+
+The reason is not tidiness. A production session can be hours of work with a
+large context behind it; restarting that daemon interrupts a live turn, and the
+next section explains what rewriting `heartbeat.py` under it does. An agent
+moves faster than the moment you would have caught it in.
+
+Two things enforce it — a checkout resolves to the development flavor, and that
+flavor refuses to provision `~/.caden` — and neither covers a hand-edited
+config or a request aimed at the wrong port. When production data is needed,
+copy it into the development home and work on the copy; see the last section.
+
 ## The one rule
 
 **Only provision `~/.caden` from a checkout of a released tag.**
