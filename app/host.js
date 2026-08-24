@@ -1399,7 +1399,12 @@ async function route(req, res, url) {
 // gateway's copy to drift from the protocol the daemon speaks.
 // --------------------------------------------------------------------------
 
-const WEB_ROOT_REMOTE = '/srv/caden-web';
+// One directory per hostname, not one shared one. The two installs are meant
+// to share nothing, and they can perfectly well share a gateway -- but they
+// each write a server list here, and a single path means whichever applied
+// last decides what the other's console sees.
+const WEB_ROOT_BASE = '/srv/caden-web';
+const webRoot = hostname => `${WEB_ROOT_BASE}/${hostname}`;
 
 function webConfig() {
   const cfg = readConfig();
@@ -1497,7 +1502,7 @@ server {
 
     # The server list. A file, because nothing on this side generates one.
     location = /host/config {
-        root ${WEB_ROOT_REMOTE};
+        root ${webRoot(hostname)};
         default_type application/json;
         add_header Cache-Control "no-cache" always;
     }
@@ -1525,7 +1530,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${hostname};
-    location /.well-known/acme-challenge/ { root ${WEB_ROOT_REMOTE}; }
+    location /.well-known/acme-challenge/ { root ${webRoot(hostname)}; }
     location / { return 301 https://$host$request_uri; }
 }
 `;
@@ -1589,10 +1594,10 @@ async function applyWebGateway(onStep = () => {}) {
   onStep('writing a temporary site so a certificate can be issued…');
   await sh([
     'set -eu',
-    `mkdir -p ${WEB_ROOT_REMOTE}`,
+    `mkdir -p ${webRoot(hostname)}/host`,
     file(`/etc/nginx/sites-available/${hostname}`,
          `server {\n    listen 80;\n    listen [::]:80;\n    server_name ${hostname};\n`
-         + `    root ${WEB_ROOT_REMOTE};\n}\n`),
+         + `    root ${webRoot(hostname)};\n}\n`),
     `ln -sf /etc/nginx/sites-available/${hostname} /etc/nginx/sites-enabled/${hostname}`,
     'nginx -t >/dev/null',
     'systemctl reload nginx',
@@ -1622,9 +1627,9 @@ async function applyWebGateway(onStep = () => {}) {
        + '# an event stream is one connection, not a poll -- and the burst in\n'
        + '# the site below covers a cold page load. What it caps is guessing.\n'
        + 'limit_req_zone $binary_remote_addr zone=caden:1m rate=120r/m;\n'),
-    file(`${WEB_ROOT_REMOTE}/host/config.tmp`, webHostConfig([server])),
-    `mkdir -p ${WEB_ROOT_REMOTE}/host`,
-    `mv -f ${WEB_ROOT_REMOTE}/host/config.tmp ${WEB_ROOT_REMOTE}/host/config || true`,
+    `mkdir -p ${webRoot(hostname)}/host`,
+    file(`${webRoot(hostname)}/host/config.tmp`, webHostConfig([server])),
+    `mv -f ${webRoot(hostname)}/host/config.tmp ${webRoot(hostname)}/host/config`,
     // Written beside the live one and moved into place only once nginx has
     // agreed to it, so a rejected config cannot take the site down.
     file(`/etc/nginx/sites-available/${hostname}.new`, site),

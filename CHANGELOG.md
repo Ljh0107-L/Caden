@@ -97,6 +97,14 @@ forward:
   it did. The wire protocol is unchanged. A run that reads no keys at all —
   a locked keychain — leaves the ones already on the server alone instead of
   replacing them with nothing.
+- **Two installs can share a gateway without sharing anything on it.** The
+  development build and the real one already keep separate config, keychain
+  items, ports and daemon homes; the gateway had one place they collided,
+  `/srv/caden-web/host/config`, where each wrote the server list the console
+  reads and whichever applied last decided what the other's console saw. One
+  directory per hostname now. What they do share — the rate limit and the ban
+  rule — is shared on purpose: the jail watches the whole access log, so it
+  covers both.
 - **The Web pane sets the gateway up.** Under Models in the desktop app: it
   asks for the three facts only a person knows — the hostname, which machine
   runs the proxy, which server's daemon serves the console — and does the rest
