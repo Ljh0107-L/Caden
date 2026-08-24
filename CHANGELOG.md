@@ -31,6 +31,14 @@ Three of these were only true on a desktop.
 Groundwork for reaching a daemon through a browser rather than an ssh
 forward:
 
+- **`scripts/web-gateway.cjs` writes the proxy configuration.** Point it at a
+  hostname and it prints the nginx block, an `ssh -R` unit for each server and
+  the `host/config` the console reads, with every daemon's token already in
+  place. The tokens are why it exists: 44 characters of base64 per server, and
+  one character wrong is a 401 from a daemon that is running perfectly.
+  [docs/WEB.md](docs/WEB.md) has the arrangement — the tunnels point outward,
+  so no server needs a public address and the gateway needs no key for any of
+  them.
 - **Attachments work without a native file panel.** The `+` button raised the
   macOS open panel and sent the path it returned; a browser has no path to
   give, and behind a reverse proxy there is no `/host/*` to send it to. Where

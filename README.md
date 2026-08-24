@@ -184,26 +184,22 @@ capped at 50 MB.
 
 ## From a phone
 
-The renderer is a plain web page, so the console works on a phone: below 760px
-the sidebar becomes an overlay over the transcript rather than a column beside
-it, picking a session puts it away again, and the controls that a desktop only
-reveals on hover are simply always there.
+The renderer is a plain web page and the daemon can serve it, so a phone
+reaches a session with the laptop shut — which is the point of the work living
+on the server in the first place. Below 760px the sidebar becomes an overlay
+over the transcript, picking a session puts it away, and the controls a desktop
+only reveals on hover are simply always there.
 
-Reaching it is the part that is not finished. The host server binds `127.0.0.1`
-and has no login of its own, and inside the packaged app it takes a random port
-— so today this means running it from a checkout and putting that one port on a
-tailnet:
+Reaching it takes a reverse proxy in front of the daemon, because the daemon
+binds loopback and should stay that way. One command writes the configuration:
 
 ```
-node app/server.js 8790
-tailscale serve --bg 8790
+scripts/web-gateway.cjs caden.example.net
 ```
 
-Your own devices and nothing else, which is the whole of the access control:
-do not put that port on a public address. And the Mac has to stay awake, which
-is the opposite of what a daemon on a server is for. Serving the console from
-the daemon itself, so a phone works with the laptop shut, is what 0.2.0 is
-about.
+[docs/WEB.md](docs/WEB.md) has the whole arrangement — what runs where, the
+nginx setting that will otherwise hang your event stream, what the console
+stops offering when its host cannot do it, and where your API keys end up.
 
 ## Layout
 
@@ -229,6 +225,7 @@ docs/ARCHITECTURE.md   how the pieces fit, and the event vocabulary
 docs/API.md            the daemon's HTTP surface
 docs/DESIGN.md         the visual system
 docs/DEVELOPING.md     working on Caden while using Caden: the two installs
+docs/WEB.md            reaching a daemon from a phone, with the Mac switched off
 ```
 
 ## Development
