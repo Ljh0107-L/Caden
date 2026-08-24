@@ -39,6 +39,14 @@ forward:
   parse error on a daemon that was running perfectly. It asks the daemon
   directly now: it knows its own version and its engines, and having answered
   at all is the liveness the host was relaying second-hand.
+- **The generated proxy config rate-limits and the docs say how to ban.** The
+  password on the proxy is the only door in front of a service that runs
+  commands and holds model keys. bcrypt at `htpasswd`'s default cost verifies
+  in ~10ms and nginx does it as fast as it is asked, so a guessable one falls
+  in days — and raising the cost is the wrong lever, since a browser sends
+  basic auth on every stylesheet and font. Capping the rate costs the person
+  who knows the password nothing and caps everyone else at two a second;
+  fail2ban ends the attempt outright.
 - **`scripts/web-gateway.cjs` writes the proxy configuration.** Point it at a
   hostname and it prints the nginx block, an `ssh -R` unit for each server and
   the `host/config` the console reads, with every daemon's token already in

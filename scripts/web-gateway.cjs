@@ -93,22 +93,54 @@ say('# ╔═══════════════════════�
     '# ╚══════════════════════════════════════════════════════════════════╝',
     '');
 
-say('# ─── 1. On the gateway: /etc/nginx/sites-available/' + hostname,
+say('# ─── 1. On the gateway',
     '#',
-    '# Get a certificate first, or certbot will rewrite this file for you:',
+    '# A certificate first, or certbot will rewrite the site file for you:',
     `#   certbot --nginx -d ${hostname}`,
     '#',
-    '# And a password. Generate it, do not invent it -- this is the only door:',
+    '# A password, generated rather than invented -- it is the only door in',
+    '# front of a service that runs commands and holds your model keys:',
     `#   htpasswd -B -c /etc/nginx/${hostname}.htpasswd you`,
+    '#',
+    '# And /etc/nginx/conf.d/caden-ratelimit.conf, which the block below needs:',
+    '#',
+    '#   limit_req_zone $binary_remote_addr zone=caden:1m rate=120r/m;',
+    '#',
+    '# Two a second sustained is far above anything real use produces -- an',
+    '# event stream is one connection, not a poll -- and the burst below covers',
+    '# a cold page load, which is about seventeen requests at once. What it',
+    '# stops is the one attack that scales: bcrypt at htpasswd default cost is',
+    '# ~10ms and nginx will verify as fast as anyone can ask. Raising that cost',
+    '# is the wrong lever, because the browser sends basic auth on every',
+    '# stylesheet and font -- it would be paid on every request by the person',
+    '# who knows the password.',
+    '#',
+    `# Then /etc/nginx/sites-available/${hostname}:`,
     '');
 
 say('server {');
 say(`    server_name ${hostname};`);
 say('');
+say('    limit_req zone=caden burst=50 nodelay;');
+say('    limit_req_status 429;');
+say('');
 say('    auth_basic           "Caden";');
 say(`    auth_basic_user_file /etc/nginx/${hostname}.htpasswd;`);
 say('');
-say('    # The console itself. app/web, copied up by the rsync in step 3.');
+say('    # Anything else under /host/ is the desktop app\'s control plane, and');
+say('    # does not exist here. Without this the fallback below answers a');
+say('    # missing route with index.html, and the renderer reports a JSON');
+say('    # parse error instead of a 404.');
+say('    location /host/ { return 404; }');
+say('');
+say('    # The server list, a file because nothing here generates one.');
+say('    location = /host/config {');
+say('        root /srv/caden-web;');
+say('        default_type application/json;');
+say('        add_header Cache-Control "no-cache" always;');
+say('    }');
+say('');
+say('    # The console itself. app/web, copied up by the rsync in step 4.');
 say('    location / {');
 say('        root /srv/caden-web;');
 say('        try_files $uri /index.html;');
@@ -167,7 +199,29 @@ for (const p of tunnelled) {
   say('');
 }
 
-say('# ─── 3. The console files, and the list of servers it should show',
+say('',
+    '# ─── 3. Ban whoever keeps getting it wrong (fail2ban)',
+    '#',
+    '# Rate limiting caps the speed; this ends the attempt. Five wrong guesses',
+    '# in ten minutes and the address is gone for an hour, which turns the',
+    '# arithmetic on a guessable password from days into never.',
+    '#',
+    '#   /etc/fail2ban/jail.d/caden.conf',
+    '#     [caden-auth]',
+    '#     enabled  = true',
+    '#     filter   = nginx-http-auth',
+    '#     port     = http,https',
+    '#     backend  = polling',
+    '#     logpath  = /var/log/nginx/error.log',
+    '#     maxretry = 5',
+    '#     findtime = 600',
+    '#     bantime  = 3600',
+    '#',
+    '# `backend = polling` is not optional on Debian and Ubuntu: the default is',
+    '# systemd, and a jail reading the journal never sees nginx, which logs to',
+    '# files. Without it the jail reports itself enabled and watches nothing.');
+
+say('# ─── 4. The console files, and the list of servers it should show',
     '#',
     `#   rsync -a --delete app/web/ <you>@${hostname}:/srv/caden-web/`,
     '#',

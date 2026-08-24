@@ -116,6 +116,52 @@ Two other things solve it, with different costs.
 Both leave everything above intact — the daemon serves the console the same
 way. Only the thing in front of it changes.
 
+## The password, and what stands behind it
+
+`auth_basic` is the whole door. Behind it is a service that runs arbitrary
+commands and holds your model API keys, on a hostname that appeared in
+Certificate Transparency logs minutes after the certificate was issued and is
+scanned continuously. Generate the password; do not invent one.
+
+If you use one you can remember anyway — and people do — two things make that
+survivable, and the generator emits both.
+
+**Rate limiting.** bcrypt at `htpasswd`'s default cost verifies in about ten
+milliseconds and nginx will do it as fast as anyone asks, so a guessable
+password falls in days. Raising the bcrypt cost is the wrong lever: a browser
+sends basic auth on every stylesheet, font and poll, so the cost is paid on
+every request by the person who *knows* the password. Capping the rate costs
+that person nothing — an event stream is one connection, not a poll — and caps
+the attacker at two attempts a second.
+
+**fail2ban** is what actually ends it: five wrong guesses in ten minutes and
+the address is gone for an hour. That is 120 attempts a day from one address,
+which turns a hundred million combinations from days into longer than you will
+be alive.
+
+```
+[caden-auth]
+enabled  = true
+filter   = nginx-http-auth
+port     = http,https
+backend  = polling
+logpath  = /var/log/nginx/error.log
+maxretry = 5
+findtime = 600
+bantime  = 3600
+```
+
+`backend = polling` is not optional on Debian or Ubuntu. The default is
+`systemd`, and a jail reading the journal never sees nginx, which logs to
+files — the jail reports itself enabled and watches nothing.
+
+Locking yourself out is a real possibility with `maxretry = 5`. It bans
+`http,https` only, so ssh still works:
+
+```
+fail2ban-client set caden-auth unbanip <your address>
+```
+
 ## Security, briefly
 
 - The daemon still binds `127.0.0.1`. Nothing in this arrangement exposes it
