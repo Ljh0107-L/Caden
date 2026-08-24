@@ -31,6 +31,15 @@ Three of these were only true on a desktop.
 Groundwork for reaching a daemon through a browser rather than an ssh
 forward:
 
+- **Attachments work without a native file panel.** The `+` button raised the
+  macOS open panel and sent the path it returned; a browser has no path to
+  give, and behind a reverse proxy there is no `/host/*` to send it to. Where
+  there is no panel the button now opens the browser's own picker and uploads
+  the bytes straight to the daemon — which is the endpoint the Mac route ends
+  up calling anyway, so what lands in the message is the same server path. The
+  rule about what counts as an image the model can read is copied from the Mac
+  side rather than re-decided: a photo picked on a phone and one dropped on
+  the desktop have to become the same thing.
 - **The daemon can resolve a provider key itself.** The renderer has never
   held a model API key — it sends the provider's id and the Mac's host server
   swaps in the value from the login keychain. A reverse proxy cannot do that;

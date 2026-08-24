@@ -19,6 +19,7 @@
 //   node tests/e2e/gateway.mjs
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import { start } from './harness.mjs';
@@ -122,6 +123,25 @@ try {
   // that buffers would hang here rather than fail, so the timeout above is
   // the assertion.
   check('the event stream survives the extra hop', true);
+
+  // Attachments: no native panel to raise, so the + button opens the
+  // browser's own and the bytes go straight at the daemon's upload endpoint.
+  // What lands in the message is a path on the server, the same as the Mac
+  // route produces -- the file has to physically get there either way.
+  const scratch = path.join(os.tmpdir(), `caden-gw-attach-${Date.now()}.txt`);
+  fs.writeFileSync(scratch, 'attached through the gateway\n');
+  const chooser = page.waitForEvent('filechooser', { timeout: 8000 });
+  await page.locator('.composer-plus').first().click();
+  await (await chooser).setFiles(scratch);
+  await page.waitForFunction(
+    () => /uploads|\/[^\s]*caden-gw-attach/.test(
+      document.querySelector('.composer-editor')?.innerText || ''),
+    null, { timeout: 15000 });
+  const composed = await page.locator('.composer-editor').first().innerText();
+  check('the + button uploads through the daemon and inserts the path',
+        !composed.includes('could not attach') && composed.trim().length > 0,
+        composed.trim().slice(0, 90));
+  fs.rmSync(scratch, { force: true });
 
   // -- what must not be offered ------------------------------------------
   await page.locator('.collapsed-strip button').click();

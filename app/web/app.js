@@ -2105,6 +2105,11 @@ function buildStatusRow(ctl, entry, onToggleContext) {
 /// up carrying is a path the agent can open, not a blob the model has to be
 /// handed.
 async function attachFiles(entry, prompt, plus) {
+  // No native panel here: raise the browser's own, and send bytes rather than
+  // paths. Same destination -- the daemon's upload endpoint is what the Mac
+  // route ends up calling too -- so what lands in the message is identical.
+  if (!can('filePicker')) return attachFromBrowser(entry, prompt, plus);
+
   let files;
   try {
     files = await pickFiles();
@@ -2127,6 +2132,47 @@ async function attachFiles(entry, prompt, plus) {
   }
   if (plus) { plus.disabled = false; plus.title = was || ''; }
   prompt.focus();
+}
+
+/// The + button where there is no native panel to raise.
+///
+/// A browser gives bytes and a name, never a path, which is the same hand the
+/// paste path is dealt -- so this walks the same road, straight at the
+/// daemon. The input is created per click and dropped afterwards: a hidden
+/// one parked in the DOM keeps its last selection, and picking the same file
+/// twice in a row then fires no change event at all.
+function attachFromBrowser(entry, prompt, plus) {
+  return new Promise(resolve => {
+    const input = el('input', { type: 'file', multiple: true,
+                                style: 'display:none' });
+    input.addEventListener('change', async () => {
+      const files = [...input.files];
+      input.remove();
+      if (!files.length) return resolve();
+      const was = plus?.title;
+      if (plus) { plus.disabled = true; plus.title = 'Attaching…'; }
+      for (const file of files) {
+        prompt.insert(`[uploading ${file.name}…]`);
+        try {
+          const got = await entry.api.attachLocalFile(file);
+          if (got.kind === 'image') {
+            prompt.replace(`[uploading ${file.name}…]`, '');
+            prompt.attach(got);
+          } else {
+            prompt.replace(`[uploading ${file.name}…]`, got.path);
+          }
+        } catch (e) {
+          prompt.replace(`[uploading ${file.name}…]`,
+                         `[could not attach ${file.name}: ${e.message || e}]`);
+        }
+      }
+      if (plus) { plus.disabled = false; plus.title = was || ''; }
+      prompt.focus();
+      resolve();
+    }, { once: true });
+    document.body.append(input);
+    input.click();
+  });
 }
 
 /// A non-image pasted straight out of Finder: the renderer can read its bytes

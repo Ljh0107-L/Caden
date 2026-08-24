@@ -109,6 +109,30 @@ export async function provision(id, opts = {}, onStep) {
 export const startTunnel = id   => hostCall('POST', `/host/servers/${id}/tunnel`);
 export const stopTunnel  = id   => hostCall('DELETE', `/host/servers/${id}/tunnel`);
 
+// Attachment rules, mirrored from app/host.js. Two copies, because the two
+// entry points are on opposite sides of the wire and the rule has to be the
+// same on both -- a photo picked on a phone and one dropped on the desktop
+// must become the same thing.
+const MODEL_IMAGE = { '.png': 'image/png', '.jpg': 'image/jpeg',
+                      '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+                      '.webp': 'image/webp' };
+const IMAGE_MAX = 4 << 20;
+const ATTACH_MAX = 50 << 20;
+const CHUNK = 4 << 20;
+
+const humanSize = n => n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB`
+                                    : `${Math.ceil(n / 1024)} KB`;
+
+/// btoa needs a binary string, and String.fromCharCode(...bytes) overflows the
+/// argument list on anything bigger than a small image.
+function base64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
 export class DaemonAPI {
   constructor(serverId) {
     this.base = `/proxy/${serverId}`;
@@ -162,6 +186,48 @@ export class DaemonAPI {
                         keepQueue ? { query: { keep_queue: '1' } } : undefined);
   }
   stopSession(id) { return this.request('POST', `/v1/sessions/${id}/stop`); }
+  /// Attach a File the browser handed us, with only the daemon to talk to.
+  ///
+  /// The Mac route for this is /host/servers/<id>/attach, which reads the
+  /// path off disk -- a browser has no path, and behind a reverse proxy there
+  /// is no /host/* at all. Everything it does is reachable from here though:
+  /// /v1/uploads is a begin, some chunks and a complete.
+  ///
+  /// The rule about what "attach" means is copied from host.js rather than
+  /// re-decided: an image the model can read rides in the turn as bytes,
+  /// anything else is pushed to the server and comes back as a path. Picking
+  /// a photo on a phone and dropping one on the desktop have to land in the
+  /// same place.
+  async attachLocalFile(file) {
+    if (file.size > ATTACH_MAX) {
+      throw new Error(`${file.name} is ${humanSize(file.size)}; attachments are `
+                      + `capped at ${humanSize(ATTACH_MAX)}`);
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const mime = MODEL_IMAGE[(file.name.match(/\.[^.]+$/) || [''])[0].toLowerCase()];
+    if (mime && file.size <= IMAGE_MAX) {
+      return { kind: 'image', name: file.name, media_type: mime,
+               data: base64(bytes) };
+    }
+
+    const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+    const begun = await this.request('POST', '/v1/uploads',
+      { body: { name: file.name, size: file.size, sha256: digest } });
+    const id = begun.upload.id;
+    for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+      const chunk = bytes.subarray(offset, offset + CHUNK);
+      const res = await fetch(`${this.base}/v1/uploads/${id}?offset=${offset}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk,
+      });
+      if (!res.ok) throw new Error(`upload failed: HTTP ${res.status}`);
+    }
+    const done = await this.request('POST', `/v1/uploads/${id}/complete`);
+    return { kind: 'file', path: done.upload.path, name: file.name, size: file.size };
+  }
+
   fsList(path, hidden = false) {
     return this.request('GET', '/v1/fs',
                         { query: { path, hidden: hidden ? '1' : '0' } });
