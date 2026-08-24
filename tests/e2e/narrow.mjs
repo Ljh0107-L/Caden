@@ -39,6 +39,27 @@ const clipped = page => page.evaluate(() => {
   return [...new Set(out)];
 });
 
+/// A child sticking out of the box that is supposed to contain it.
+///
+/// Different from both of the other two: the page does not scroll sideways
+/// and no text is clipped, because the parent is not clipping -- the chip
+/// simply hangs past the edge of the card it is drawn in. That is what the
+/// composer's controls did at 390px: the row could wrap, but the group
+/// holding model, permission and effort could not, so the last chip went
+/// over the side.
+const spilling = page => page.evaluate(() => {
+  const out = [];
+  for (const n of document.querySelectorAll('*')) {
+    const p = n.parentElement;
+    if (!p || !n.getClientRects().length) continue;
+    if (getComputedStyle(p).overflow !== 'visible') continue;   // clipping is deliberate
+    const a = n.getBoundingClientRect(), b = p.getBoundingClientRect();
+    if (b.width && (a.right > b.right + 0.5 || a.left < b.left - 0.5))
+      out.push(`${n.tagName.toLowerCase()}.${(n.className || '').toString().slice(0, 30)}`);
+  }
+  return [...new Set(out)];
+});
+
 /// Anything wider than the viewport, named. A bare scrollWidth comparison says
 /// the page overflows but not what did it, and the offender is always a fixed
 /// width on one element.
@@ -83,6 +104,10 @@ try {
   check('the composer fits on screen',
         box.x >= 0 && box.x + box.width <= IPHONE.width,
         `x=${Math.round(box.x)} w=${Math.round(box.width)}`);
+
+  const spill = await spilling(page);
+  check('nothing hangs out of the box it is drawn in', spill.length === 0,
+        spill.join(', '));
 
   const fontPx = await page.locator('.empty-state .composer-editor')
     .evaluate(n => parseFloat(getComputedStyle(n).fontSize));
@@ -139,6 +164,26 @@ try {
   const cut = await clipped(page);
   check('nothing on the Servers pane is cut off', cut.length === 0, cut.join(' | '));
   await page.keyboard.press('Escape');
+
+  // 6c. The one accent in the interface was a hex pair picked against the
+  //     dark canvas -- pale blue on translucent blue -- which in the light
+  //     theme is pale blue on pale blue. Everything else here derives from
+  //     --base and flips with the scheme; asserting the two differ is what
+  //     catches the next colour that forgets to.
+  const accentIn = async scheme => {
+    await page.emulateMedia({ colorScheme: scheme });
+    return page.evaluate(() => {
+      const el = document.createElement('div');
+      el.className = 'srv-btn accent';
+      document.body.append(el);
+      const c = getComputedStyle(el).color;
+      el.remove();
+      return c;
+    });
+  };
+  const [light, dark] = [await accentIn('light'), await accentIn('dark')];
+  check('the accent colour follows the theme', light !== dark, `${light} / ${dark}`);
+  await page.emulateMedia({ colorScheme: null });
 
   // 7. A finger cannot hover, and the row actions were `pointer-events: none`
   //    until it did -- so on a phone there was no way to archive a session

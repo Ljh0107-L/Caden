@@ -16,6 +16,18 @@ Three of these were only true on a desktop.
   the desktop toggle already had, laid over each other rather than side by
   side — and picking a session puts it away again. Nothing new to install:
   the renderer was always a plain web page.
+- **Nothing hangs off the side of the box it is drawn in.** The composer's
+  outer row wraps; the group inside it holding model, permission and effort
+  did not, so on a 390px screen the last chip went over the edge of the card.
+  That is a third kind of overflow, distinct from the page scrolling sideways
+  and from text being clipped — nothing was clipping, the chip was simply
+  outside. The narrow walk checks for all three now.
+- **The one accent colour works in the light theme.** `.srv-btn.accent` — the
+  button that says an engine has an update — was a hex pair chosen against the
+  dark canvas: pale blue text on translucent blue. In the light theme that is
+  pale blue on pale blue, and the button read as disabled. Everything else in
+  the stylesheet derives from `--base` and flips with the scheme; this does
+  now too.
 - **Nothing on a phone ends in an ellipsis.** Truncation is a desktop bargain:
   a line that does not fit costs less than the rows around it going ragged,
   and the rest is a hover away. Neither half holds on a phone — there is no
