@@ -57,13 +57,26 @@ worth adding, since every later upgrade goes the same way.
 
 ## Setting it up
 
+**From the app: the Web pane**, under Models. It asks for the three facts only
+you know — the hostname, which machine runs the proxy, which server's daemon
+serves the console — and does the rest over ssh, streaming what it is doing:
+the certificate, the nginx block with each daemon's token in it, the rate
+limit, the ban rule. Apply is also how you change any of it later; the
+configuration is rewritten each time, and rolled back if nginx refuses it.
+
+The password is set from the same pane and goes straight through to the
+daemon. Caden does not keep a copy: the only thing that needs it is the
+process being asked to check it.
+
+**From a terminal**, if you would rather read it before it happens:
+
 ```
 scripts/web-gateway.cjs caden.example.net
 ```
 
-It reads your config and prints the nginx block, a systemd unit per server, and
-the `host/config` file the console reads — with each daemon's token already
-filled in. It applies nothing; read it, then paste it.
+It prints the same nginx block, a systemd unit per tunnelled server, and the
+`host/config` the console reads, with the tokens filled in. It applies
+nothing; read it, then paste it.
 
 The tokens are the reason the script exists. They are 44 characters of base64,
 one per server, and a character wrong gives you a 401 from a daemon that is

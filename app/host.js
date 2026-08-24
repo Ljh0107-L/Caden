@@ -1235,6 +1235,72 @@ async function route(req, res, url) {
     return true;
   }
 
+  if (p === '/host/web/status') {
+    try { json(res, 200, await webStatus()); }
+    catch (e) { json(res, 500, { error: String(e.message || e) }); }
+    return true;
+  }
+
+  if (p === '/host/web/settings' && req.method === 'POST') {
+    const body = await readBody(req);
+    const clean = {};
+    for (const k of ['hostname', 'gatewayHost', 'serverId']) {
+      if (typeof body[k] === 'string') clean[k] = body[k].trim();
+    }
+    return json(res, 200, saveWebConfig(clean)), true;
+  }
+
+  if (p === '/host/web/apply' && req.method === 'POST') {
+    // Same streaming shape as provisioning: most of the time is spent inside
+    // one ssh command, and a blank response for a minute reads as a hang.
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+    });
+    const send = e => res.write(`${JSON.stringify(e)}\n`);
+    try {
+      const result = await applyWebGateway(text => send({ type: 'step', text }));
+      send({ type: 'done', ok: true, result });
+    } catch (e) {
+      send({ type: 'done', ok: false, error: String(e.message || e) });
+    }
+    res.end();
+    return true;
+  }
+
+  if (p === '/host/web/password' && req.method === 'POST') {
+    const body = await readBody(req);
+    const pw = String(body.password || '');
+    if (pw.length < 8) return json(res, 400, { error: 'that password is too short to be worth storing' }), true;
+    const web = webConfig();
+    const server = (readConfig().servers || []).find(x => x.id === web.serverId);
+    if (!server) return json(res, 400, { error: 'choose which server serves the console first' }), true;
+    try {
+      const home = server.remoteHome || REMOTE_HOME;
+      // Through stdin, so it is not in the process list on the way past or in
+      // a shell history afterwards.
+      await provisionShell(server)(
+        `CADEN_HOME=${home} python3 ${home}/heartbeat.py --set-web-password`,
+        { input: `${pw}\n` });
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 502, { error: String(e.message || e) }); }
+    return true;
+  }
+
+  if (p === '/host/web/logout-all' && req.method === 'POST') {
+    const web = webConfig();
+    const server = (readConfig().servers || []).find(x => x.id === web.serverId);
+    if (!server) return json(res, 400, { error: 'no console server chosen' }), true;
+    try {
+      const home = server.remoteHome || REMOTE_HOME;
+      await provisionShell(server)(
+        `curl -sS -X POST -H "Authorization: Bearer $(cat ${home}/token)" `
+        + `http://127.0.0.1:${server.remotePort || DEFAULT_PORT}/v1/web/logout-all`);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 502, { error: String(e.message || e) }); }
+    return true;
+  }
+
   if (p === '/host/files/pick' && req.method === 'POST') {
     try { json(res, 200, { files: await pickFiles() }); }
     catch (e) { json(res, 501, { error: String(e.message || e) }); }
@@ -1316,6 +1382,318 @@ async function route(req, res, url) {
   }
 
   return false;
+}
+
+// --------------------------------------------------------------------------
+// the web gateway
+//
+// A reverse proxy in front of one or more daemons, so a browser can reach a
+// session with this Mac switched off. Two ssh identities, because they are
+// two jobs: the gateway's nginx lives in /etc, which wants root, and the
+// daemon deliberately does not run as root -- an agent that runs arbitrary
+// commands should not be running them as one.
+//
+// nginx proxies `/` to a daemon rather than serving app/web off the gateway's
+// disk. That daemon already has the console (provisioning put it there), so
+// there is nothing to copy, nothing to keep in step, and no way for the
+// gateway's copy to drift from the protocol the daemon speaks.
+// --------------------------------------------------------------------------
+
+const WEB_ROOT_REMOTE = '/srv/caden-web';
+
+function webConfig() {
+  const cfg = readConfig();
+  return { hostname: '', gatewayHost: '', serverId: '', ...(cfg.web || {}) };
+}
+
+function saveWebConfig(patch) {
+  const cfg = readConfig();
+  cfg.web = { ...webConfig(), ...patch };
+  writeConfig(cfg);
+  return cfg.web;
+}
+
+/// A shell on the gateway. Not provisionShell: that one is about the machine
+/// a daemon runs on, and this is about the machine nginx runs on, which is
+/// reached as somebody who can write /etc.
+function gatewayShell(gatewayHost) {
+  if (!gatewayHost) throw new Error('no gateway host chosen');
+  return (command, opts) => ssh({ sshHost: gatewayHost }, command, opts);
+}
+
+/// One `location` per daemon, with that daemon's token added on the way past.
+/// The renderer already addresses servers as `/proxy/<id>/...`; this is the
+/// same swap app/server.js does for it locally, written as configuration.
+function webProxyBlocks(servers, ports) {
+  return servers.map(s => {
+    const port = ports.get(s.id);
+    return [
+      `    # ${(s.name || s.sshHost || s.id).replace(/[\r\n]/g, ' ')}`,
+      `    location /proxy/${s.id}/ {`,
+      `        proxy_pass http://127.0.0.1:${port}/;`,
+      `        proxy_set_header Authorization "Bearer ${daemonToken(s)}";`,
+      '        proxy_http_version 1.1;',
+      '        proxy_set_header Connection "";',
+      '        # An event stream that nginx buffers does not fail, it hangs --',
+      '        # and looks exactly like a daemon that died.',
+      '        proxy_buffering off;',
+      '        proxy_read_timeout 3600s;',
+      '        client_max_body_size 64m;',
+      '    }',
+    ].join('\n');
+  }).join('\n\n');
+}
+
+function webSiteConfig({ hostname, consolePort, servers, ports }) {
+  return `# Written by Caden. Edits here are replaced the next time the Web
+# pane applies its settings.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name ${hostname};
+
+    # Named rather than left to certbot. This file is rewritten on every
+    # apply, so anything certbot inserted into the previous one is gone --
+    # which is exactly how the first version of this took the site down: a
+    # server block with no listener, accepted by nginx -t, answering nothing.
+    ssl_certificate     /etc/letsencrypt/live/${hostname}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${hostname}/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    limit_req zone=caden burst=50 nodelay;
+    limit_req_status 429;
+
+    # Checked before anything is served, including the routes that proxy to
+    # other machines -- those never reach the daemon that owns the session, so
+    # a check living only in a daemon would not cover them.
+    auth_request /_caden_verify;
+    error_page 401 = @caden_login;
+
+    location = /_caden_verify {
+        internal;
+        proxy_pass http://127.0.0.1:${consolePort}/v1/web/verify;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+    location @caden_login { return 302 /login?next=$request_uri; }
+
+    # Signing in cannot require being signed in.
+    location = /login {
+        auth_request off;
+        proxy_pass http://127.0.0.1:${consolePort}/login;
+        proxy_set_header Host $host;
+    }
+    location = /v1/web/login {
+        auth_request off;
+        proxy_pass http://127.0.0.1:${consolePort}/v1/web/login;
+        proxy_set_header Host $host;
+    }
+    location = /v1/web/logout {
+        auth_request off;
+        proxy_pass http://127.0.0.1:${consolePort}/v1/web/logout;
+        proxy_set_header Host $host;
+    }
+
+    # The server list. A file, because nothing on this side generates one.
+    location = /host/config {
+        root ${WEB_ROOT_REMOTE};
+        default_type application/json;
+        add_header Cache-Control "no-cache" always;
+    }
+    # Everything else under /host/ is the desktop app's control plane and does
+    # not exist here. Saying 404 beats letting the console below answer with
+    # index.html, which the renderer then fails to parse as JSON.
+    location /host/ { return 404; }
+
+${webProxyBlocks(servers, ports)}
+
+    # The console itself, from the daemon that already has it -- so there is
+    # no second copy on this machine to fall out of step.
+    location / {
+        proxy_pass http://127.0.0.1:${consolePort}/;
+        proxy_set_header Authorization "Bearer ${daemonToken(servers.find(x => ports.get(x.id) === consolePort) || servers[0])}";
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+    }
+}
+
+# Plain HTTP exists only to send people to the other one, and to carry the
+# ACME challenge when the certificate is renewed.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${hostname};
+    location /.well-known/acme-challenge/ { root ${WEB_ROOT_REMOTE}; }
+    location / { return 301 https://$host$request_uri; }
+}
+`;
+}
+
+/// What the console reads instead of asking a host process, because behind a
+/// proxy there is no host process. No capabilities: nothing here can add a
+/// server, run ssh or raise a file dialog.
+function webHostConfig(servers) {
+  const cfg = readConfig();
+  return JSON.stringify({
+    servers: servers.map(s => ({ id: s.id, name: s.name || s.sshHost || s.id,
+                                 mode: 'direct', provisioned: true })),
+    models: cfg.models || [],
+    providers: (cfg.providers || []).map(({ apiKey, ...rest }) => ({ ...rest, hasKey: true })),
+    defaults: {
+      workdir: cfg.defaultWorkdir || '~',
+      permissionMode: cfg.defaultPermissionMode || 'bypassPermissions',
+    },
+    capabilities: {},
+  }, null, 2);
+}
+
+/// Set the gateway up, or bring it in line with the settings. Idempotent:
+/// this is also how you apply a changed hostname or a new server.
+///
+/// Everything runs as one script over one ssh connection, the way
+/// provisioning does, so a half-applied state is a script that stopped rather
+/// than five commands that partly went through.
+async function applyWebGateway(onStep = () => {}) {
+  const { hostname, gatewayHost, serverId } = webConfig();
+  if (!hostname) throw new Error('choose a hostname first');
+  if (!gatewayHost) throw new Error('choose which machine runs the proxy');
+  const server = (readConfig().servers || []).find(x => x.id === serverId);
+  if (!server) throw new Error('choose which server serves the console');
+  if (!daemonToken(server)) {
+    throw new Error(`no daemon token for ${server.name || serverId} — provision it first`);
+  }
+
+  const consolePort = server.remotePort || DEFAULT_PORT;
+  const ports = new Map([[server.id, consolePort]]);
+  const sh = gatewayShell(gatewayHost);
+  const marker = `__CADEN_${require('crypto').randomBytes(9).toString('hex')}__`;
+  const file = (path_, body, mode) => [
+    `cat > ${path_} <<'${marker}'`, body.replace(/\n$/, ''), marker,
+    mode ? `chmod ${mode} ${path_}` : '',
+  ].filter(Boolean).join('\n');
+
+  onStep('checking the gateway…');
+  const pre = await sh('command -v nginx >/dev/null && echo nginx; '
+                     + 'command -v certbot >/dev/null && echo certbot; '
+                     + 'id -u');
+  if (!/nginx/.test(pre.stdout)) throw new Error(`${gatewayHost} has no nginx`);
+  if ((pre.stdout.match(/^0$/m) || []).length === 0) {
+    throw new Error(`${gatewayHost} does not connect as root, and /etc/nginx needs it`);
+  }
+  const haveCertbot = /certbot/.test(pre.stdout);
+
+  // A plain HTTP site first, so certbot has something to attach to and its
+  // challenge is not behind the sign-in that does not exist yet.
+  onStep('writing a temporary site so a certificate can be issued…');
+  await sh([
+    'set -eu',
+    `mkdir -p ${WEB_ROOT_REMOTE}`,
+    file(`/etc/nginx/sites-available/${hostname}`,
+         `server {\n    listen 80;\n    listen [::]:80;\n    server_name ${hostname};\n`
+         + `    root ${WEB_ROOT_REMOTE};\n}\n`),
+    `ln -sf /etc/nginx/sites-available/${hostname} /etc/nginx/sites-enabled/${hostname}`,
+    'nginx -t >/dev/null',
+    'systemctl reload nginx',
+  ].join('\n'));
+
+  const certPath = `/etc/letsencrypt/live/${hostname}/fullchain.pem`;
+  const existing = await sh(`test -f ${certPath} && echo yes || echo no`);
+  if (!/yes/.test(existing.stdout)) {
+    if (!haveCertbot) throw new Error(`${gatewayHost} has no certbot, and there is no certificate for ${hostname}`);
+    onStep(`asking Let's Encrypt for a certificate for ${hostname}…`);
+    const out = await sh(`certbot --nginx -d ${hostname} --non-interactive --agree-tos `
+                       + '--register-unsafely-without-email --redirect 2>&1 | tail -4');
+    const now = await sh(`test -f ${certPath} && echo yes || echo no`);
+    if (!/yes/.test(now.stdout)) {
+      throw new Error(`certbot did not produce a certificate: ${out.stdout.trim().slice(0, 300)}`);
+    }
+  } else {
+    onStep('certificate already there');
+  }
+
+  onStep('writing the proxy configuration…');
+  const site = webSiteConfig({ hostname, consolePort, servers: [server], ports });
+  await sh([
+    'set -eu',
+    file('/etc/nginx/conf.d/caden-ratelimit.conf',
+         '# Two a second sustained is far above anything real use produces --\n'
+       + '# an event stream is one connection, not a poll -- and the burst in\n'
+       + '# the site below covers a cold page load. What it caps is guessing.\n'
+       + 'limit_req_zone $binary_remote_addr zone=caden:1m rate=120r/m;\n'),
+    file(`${WEB_ROOT_REMOTE}/host/config.tmp`, webHostConfig([server])),
+    `mkdir -p ${WEB_ROOT_REMOTE}/host`,
+    `mv -f ${WEB_ROOT_REMOTE}/host/config.tmp ${WEB_ROOT_REMOTE}/host/config || true`,
+    // Written beside the live one and moved into place only once nginx has
+    // agreed to it, so a rejected config cannot take the site down.
+    file(`/etc/nginx/sites-available/${hostname}.new`, site),
+    `cp /etc/nginx/sites-available/${hostname} /etc/nginx/sites-available/${hostname}.prev || true`,
+    `mv -f /etc/nginx/sites-available/${hostname}.new /etc/nginx/sites-available/${hostname}`,
+    `if ! nginx -t 2>/tmp/caden-nginx.err; then `
+      + `mv -f /etc/nginx/sites-available/${hostname}.prev /etc/nginx/sites-available/${hostname}; `
+      + 'cat /tmp/caden-nginx.err >&2; exit 1; fi',
+    `rm -f /etc/nginx/sites-available/${hostname}.prev`,
+    'systemctl reload nginx',
+  ].join('\n')).catch(e => {
+    throw new Error(`nginx refused the configuration and it was rolled back: ${String(e.message || e).slice(0, 300)}`);
+  });
+
+  onStep('installing the brute-force ban…');
+  await sh([
+    'set -eu',
+    'if command -v fail2ban-client >/dev/null 2>&1; then',
+    file('/etc/fail2ban/filter.d/caden-login.conf',
+         '[Definition]\nfailregex = ^<HOST> .* "POST /v1/web/login HTTP/[0-9.]+" 401\nignoreregex =\n'),
+    // backend=polling is not optional on Debian: the default reads the
+    // journal, and nginx logs to files, so the jail would watch nothing while
+    // reporting itself enabled.
+    file('/etc/fail2ban/jail.d/caden.conf',
+         '[caden-auth]\nenabled  = true\nfilter   = caden-login\n'
+       + 'port     = http,https\nbackend  = polling\n'
+       + 'logpath  = /var/log/nginx/access.log\n'
+       + 'maxretry = 5\nfindtime = 600\nbantime  = 3600\n'),
+    'systemctl restart fail2ban || true',
+    'else echo "no fail2ban on this host; skipped" >&2; fi',
+  ].join('\n'));
+
+  onStep('done');
+  return { hostname, url: `https://${hostname}/` };
+}
+
+/// Whether the console has a password yet, and whether the address answers.
+async function webStatus() {
+  const web = webConfig();
+  const servers = (readConfig().servers || []).filter(s => s.provisioned);
+  const out = { ...web, servers: servers.map(s => ({ id: s.id, name: s.name || s.sshHost || s.id })),
+                sshHosts: sshHosts().map(h => h.host), passwordSet: null,
+                cert: null, reachable: null };
+  const server = servers.find(s => s.id === web.serverId);
+  if (server) {
+    const sh = provisionShell(server);
+    const home = server.remoteHome || REMOTE_HOME;
+    const r = await sh(`test -s ${home}/web-password && echo yes || echo no`).catch(() => null);
+    out.passwordSet = r ? /yes/.test(r.stdout) : null;
+  }
+  if (web.gatewayHost && web.hostname) {
+    const sh = gatewayShell(web.gatewayHost);
+    const r = await sh(`openssl x509 -enddate -noout -in `
+      + `/etc/letsencrypt/live/${web.hostname}/fullchain.pem 2>/dev/null || true`).catch(() => null);
+    const m = r && /notAfter=(.+)/.exec(r.stdout);
+    out.cert = m ? m[1].trim() : null;
+  }
+  if (web.hostname) {
+    // The sign-in redirect is the healthy answer: it means nginx is there and
+    // the check in front of it is working.
+    out.reachable = await new Promise(resolve => {
+      const req = https.request(`https://${web.hostname}/`, { method: 'GET', timeout: 6000 },
+        r => { resolve(r.statusCode || 0); r.destroy(); });
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+      req.on('error', () => resolve(null));
+      req.end();
+    });
+  }
+  return out;
 }
 
 /// Called on quit: the forwards are this app's doing, so they go with it.

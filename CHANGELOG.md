@@ -97,6 +97,17 @@ forward:
   it did. The wire protocol is unchanged. A run that reads no keys at all —
   a locked keychain — leaves the ones already on the server alone instead of
   replacing them with nothing.
+- **The Web pane sets the gateway up.** Under Models in the desktop app: it
+  asks for the three facts only a person knows — the hostname, which machine
+  runs the proxy, which server's daemon serves the console — and does the rest
+  over ssh with its steps streaming, the way provisioning does. The
+  certificate, the nginx block with each daemon's 44-character token in it,
+  the rate limit, the ban rule. Apply is also how you change any of it later:
+  the configuration is rewritten each time, tested, and rolled back if nginx
+  refuses it. The password goes straight through to the daemon and is not kept
+  anywhere on this Mac. The pane is not offered to a console reached through
+  the gateway, which would be offering to reconfigure the thing you arrived
+  through.
 - **A root daemon says so before the turn, not during it.** `bypassPermissions`
   is `--dangerously-skip-permissions` underneath, and Claude Code refuses it
   under a uid of 0 — so on a daemon provisioned as root the default permission

@@ -106,6 +106,44 @@ export async function provision(id, opts = {}, onStep) {
   if (!done.ok) throw new Error(done.error || 'daemon provisioning failed');
   return done;
 }
+/// The web gateway -- the reverse proxy that lets a browser reach a daemon
+/// with this Mac switched off. All of it needs ssh and root somewhere, so all
+/// of it is the host's; a console served through the gateway declares no
+/// capabilities and never shows the pane that calls these.
+export const webStatus       = ()      => hostCall('GET', '/host/web/status');
+export const saveWebSettings = patch   => hostCall('POST', '/host/web/settings', patch);
+export const setWebPassword  = password => hostCall('POST', '/host/web/password', { password });
+export const logoutBrowsers  = ()      => hostCall('POST', '/host/web/logout-all');
+
+/// Applying it is minutes of ssh, so it streams its steps the way
+/// provisioning does rather than leaving a blank response.
+export async function applyWeb(onStep) {
+  const res = await fetch('/host/web/apply', { method: 'POST' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let done = null;
+  for (;;) {
+    const { value, done: ended } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !ended });
+    let nl;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch { continue; }
+      if (ev.type === 'step') onStep?.(ev.text);
+      if (ev.type === 'done') done = ev;
+    }
+    if (ended) break;
+  }
+  if (!done) throw new Error('the apply stream ended without a result');
+  if (!done.ok) throw new Error(done.error || 'applying the gateway failed');
+  return done.result;
+}
+
 export const startTunnel = id   => hostCall('POST', `/host/servers/${id}/tunnel`);
 export const stopTunnel  = id   => hostCall('DELETE', `/host/servers/${id}/tunnel`);
 

@@ -157,6 +157,13 @@ try {
         /heartbeat \d+\.\d+/.test(body) && !/not valid JSON/.test(body),
         body.replace(/\n/g, ' / ').slice(0, 160));
   check('no ssh-config section', !body.includes('From your SSH config'));
+
+  // The Web pane configures the very proxy this page arrived through, over
+  // ssh, as root. Offering it here would be offering to do all of that from
+  // inside the thing it sets up.
+  const nav = await page.locator('#sidebar .nav-row-label').allInnerTexts();
+  check('and no Web pane, which is the Mac\'s job', !nav.includes('Web'),
+        nav.join(', '));
   // Copy is part of it: describing ssh setup on a page that cannot offer it
   // sends someone hunting for a button that was deliberately not drawn.
   check('and the pane does not describe setting one up over ssh',

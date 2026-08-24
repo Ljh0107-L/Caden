@@ -7,7 +7,9 @@
 
 import { hostConfig, DaemonAPI, sshHosts, addServer, removeServer, installViaHost,
          serverStatus, provision, startTunnel, stopTunnel,
-         pickFiles, attachFile, attachBytes } from './api.js';
+         pickFiles, attachFile, attachBytes,
+         webStatus, saveWebSettings, applyWeb, setWebPassword,
+         logoutBrowsers } from './api.js';
 import { Transcript, groupRows, toolVerb, toolBucket, visibleFrom } from './transcript.js';
 import { renderMarkdown } from './markdown.js';
 import { renderDiff, diffFromToolInput } from './diff.js';
@@ -55,6 +57,8 @@ const state = {
   draft: { cwd: '', modelId: null, permissionMode: '' },
   editing: false,          // an inline editor owns the keyboard right now
   sidebarStale: false,     // a repaint was skipped while it did
+  web: null,               // the gateway's settings and state, once fetched
+  webBusy: null,           // what applying it is doing right now
 };
 
 /// What the thing serving this page can do on our behalf.
@@ -561,6 +565,12 @@ function select(sessionId, serverId) {
 function openPane(pane) {
   state.pane = pane;
   dismissOverlaySidebar();
+  if (pane === 'web') {
+    state.web = null;                       // so the pane paints "checking…"
+    webStatus().then(w => { state.web = w; renderWebPane(); })
+               .catch(e => { state.web = { error: String(e.message || e) };
+                             renderWebPane(); });
+  }
   if (pane === 'servers') {
     if (can('servers'))
       sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
@@ -646,8 +656,18 @@ function renderSidebar() {
   fillRow(rows[2], { label: 'Models', icon: 'robot',
                      active: state.pane === 'models',
                      onClick: () => openPane('models') });
+  // Setting a gateway up is ssh and root on somebody else's machine, so it
+  // belongs to the Mac. Served from a daemon there is nothing to configure
+  // and the row would only lead somewhere that says so.
+  if (can('servers')) {
+    fillRow(rows[3], { label: 'Web', icon: 'server',
+                       active: state.pane === 'web',
+                       onClick: () => openPane('web') });
+  } else {
+    rows[3]?.remove();
+  }
   // Only the first row carries a shortcut badge.
-  for (const r of [rows[1], rows[2]])
+  for (const r of [rows[1], rows[2], rows[3]])
     r?.querySelectorAll('.nav-row-end').forEach(n => n.replaceChildren());
 
   const content = el('div', { class: cls('contentCls'), id: 'server-list' });
@@ -910,6 +930,7 @@ function renderMain() {
     c.rowNodes = null;
   }
 
+  if (state.pane === 'web') { renderWebPane(); return; }
   if (state.pane === 'models') { renderModelsPane(); return; }
   if (state.pane === 'servers') { renderServersPane(); return; }
   if (state.pane?.sessionDetail) {
@@ -2924,8 +2945,8 @@ const srvLine = (mark, label, detail, action) =>
     el('span', { class: 'srv-detail' }, detail || ''),
     action || null);
 
-const srvBtn = (label, onclick) => {
-  const b = el('button', { class: 'srv-btn' }, label);
+const srvBtn = (label, onclick, extra) => {
+  const b = el('button', { class: `srv-btn${extra ? ' ' + extra : ''}` }, label);
   b.onclick = onclick;
   return b;
 };
@@ -3135,6 +3156,165 @@ function renderServersPane() {
   paintPane('Servers',
     el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
       body));
+}
+
+// ---------------------------------------------------------------- web pane
+//
+// The gateway is a reverse proxy in front of a daemon, and setting one up is
+// four fiddly things -- a certificate, a password, an nginx block carrying a
+// 44-character token, a ban rule -- of which exactly one is interesting. The
+// pane does them; what it asks for is the three facts only a person knows.
+
+function webField(label, value, hint, onPick) {
+  const btn = el('button', { class: 'srv-btn', type: 'button' },
+                 value || 'choose…');
+  btn.addEventListener('click', e => onPick(e.currentTarget));
+  return srvLine(value ? 'ok' : 'none', label, hint || '', btn);
+}
+
+async function webSet(patch) {
+  state.web = { ...state.web, ...await saveWebSettings(patch) };
+  renderWebPane();
+  webStatus().then(w => { state.web = w; renderWebPane(); }).catch(() => {});
+}
+
+function renderWebPane() {
+  if (state.pane !== 'web') return;
+  const w = state.web;
+  const body = el('div', { class: 'models-pane' },
+    el('div', { class: 'pane-intro' },
+      el('div', { class: 'pane-intro-title' }, 'Web'),
+      el('div', { class: 'pane-intro-sub' },
+        'Reach a server from a phone, with this Mac switched off. A proxy in '
+        + 'front of the daemon holds the certificate and asks for the '
+        + 'password.')));
+
+  if (!w) {
+    body.append(el('div', { class: 'prov-card' }, srvLine('busy', 'Checking…', '')));
+    return paintPane('Web',
+      el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
+         body));
+  }
+  if (w.error) {
+    body.append(el('div', { class: 'prov-card' }, el('div', { class: 'srv-error' }, w.error)));
+    return paintPane('Web',
+      el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
+         body));
+  }
+
+  // -- the three facts only a person knows -----------------------------
+  const setup = el('div', { class: 'prov-card' });
+  const hostInput = el('input', { class: 'inline-edit mono', spellcheck: 'false',
+                                  placeholder: 'caden.example.net',
+                                  style: 'min-width:180px' });
+  hostInput.value = w.hostname || '';
+  const commit = () => {
+    if ((hostInput.value || '').trim() !== (w.hostname || ''))
+      webSet({ hostname: hostInput.value });
+  };
+  hostInput.addEventListener('blur', commit);
+  hostInput.addEventListener('keydown', e => { if (e.key === 'Enter') hostInput.blur(); });
+  setup.append(srvLine(w.hostname ? 'ok' : 'none', 'Address',
+                       'an A record for it, pointing at the proxy', hostInput));
+
+  setup.append(webField('Proxy runs on', w.gatewayHost,
+    'ssh as somebody who can write /etc/nginx', anchor =>
+      openMenu(anchor, (w.sshHosts || []).map(h => ({
+        label: h, checked: h === w.gatewayHost,
+        action: () => webSet({ gatewayHost: h }),
+      })))));
+
+  const chosen = (w.servers || []).find(s => s.id === w.serverId);
+  setup.append(webField('Console from', chosen && chosen.name,
+    'the daemon whose copy of the console is served', anchor =>
+      openMenu(anchor, (w.servers || []).map(s => ({
+        label: s.name, checked: s.id === w.serverId,
+        action: () => webSet({ serverId: s.id }),
+      })))));
+  body.append(el('div', { class: 'prov-section' },
+    el('div', { class: 'prov-title-row' },
+      el('div', { class: 'prov-id' },
+        el('span', { class: 'prov-name' }, 'Settings'))), setup));
+
+  // -- what is true right now ------------------------------------------
+  const state_ = el('div', { class: 'prov-card' });
+  const busy = state.webBusy;
+  if (busy) {
+    state_.append(srvLine('busy', busy, ''));
+  } else {
+    state_.append(srvLine(w.cert ? 'ok' : 'bad', 'Certificate',
+      w.cert ? `expires ${w.cert}` : 'none yet — applying will ask for one'));
+    state_.append(srvLine(w.passwordSet ? 'ok' : 'bad', 'Password',
+      w.passwordSet ? 'set on the console daemon'
+                    : 'not set — nobody can sign in until it is',
+      srvBtn(w.passwordSet ? 'Change' : 'Set', () => webAskPassword())));
+    const reach = w.reachable;
+    state_.append(srvLine(reach === 302 || reach === 200 ? 'ok' : reach ? 'warn' : 'bad',
+      'Address',
+      reach === 302 ? 'answering, and asking to sign in'
+        : reach === 200 ? 'answering'
+        : reach ? `answering with ${reach}`
+        : w.hostname ? 'no answer' : 'no address yet'));
+    if (w.error) state_.append(el('div', { class: 'srv-error' }, w.error));
+  }
+  const acts = el('div', { class: 'prov-acts' });
+  if (!busy) {
+    acts.append(srvBtn(w.cert ? 'Apply' : 'Set up', () => webApply(), 'accent'));
+    if (w.passwordSet) {
+      acts.append(srvBtn('Sign out all browsers', async () => {
+        try { await logoutBrowsers(); setWebBusy('signed everyone out'); }
+        catch (e) { setWebBusy(String(e.message || e)); }
+        setTimeout(() => setWebBusy(null), 2500);
+      }));
+    }
+  }
+  body.append(el('div', { class: 'prov-section' },
+    el('div', { class: 'prov-title-row' },
+      el('div', { class: 'prov-id' },
+        el('span', { class: 'prov-name' }, 'Gateway'),
+        el('span', { class: 'prov-url' }, w.hostname ? `https://${w.hostname}/` : '')),
+      acts), state_));
+
+  paintPane('Web',
+    el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
+       body));
+}
+
+function setWebBusy(text) { state.webBusy = text; renderWebPane(); }
+
+async function webApply() {
+  setWebBusy('starting…');
+  try {
+    await applyWeb(text => setWebBusy(text));
+    state.web = await webStatus();
+    setWebBusy(null);
+  } catch (e) {
+    state.web = { ...state.web, error: String(e.message || e) };
+    setWebBusy(null);
+  }
+}
+
+/// Asked for in the pane rather than typed at a terminal, and sent straight
+/// through -- it is never held in the config or the keychain, because the
+/// only thing that needs it is the daemon it is being set on.
+function webAskPassword() {
+  const row = el('div', { class: 'prov-card' });
+  const input = el('input', { class: 'inline-edit', type: 'password',
+                              placeholder: 'at least 8 characters',
+                              style: 'min-width:200px' });
+  const save = srvBtn('Save', async () => {
+    try {
+      await setWebPassword(input.value);
+      setWebBusy('password set — every browser signed out');
+      state.web = await webStatus();
+    } catch (e) { setWebBusy(String(e.message || e)); }
+    setTimeout(() => setWebBusy(null), 2500);
+  });
+  row.append(srvLine('none', 'New password',
+                     'changing it signs out every browser', el('div', {}, input, save)));
+  const scroll = $main.querySelector('.pane-scroll .models-pane');
+  if (scroll) scroll.append(row);
+  input.focus();
 }
 
 function renderModelsPane() {
