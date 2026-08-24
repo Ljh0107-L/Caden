@@ -1290,6 +1290,33 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
     font-size: 16px; line-height: 24px; min-height: 24px;
   }
 
+  /* Truncation is a desktop bargain: a line that does not fit is worth less
+     than the rows around it staying aligned, and the full text is a tooltip
+     away. Neither half holds on a phone -- there is no hover to reveal it,
+     and vertical space is the one thing there is plenty of. So anything that
+     ended in an ellipsis wraps instead, and the page gets longer. */
+  .pane-intro-sub,
+  .prov-url,
+  .srv-detail {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    max-width: none;
+  }
+
+  /* The detail is the part that never fits: "2.1.241 (Claude Code) · daemon
+     too old to check" beside a label and a button leaves it about 150px. It
+     takes the next line whole instead -- `order` rather than DOM changes,
+     because the row is four siblings and the button belongs beside the
+     label, not below the text it describes. */
+  .srv-line { flex-wrap: wrap; row-gap: 2px; }
+  .srv-label { flex: 1 1 auto; min-width: 0; }
+  .srv-detail {
+    flex: 0 0 100%;
+    order: 1;
+    padding-left: 22px;   /* under the label, clear of the tick */
+  }
+
   /* Home-screen use later: with no viewport-fit=cover these resolve to 0, so
      this costs nothing today and is right if a manifest ever lands. */
   .composer-area { padding-bottom: max(14px, env(safe-area-inset-bottom)); }

@@ -23,6 +23,22 @@ const check = (label, ok, detail = '') => {
   if (!ok) failed++;
 };
 
+/// Text the browser had to cut off to fit. On a desktop an ellipsis is a fair
+/// trade -- the rows stay aligned and the rest is a hover away -- but a finger
+/// cannot hover, and the thing a phone has plenty of is vertical space. So
+/// nothing here should be clipped; it should have wrapped.
+const clipped = page => page.evaluate(() => {
+  const out = [];
+  for (const n of document.querySelectorAll('*')) {
+    if (!n.innerText || n.children.length > 3) continue;
+    if (n.scrollWidth > n.clientWidth + 1 && n.clientWidth > 0) {
+      out.push(`${n.tagName.toLowerCase()}.${(n.className || '').toString().slice(0, 30)}`
+               + ` :: ${n.innerText.slice(0, 45)}`);
+    }
+  }
+  return [...new Set(out)];
+});
+
 /// Anything wider than the viewport, named. A bare scrollWidth comparison says
 /// the page overflows but not what did it, and the offender is always a fixed
 /// width on one element.
@@ -111,6 +127,18 @@ try {
   await page.locator('#sidebar .sidebar-menu-item .nav-row').first().click();
   await page.locator('.sidebar-scrim').waitFor({ state: 'detached', timeout: 5000 });
   check('picking a session closes the drawer', true);
+
+  // 6b. Nothing should be reading as an ellipsis. The Servers pane is where
+  //     it showed first: a version string and a status beside a label and a
+  //     button leaves about 150px, so "2.1.241 (Claude Code) · daemon too old
+  //     to check" became "2.1.241 (Claud…".
+  await page.locator('.collapsed-strip button').click();
+  await page.locator('#sidebar .nav-row', { hasText: 'Servers' }).click();
+  await page.locator('.pane-intro-title', { hasText: 'Servers' }).waitFor({ timeout: 8000 });
+  await page.waitForTimeout(500);
+  const cut = await clipped(page);
+  check('nothing on the Servers pane is cut off', cut.length === 0, cut.join(' | '));
+  await page.keyboard.press('Escape');
 
   // 7. A finger cannot hover, and the row actions were `pointer-events: none`
   //    until it did -- so on a phone there was no way to archive a session

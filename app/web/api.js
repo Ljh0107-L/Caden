@@ -156,7 +156,13 @@ export class DaemonAPI {
   }
 
   health() { return this.request('GET', '/v1/health'); }
-  engines() { return this.request('GET', '/v1/engines'); }
+  /// `latest` asks the daemon to also report what the newest release is, which
+  /// it looks up in the background. Without it the field is absent, and absent
+  /// is what the pane renders as "daemon too old to check" -- a sentence about
+  /// the daemon being stale, printed for a daemon that is current.
+  engines({ latest = false } = {}) {
+    return this.request('GET', '/v1/engines', latest ? { query: { latest: '1' } } : undefined);
+  }
   installEngine(engine, method = 'auto') {
     return this.request('POST', '/v1/engines/install', { body: { engine, method } })
                .then(r => r.job);

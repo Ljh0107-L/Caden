@@ -2779,7 +2779,7 @@ const setBusy = (id, text) => {
 async function statusFromDaemon(entry) {
   const [health, engines] = await Promise.all([
     entry.api.health(),
-    entry.api.engines().catch(() => null),
+    entry.api.engines({ latest: true }).catch(() => null),
   ]);
   return {
     daemon: true,

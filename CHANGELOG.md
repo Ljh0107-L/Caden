@@ -16,6 +16,12 @@ Three of these were only true on a desktop.
   the desktop toggle already had, laid over each other rather than side by
   side — and picking a session puts it away again. Nothing new to install:
   the renderer was always a plain web page.
+- **Nothing on a phone ends in an ellipsis.** Truncation is a desktop bargain:
+  a line that does not fit costs less than the rows around it going ragged,
+  and the rest is a hover away. Neither half holds on a phone — there is no
+  hover, and vertical space is the one thing there is plenty of. The pane
+  intro, the server URL and the engine detail wrap now, and the detail takes
+  the next line whole rather than sharing 150px with a label and a button.
 - **Hover-only controls are reachable with a finger.** Archive and pin on a
   session row were `opacity: 0` *and* `pointer-events: none` until the pointer
   hovered, so on a phone they could not be reached at all — the only way in
