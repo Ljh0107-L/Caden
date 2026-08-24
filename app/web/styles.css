@@ -1302,20 +1302,6 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
     font-size: 16px; line-height: 24px; min-height: 24px;
   }
 
-  /* Truncation is a desktop bargain: a line that does not fit is worth less
-     than the rows around it staying aligned, and the full text is a tooltip
-     away. Neither half holds on a phone -- there is no hover to reveal it,
-     and vertical space is the one thing there is plenty of. So anything that
-     ended in an ellipsis wraps instead, and the page gets longer. */
-  .pane-intro-sub,
-  .prov-url,
-  .srv-detail {
-    white-space: normal;
-    overflow: visible;
-    text-overflow: clip;
-    max-width: none;
-  }
-
   /* Three chips, a plus and a send button do not fit on one 390px line.
      The outer row wraps, but the group holding model, permission and effort
      did not -- so when it was the thing that did not fit, its last chip hung
@@ -1348,6 +1334,36 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
   @supports (height: 100dvh) {
     html, body { height: 100dvh; }
   }
+}
+
+/* ---------- no room, or no hover ---------- */
+/*
+   Truncation is a bargain that pays on a desktop: a line that does not fit
+   costs less than the rows around it going ragged, and whatever was cut is a
+   hover away. On a phone neither half holds -- vertical space is the one
+   thing there is plenty of, and there is no hover.
+
+   The second half is the reason, and it is a property of the pointer, not of
+   the width. A phone held sideways is 844px wide and still has no hover; it
+   was getting the desktop's ellipses because the rule was keyed on the number
+   instead of on why. Both conditions, so a narrow desktop window wraps too --
+   there the text really has nowhere to go.
+*/
+@media (max-width: 760px), (hover: none) {
+  .pane-intro-sub,
+  .prov-url,
+  .srv-detail,
+  .nav-row-label,
+  .header .title {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    max-width: none;
+  }
+  /* The title is a header, not a paragraph: it may take a second line rather
+     than pushing the transcript down the page. */
+  .header .title { display: -webkit-box; -webkit-line-clamp: 2;
+                   -webkit-box-orient: vertical; overflow: hidden; }
 }
 
 /* ---------- touch ---------- */

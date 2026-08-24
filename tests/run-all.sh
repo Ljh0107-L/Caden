@@ -147,6 +147,8 @@ if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
   result $? "e2e narrow (phone-sized viewport, touch pointer)"
   node tests/e2e/gateway.mjs
   result $? "e2e gateway (served by a proxy, with the Mac switched off)"
+  node tests/e2e/viewports.mjs
+  result $? "e2e viewports (every width a phone reports, and a desktop)"
 else
   echo "   skip  e2e -- npm install && npx playwright install chromium"
 fi

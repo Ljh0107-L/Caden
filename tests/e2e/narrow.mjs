@@ -31,6 +31,11 @@ const clipped = page => page.evaluate(() => {
   const out = [];
   for (const n of document.querySelectorAll('*')) {
     if (!n.innerText || n.children.length > 3) continue;
+    // Only what actually clips. Content wider than a box with
+    // overflow:visible is not hidden, it hangs out -- a different fault, with
+    // its own check, and counting it here reported a wrapped line as an
+    // ellipsis.
+    if (getComputedStyle(n).overflow === 'visible') continue;
     if (n.scrollWidth > n.clientWidth + 1 && n.clientWidth > 0) {
       out.push(`${n.tagName.toLowerCase()}.${(n.className || '').toString().slice(0, 30)}`
                + ` :: ${n.innerText.slice(0, 45)}`);

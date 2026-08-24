@@ -16,6 +16,12 @@ Three of these were only true on a desktop.
   the desktop toggle already had, laid over each other rather than side by
   side — and picking a session puts it away again. Nothing new to install:
   the renderer was always a plain web page.
+- **A phone held sideways is still a phone.** The rules that wrap rather than
+  truncate were keyed on `max-width: 760px`, so a landscape handset — 844px
+  across, and with no more hover than it had a moment ago — got the desktop's
+  ellipses. The width was never the reason; the missing hover was. They are
+  keyed on both now, so a narrow desktop window wraps too, and an iPad stops
+  hiding the ends of its own sentences.
 - **Nothing hangs off the side of the box it is drawn in.** The composer's
   outer row wraps; the group inside it holding model, permission and effort
   did not, so on a 390px screen the last chip went over the edge of the card.
