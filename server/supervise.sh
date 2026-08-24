@@ -188,6 +188,10 @@ systemd_install() {
   tmp="$UNIT_DIR/$SERVICE.service.tmp"
   want_unit > "$tmp"
   if [ -f "$UNIT" ] && cmp -s "$tmp" "$UNIT"; then
+    # Nothing to publish, so nothing should be left lying next to the unit
+    # either. install is idempotent and gets re-run on every provision, so
+    # without this the scratch file accumulates in the unit directory.
+    rm -f "$tmp"
     changed=0
   else
     mv "$tmp" "$UNIT"
