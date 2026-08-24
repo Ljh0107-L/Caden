@@ -31,6 +31,15 @@ Three of these were only true on a desktop.
 Groundwork for reaching a daemon through a browser rather than an ssh
 forward:
 
+- **The console hides what its host cannot do.** `/host/config` now says what
+  the thing serving the page is able to do on the renderer's behalf — add a
+  server, provision one over ssh, open a forward, pick a file with a native
+  dialog. The Mac app declares all of it. A console served by a daemon behind
+  a reverse proxy declares none, and the pane drops the buttons and the copy
+  describing them rather than offering something that would 404. Absent means
+  none, so a hand-written config for that arrangement does not have to know
+  the list in order to be safe. What the pane still does is report — hiding
+  the actions must not hide the diagnosis.
 - **Provisioning sends the console with the daemon.** The payload was three
   text files in a heredoc, chosen so a minimal container with no `tar` and no
   `base64` could still be provisioned. The renderer is 258K of text, which

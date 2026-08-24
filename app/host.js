@@ -1124,6 +1124,21 @@ async function route(req, res, url) {
         workdir: cfg.defaultWorkdir || '~',
         permissionMode: cfg.defaultPermissionMode || 'bypassPermissions',
       },
+      // What this host can do on the renderer's behalf. Everything here needs
+      // something only a Mac running the app has -- the filesystem, ssh, the
+      // keychain, a native dialog -- so a console served from a daemon and
+      // reached through a reverse proxy declares none of it, and the renderer
+      // hides the controls rather than offering buttons that 404.
+      //
+      // Absent means none: a hand-written config for that arrangement should
+      // not have to know the list in order to be safe.
+      capabilities: {
+        servers: true,        // add and remove servers, read ~/.ssh/config
+        provisioning: true,   // install the daemon over ssh
+        tunnels: true,        // open and close the port-forwards
+        hostInstall: true,    // push an engine up using this Mac as transport
+        filePicker: true,     // the native open panel, and attach-by-path
+      },
     });
     return true;
   }

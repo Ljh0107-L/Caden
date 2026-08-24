@@ -57,6 +57,15 @@ const state = {
   sidebarStale: false,     // a repaint was skipped while it did
 };
 
+/// What the thing serving this page can do on our behalf.
+///
+/// The Mac app's host server can reach ssh, the filesystem and the keychain,
+/// so it offers to add servers, provision them and open forwards. A console
+/// served by a daemon behind a reverse proxy can do none of that, and says so
+/// by declaring nothing. Absent means none, deliberately: a hand-written
+/// config for that arrangement should not have to know the list to be safe.
+const can = name => !!(state.config.capabilities || {})[name];
+
 const $sidebar = document.getElementById('sidebar');
 const $main = document.getElementById('main');
 
@@ -553,7 +562,8 @@ function openPane(pane) {
   state.pane = pane;
   dismissOverlaySidebar();
   if (pane === 'servers') {
-    sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
+    if (can('servers'))
+      sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
     for (const p of state.config.servers) checkServer(p.id);
   }
   renderSidebar();
@@ -2851,10 +2861,15 @@ function serverSection(profile) {
 
   if (!busy) {
     const needsWork = !st || !st.daemon || !st.token || (tunnelMode && !st.tunnel);
-    if (needsWork) acts.append(srvBtn('Set up', () => setUpServer(profile)));
-    else if (tunnelMode) acts.append(srvBtn('Close forward', async () => {
-      await stopTunnel(profile.id); await checkServer(profile.id);
-    }));
+    // Both of these are ssh from this Mac. Without it the row still reports
+    // what it found -- which is the useful half -- but offers nothing it
+    // cannot do.
+    if (needsWork && can('provisioning'))
+      acts.append(srvBtn('Set up', () => setUpServer(profile)));
+    else if (tunnelMode && !needsWork && can('tunnels'))
+      acts.append(srvBtn('Close forward', async () => {
+        await stopTunnel(profile.id); await checkServer(profile.id);
+      }));
     const more = el('button', { class: 'prov-act', title: 'Server options' }, cIcon('sliders', 13));
     more.onclick = e => openMenu(e.currentTarget, [
       { label: 'Check again', action: () => checkServer(profile.id) },
@@ -2863,20 +2878,25 @@ function serverSection(profile) {
           if (entry) await connectServer(entry);
           await checkServer(profile.id);
         } },
-      { label: 'Upgrade the daemon', action: () => setUpServer(profile, { restart: true }) },
+      ...(can('provisioning')
+        ? [{ label: 'Upgrade the daemon',
+             action: () => setUpServer(profile, { restart: true }) }]
+        : []),
       // The row's button disappears once an engine is current; reinstalling is
       // still worth reaching for -- a broken install, or taking over a copy
       // that lives outside Caden.
       { label: 'Reinstall Claude Code', action: () => installEngineOn(profile, 'claude') },
       { label: 'Reinstall Codex', action: () => installEngineOn(profile, 'codex') },
-      '-',
-      { label: 'Remove server', action: async () => {
-          await removeServer(profile.id);
-          state.serverStatus.delete(profile.id);
-          await reloadServers();
-          state.sshHosts = await sshHosts();
-          renderServersPane();
-        } },
+      ...(can('servers')
+        ? ['-',
+           { label: 'Remove server', action: async () => {
+               await removeServer(profile.id);
+               state.serverStatus.delete(profile.id);
+               await reloadServers();
+               state.sshHosts = await sshHosts();
+               renderServersPane();
+             } }]
+        : []),
     ]);
     acts.append(more);
   }
@@ -3016,11 +3036,19 @@ function renderServersPane() {
     el('div', { class: 'pane-intro' },
       el('div', { class: 'pane-intro-title' }, 'Servers'),
       el('div', { class: 'pane-intro-sub' },
-        'A server runs the agents. Add one, install the daemon over ssh, and '
-        + 'Caden reaches it through a local forward.')));
+        // Two different truths. Told from the desktop app this pane is where
+        // servers get added and set up; served from a daemon behind a proxy
+        // none of that is on offer, and describing it anyway sends someone
+        // hunting for a button that was deliberately not drawn.
+        can('servers')
+          ? 'A server runs the agents. Add one, install the daemon over ssh, and '
+            + 'Caden reaches it through a local forward.'
+          : 'A server runs the agents. This console reaches them through the '
+            + 'proxy that served it; adding and setting up servers is done '
+            + 'from the desktop app.')));
 
   for (const profile of state.config.servers) body.append(serverSection(profile));
-  body.append(sshHostSection());
+  if (can('servers')) body.append(sshHostSection());
 
   paintPane('Servers',
     el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },

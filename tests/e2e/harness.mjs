@@ -86,6 +86,12 @@ export async function start() {
 
   return {
     appUrl: `http://127.0.0.1:${appPort}`,
+    // For the gateway walk, which stands up its own front end in place of
+    // app/server.js and needs to reach the daemon the way a reverse proxy
+    // would: straight at it, with the token it reads off disk.
+    daemonUrl: `http://127.0.0.1:${daemonPort}`,
+    daemonToken: fs.readFileSync(path.join(daemonHome, 'token'), 'utf8').trim(),
+    webRoot: path.join(ROOT, 'app', 'web'),
     async stop() {
       daemon.kill(); app.kill();
       fs.rmSync(tmp, { recursive: true, force: true });
