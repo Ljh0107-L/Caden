@@ -148,7 +148,14 @@ try {
   await page.locator('#sidebar .nav-row', { hasText: 'Servers' }).click();
   await page.locator('.pane-intro-title', { hasText: 'Servers' }).waitFor({ timeout: 8000 });
 
+  // The status check is a round trip that starts when the pane opens, so give
+  // it one before reading the row.
+  await page.locator('.models-pane', { hasText: 'heartbeat' })
+    .waitFor({ timeout: 10000 }).catch(() => {});
   const body = await page.locator('.models-pane').innerText();
+  check('the row is filled in from the daemon, with no host to ask',
+        /heartbeat \d+\.\d+/.test(body) && !/not valid JSON/.test(body),
+        body.replace(/\n/g, ' / ').slice(0, 160));
   check('no ssh-config section', !body.includes('From your SSH config'));
   // Copy is part of it: describing ssh setup on a page that cannot offer it
   // sends someone hunting for a button that was deliberately not drawn.
@@ -170,9 +177,18 @@ try {
   }
 
   // The server still reports what it found -- hiding the actions must not
-  // hide the diagnosis.
+  // hide the diagnosis. /host/servers/<id>/status is the Mac answering a
+  // question only it can answer, so the row has to be assembled from the
+  // daemon instead: it knows its own version and its engines, and having
+  // answered at all is the liveness the host was relaying second-hand.
+  //
+  // Found by deploying it. Behind a real nginx the missing /host route fell
+  // through to the SPA fallback, the renderer was handed index.html where it
+  // expected JSON, and the row read "Daemon: not installed" over a JSON parse
+  // error -- on a daemon that was running perfectly.
   check('the server row still reports its state',
         body.includes('E2E'), body.slice(0, 120));
+
 } catch (err) {
   console.log(`  FAIL   ${err.message}`);
   failed++;

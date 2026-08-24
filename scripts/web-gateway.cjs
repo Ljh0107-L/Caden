@@ -3,7 +3,12 @@
 
 // The reverse-proxy half of reaching Caden from a phone, written out for you.
 //
-//   scripts/web-gateway.cjs caden.example.net [--flavor dev]
+//   scripts/web-gateway.cjs caden.example.net [--on <host>] [--only <host>]...
+//
+// `--on` names a server that *is* the gateway. Its daemon is already on the
+// loopback nginx will be talking to, so it needs no tunnel and gets none --
+// which is the whole of the simplest useful deployment: one machine, running
+// the daemon and the proxy in front of it.
 //
 // Everything this prints could be typed by hand. The reason not to is the
 // tokens: each server has its own, they are 44 characters of base64, and the
@@ -18,8 +23,12 @@ const { readConfig, daemonToken } = require('../app/host');
 
 const args = process.argv.slice(2);
 let hostname = '';
+let onHost = '';
+const only = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--flavor') { i++; continue; }   // read by app/flavor via env
+  if (args[i] === '--on') { onHost = args[++i] || ''; continue; }
+  if (args[i] === '--only') { only.push(args[++i] || ''); continue; }
   if (args[i].startsWith('-')) continue;
   hostname = hostname || args[i];
 }
@@ -40,7 +49,11 @@ const isLocal = s => {
 const cfg = readConfig();
 const all = (cfg.servers || []).filter(s => s.provisioned);
 const local = all.filter(isLocal);
-const servers = all.filter(s => !isLocal(s));
+// `--only` is for standing one server up first. A route to a tunnel nobody
+// has opened yet is a row that reads as broken, which is a poor first
+// impression of something that works.
+const wanted = s => !only.length || only.includes(s.name) || only.includes(s.sshHost);
+const servers = all.filter(s => !isLocal(s) && wanted(s));
 if (!servers.length) {
   console.error('no provisioned servers this gateway could reach.');
   console.error(local.length
@@ -53,13 +66,20 @@ if (!servers.length) {
 // One loopback port on the gateway per server. The number itself does not
 // matter; that they are stable does, because the systemd unit on each server
 // and the nginx block on the gateway have to agree on it.
-const plan = servers.map((s, i) => ({
-  id: s.id,
-  name: s.name || s.sshHost || s.id,
-  port: 7901 + i,
-  remotePort: s.remotePort || 7838,
-  token: daemonToken(s),
-}));
+let next = 7901;
+const plan = servers.map(s => {
+  // The gateway's own daemon is already on the loopback nginx will use, so it
+  // takes its real port and no tunnel. Everything else gets one of these.
+  const here = onHost && (s.sshHost === onHost || s.name === onHost);
+  return {
+    id: s.id,
+    name: s.name || s.sshHost || s.id,
+    here,
+    port: here ? (s.remotePort || 7838) : next++,
+    remotePort: s.remotePort || 7838,
+    token: daemonToken(s),
+  };
+});
 
 const missing = plan.filter(p => !p.token);
 const usable = plan.filter(p => p.token);
@@ -96,7 +116,9 @@ say('        add_header Cache-Control "no-cache" always;');
 say('    }');
 for (const p of usable) {
   say('');
-  say(`    # ${p.name} -- reached through the tunnel it opens in step 2.`);
+  say(p.here
+    ? `    # ${p.name} -- the daemon on this machine, no tunnel involved.`
+    : `    # ${p.name} -- reached through the tunnel it opens in step 2.`);
   say(`    location /proxy/${p.id}/ {`);
   say(`        proxy_pass http://127.0.0.1:${p.port}/;`);
   say(`        proxy_set_header Authorization "Bearer ${p.token}";`);
@@ -113,7 +135,13 @@ for (const p of usable) {
 }
 say('}');
 
-say('',
+const tunnelled = usable.filter(p => !p.here);
+if (!tunnelled.length) {
+  say('', '# ─── 2. No tunnels needed',
+      '#',
+      '# Every daemon in this plan is on the gateway itself.');
+}
+if (tunnelled.length) say('',
     '# ─── 2. On each server: a tunnel it opens itself',
     '#',
     '# Outward, not inward. The gateway never connects to these machines, so',
@@ -121,7 +149,7 @@ say('',
     '# gateway needs no key for them. ssh -R binds the far end on 127.0.0.1,',
     '# so nothing but nginx can reach the forwarded port.',
     '');
-for (const p of usable) {
+for (const p of tunnelled) {
   say(`# ${p.name}: /etc/systemd/system/caden-tunnel.service`);
   say('[Unit]');
   say('Description=Caden tunnel to the web gateway');

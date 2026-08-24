@@ -31,6 +31,14 @@ Three of these were only true on a desktop.
 Groundwork for reaching a daemon through a browser rather than an ssh
 forward:
 
+- **The Servers pane fills itself in from the daemon when there is no host to
+  ask.** `/host/servers/<id>/status` is the Mac answering questions only it
+  can — is the forward up, does the keychain hold a token. Behind a proxy that
+  route does not exist, and an nginx with a single-page fallback answers it
+  with `index.html`, so the pane read "Daemon: not installed" over a JSON
+  parse error on a daemon that was running perfectly. It asks the daemon
+  directly now: it knows its own version and its engines, and having answered
+  at all is the liveness the host was relaying second-hand.
 - **`scripts/web-gateway.cjs` writes the proxy configuration.** Point it at a
   hostname and it prints the nginx block, an `ssh -R` unit for each server and
   the `host/config` the console reads, with every daemon's token already in

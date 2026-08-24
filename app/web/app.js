@@ -2765,9 +2765,45 @@ const setBusy = (id, text) => {
   renderServersPane();
 };
 
+/// The same report, assembled from the daemon instead of from a host.
+///
+/// /host/servers/<id>/status is the Mac answering questions it is uniquely
+/// able to answer -- is the forward up, does the keychain have a token. None
+/// of that exists behind a proxy, but most of what the pane shows does: the
+/// daemon knows its own version and which engines it has, and the fact that it
+/// answered at all is the liveness the host was reporting second-hand.
+///
+/// A forward is not a thing here, so `tunnel` is absent rather than false, and
+/// nothing offers to close one. The token is the proxy's business and it
+/// clearly worked, or none of this would have come back.
+async function statusFromDaemon(entry) {
+  const [health, engines] = await Promise.all([
+    entry.api.health(),
+    entry.api.engines().catch(() => null),
+  ]);
+  return {
+    daemon: true,
+    token: true,
+    daemonVersion: health?.version || null,
+    daemonRevision: health?.revision || null,
+    engines: {
+      claude: engines?.engines?.claude || { installed: false },
+      codex: engines?.engines?.codex || { installed: false },
+    },
+    arch: engines?.arch,
+    libc: engines?.libc,
+    ready: !!(engines?.engines?.claude?.installed
+              || engines?.engines?.codex?.installed),
+  };
+}
+
 async function checkServer(id, { attempt = 0 } = {}) {
-  try { state.serverStatus.set(id, await serverStatus(id)); }
-  catch (e) { state.serverStatus.set(id, { error: String(e.message || e) }); }
+  const entry = state.servers.get(id);
+  try {
+    state.serverStatus.set(id, can('servers') || !entry
+      ? await serverStatus(id)
+      : await statusFromDaemon(entry));
+  } catch (e) { state.serverStatus.set(id, { error: String(e.message || e) }); }
   renderServersPane();
 
   // The upstream version check runs in the background on the server and its

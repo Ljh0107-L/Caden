@@ -1377,5 +1377,6 @@ async function ensureLocalServer() {
 
 module.exports = {
   route, readConfig, daemonBase, daemonToken, providerKey, expandTilde,
-  buildProvisionScript, webPayload, provision, shutdown, ensureLocalServer,
+  buildProvisionScript, webPayload, providerSecrets, provision, shutdown,
+  ensureLocalServer,
 };
