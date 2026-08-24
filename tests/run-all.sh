@@ -98,6 +98,10 @@ step "file permissions (a shared box cannot read the session tree)"
 python3 tests/permissions_test.py >/dev/null 2>&1
 result $? "permissions_test.py"
 
+step "the console over HTTP (served, cached, and no way out of the web root)"
+python3 tests/console_serving_test.py >/dev/null 2>&1
+result $? "console_serving_test.py"
+
 step "event stream (the terminal event survives the close)"
 python3 tests/stream_close_test.py
 result $? "stream_close_test.py"

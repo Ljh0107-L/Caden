@@ -99,6 +99,10 @@ DIR_ENGINES = home("engines")
 DIR_SESSIONS = home("sessions")
 DIR_UPLOADS = home("uploads")
 DIR_TMP = home("tmp")
+# The console's own files, when this daemon has a copy. Not created by
+# `ensure_dirs`: an absent directory is how a daemon says it has no console to
+# serve, and an empty one would answer 404 to every asset instead.
+DIR_WEB = home("web")
 PATH_TOKEN = home("token")
 PATH_LOG = home("heartbeat.log")
 PATH_PID = home("heartbeat.pid")
@@ -320,6 +324,18 @@ def run_capture(argv, cwd=None, env=None, timeout=120, stdin_data=None):
         out, err = proc.communicate()
         return 124, out.decode("utf-8", "replace"), "timed out after %ss" % timeout
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+WEB_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".woff2": "font/woff2",
+    ".ico": "image/x-icon",
+}
 
 
 def token_load_or_create():
@@ -5409,11 +5425,17 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path).rstrip("/") or "/"
         query = parse_qs(parsed.query)
         try:
-            if path in ("/v1/ping", "/"):
+            # `/` was an alias for ping, and stays one on a daemon with no
+            # console to serve. Where there is one it is the console's, which
+            # means it goes through `_auth` below like the rest of the tree
+            # rather than answering a stranger with a login-shaped page.
+            if path == "/v1/ping" or (path == "/" and not os.path.isdir(DIR_WEB)):
                 return self._send_json(self._ping_body())
             self._auth()
             handler = self.server.router.match(method, path)
             if handler is None:
+                if method == "GET" and self._serve_web(path):
+                    return
                 raise HttpError(404, "no route for %s %s" % (method, path))
             fn, params = handler
             return fn(self, params, query)
@@ -5430,6 +5452,67 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": message, "status": status}, status=status)
         except Exception:
             pass
+
+    # -- the console ----------------------------------------------------
+    def _serve_web(self, path):
+        """Serve the renderer out of `~/.caden/web`, if provisioning put it there.
+
+        Returns False when there is nothing to serve, so the caller can raise
+        the 404 the API would have raised anyway -- a daemon from before the
+        console shipped is not a daemon with a broken console.
+
+        Behind `_auth` like every other route, because both ways a browser
+        actually gets here supply the token on every request, subresources
+        included: a reverse proxy adding the header, or the Mac app's own host
+        server. Leaving it open would buy nothing -- these files are public on
+        GitHub -- but it would mean a daemon whose proxy is misconfigured
+        answers a stranger with a recognisable console instead of a 401.
+        """
+        if not os.path.isdir(DIR_WEB):
+            return False
+        root = os.path.realpath(DIR_WEB)
+        rel = "index.html" if path == "/" else path.lstrip("/")
+        # realpath, not normpath: `..` is only half of it, and a symlink
+        # inside the tree pointing out of it is the other half.
+        target = os.path.realpath(os.path.join(root, rel))
+        if target != root and not target.startswith(root + os.sep):
+            raise HttpError(403, "outside the web root")
+        if not os.path.isfile(target):
+            return False
+        try:
+            st = os.stat(target)
+            with open(target, "rb") as fh:
+                body = fh.read()
+        except OSError:
+            return False
+
+        # The whole point of this path is a phone on a mobile connection, and
+        # the renderer plus its fonts is 340K. `no-store` -- what the Mac's
+        # host server sends, where the files are a local read -- would fetch
+        # all of it on every open. The tag is mtime and size rather than a
+        # digest of the bytes: provisioning rewrites these files wholesale, so
+        # a changed mtime is exactly the signal, and hashing 340K per request
+        # to learn the same thing is waste.
+        etag = '"%x-%x"' % (int(st.st_mtime), st.st_size)
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+
+        ctype = WEB_TYPES.get(os.path.splitext(target)[1].lower(),
+                              "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        # Revalidate every time, never reuse blindly: an upgraded daemon and a
+        # cached renderer from the build before it disagree about the protocol.
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
 
     # -- SSE ------------------------------------------------------------
     def stream_events(self, bus, after, follow=True, idle_timeout=None,

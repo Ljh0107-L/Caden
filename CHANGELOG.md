@@ -31,6 +31,14 @@ Three of these were only true on a desktop.
 Groundwork for reaching a daemon through a browser rather than an ssh
 forward:
 
+- **The daemon serves the console itself.** Dropped into `~/.caden/web` by
+  provisioning, behind the same token as everything else, with ETags so that
+  340K of renderer and fonts is not re-fetched on every open over a phone
+  connection. A daemon without that directory is unchanged — `/` is still the
+  ping alias it always was. The file path is built from a URL in a process
+  that also runs commands, so the half that matters is the refusals: `..`, the
+  percent-encoded version of `..`, and a symlink inside the tree pointing out
+  of it are all 403.
 - **The daemon says less to a stranger, and answers a wrong token more
   slowly.** An unauthenticated `/v1/ping` named the software, the version and
   the exact source revision — the first line of a scanner's report, on a port
