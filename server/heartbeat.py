@@ -104,6 +104,9 @@ DIR_TMP = home("tmp")
 # serve, and an empty one would answer 404 to every asset instead.
 DIR_WEB = home("web")
 PATH_TOKEN = home("token")
+# Model credentials, keyed by provider id, as the Mac last synced them. See
+# resolve_key_ref.
+PATH_PROVIDERS = home("providers.json")
 PATH_LOG = home("heartbeat.log")
 PATH_PID = home("heartbeat.pid")
 # The port is recorded next to the pid because it is not always the one that
@@ -3301,6 +3304,49 @@ ENGINE_IDLE_SECONDS = 2 * 3600
 ENGINE_SWEEP_SECONDS = 300
 
 
+def provider_keys():
+    """Credentials this daemon has been given, keyed by provider id.
+
+    Read per call rather than held from boot: the Mac rewrites this file when
+    the provider list changes, and a cached copy would go on using a key that
+    was rotated away.
+    """
+    try:
+        with open(PATH_PROVIDERS) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_key_ref(spec):
+    """Swap a `key_ref` for the key it names.
+
+    The renderer never holds a model key. It sends the provider's id, and
+    whatever sits in front of the daemon puts the value in: on the Mac that is
+    app/server.js reading the login keychain (app/secret-inject.js).
+
+    A reverse proxy cannot -- it can add a header, not rewrite a JSON body --
+    so for a console served straight from this daemon the swap happens here
+    instead, out of the copy provisioning left behind.
+
+    A ref with nothing behind it is still stripped, so the request goes on to
+    fail at `require_credential` with its own clear message about a missing
+    key rather than looking like a malformed body.
+    """
+    if not isinstance(spec, dict):
+        return spec
+    ref = spec.pop("key_ref", None)
+    if not ref:
+        return spec
+    key = provider_keys().get(ref)
+    if key:
+        provider = dict(spec.get("provider") or {})
+        provider["api_key"] = key
+        spec["provider"] = provider
+    return spec
+
+
 def require_credential(engine, provider):
     """Reject a session that has no credential of its own.
 
@@ -5826,7 +5872,7 @@ def h_sessions_list(req, params, query):
 
 
 def h_session_create(req, params, query):
-    body = req._json_body()
+    body = resolve_key_ref(req._json_body())
     try:
         sess = SESSIONS.create(body)
     except ValueError as exc:
@@ -5903,7 +5949,7 @@ def h_session_patch(req, params, query):
     sess = SESSIONS.get(params["sid"])
     if not sess:
         raise HttpError(404, "no such session")
-    body = req._json_body()
+    body = resolve_key_ref(req._json_body())
 
     # Everything is validated before any of it is applied, so a rejected patch
     # leaves the session exactly as it was.

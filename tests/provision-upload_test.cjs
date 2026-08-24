@@ -31,7 +31,11 @@ const web = [
   { name: 'fonts/probe.woff2', binary: true, body: fontBytes },
 ];
 
-const script = buildProvisionScript(home, files, 17983, false, web);
+// The keys the Mac holds, on their way to a daemon that has to resolve
+// `key_ref` without anything in front of it that can.
+const secrets = { 'prov-a': 'sk-alpha-0123456789', 'prov-b': 'sk-beta-9876543210' };
+
+const script = buildProvisionScript(home, files, 17983, false, web, secrets);
 const result = spawnSync('sh', ['-s'], { input: script, encoding: 'utf8' });
 try {
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -44,6 +48,15 @@ try {
     assert.deepEqual(got, file.body, `web/${file.name} changed during upload`);
   }
 
+  // Credentials, and the mode they arrive with. `cat >` creates under the
+  // login's umask -- 022 on most hosts -- so a file narrowed after the write
+  // is briefly world-readable at its final name with the keys already in it.
+  const credPath = path.join(home, 'providers.json');
+  assert.deepEqual(JSON.parse(fs.readFileSync(credPath, 'utf8')), secrets,
+                   'providers.json did not arrive intact');
+  assert.equal(fs.statSync(credPath).mode & 0o777, 0o600,
+               `providers.json is ${(fs.statSync(credPath).mode & 0o777).toString(8)}`);
+
   // Swapped in whole: the scratch directory must not survive a good run, or
   // the next one starts by deleting a copy it did not make.
   assert.ok(!fs.existsSync(path.join(home, 'web.new')), 'web.new was left behind');
@@ -55,6 +68,19 @@ try {
             'the fonts are not marked binary');
   assert.ok(!real.some(f => path.posix.basename(f.name).startsWith('.')),
             `a dotfile is in the payload: ${real.map(f => f.name).join(', ')}`);
+
+  // Null means "the keychain did not answer", which must leave the server's
+  // working keys alone rather than replacing them with {}.
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'caden-provision-nocreds-'));
+  fs.writeFileSync(path.join(home2, 'providers.json'), '{"kept":"sk-existing"}');
+  const r2 = spawnSync('sh', ['-s'], {
+    input: buildProvisionScript(home2, files, 17984, false, [], null),
+    encoding: 'utf8' });
+  assert.equal(r2.status, 0, r2.stderr || r2.stdout);
+  assert.equal(fs.readFileSync(path.join(home2, 'providers.json'), 'utf8'),
+               '{"kept":"sk-existing"}',
+               'a run with no readable keys overwrote the ones on the server');
+  fs.rmSync(home2, { recursive: true, force: true });
 
   console.log('provision-upload_test: OK');
 } finally {

@@ -381,7 +381,7 @@ function webPayload(dir = WEB_DIR, out = []) {
   return out;
 }
 
-function buildProvisionScript(home, files, port, restart, web = []) {
+function buildProvisionScript(home, files, port, restart, web = [], secrets = null) {
   const remoteHome = shellPath(home);
   // A random heredoc marker prevents a source line from terminating the file
   // early while keeping the payload independent of base64/tar availability on
@@ -400,12 +400,51 @@ function buildProvisionScript(home, files, port, restart, web = []) {
       marker,
       `chmod 700 ${remoteHome}/${name}.tmp && mv -f ${remoteHome}/${name}.tmp ${remoteHome}/${name}`,
     ]),
+    ...secretsScript(remoteHome, secrets, marker),
     ...webScript(remoteHome, web, marker),
     `sh ${remoteHome}/bootstrap.sh --home ${remoteHome} --port ${Number(port) || DEFAULT_PORT} --supervise`
       + (restart ? ' --restart' : ''),
     '',
   ].join('\n');
   return script;
+}
+
+/// The model credentials this Mac holds, keyed by provider id.
+///
+/// A console served straight from a daemon has nothing in front of it that
+/// can turn a `key_ref` into a key -- a reverse proxy adds headers, it does
+/// not rewrite JSON bodies -- so the daemon resolves the ref itself, out of
+/// the copy this puts there.
+///
+/// Returns null rather than an empty object when the config lists providers
+/// and not one key came back. That is what a locked or unavailable keychain
+/// looks like, and writing `{}` for it would wipe working credentials off the
+/// server on the next routine upgrade.
+function providerSecrets() {
+  const providers = readConfig().providers || [];
+  const out = {};
+  for (const p of providers) {
+    const key = providerKey(p.id);
+    if (key) out[p.id] = key;
+  }
+  if (providers.length && !Object.keys(out).length) return null;
+  return out;
+}
+
+/// Writing it: 0600, and created that way rather than narrowed afterwards.
+/// `cat >` makes the file under the login's umask, which is 022 on most
+/// hosts, so without the subshell the keys are briefly world-readable at
+/// their final name.
+function secretsScript(remoteHome, secrets, marker) {
+  if (!secrets) return [];
+  const dest = `${remoteHome}/providers.json`;
+  return [
+    `(umask 077; cat > ${dest}.tmp <<'${marker}'`,
+    JSON.stringify(secrets, null, 2),
+    marker,
+    ')',
+    `chmod 600 ${dest}.tmp && mv -f ${dest}.tmp ${dest}`,
+  ];
 }
 
 /// The console half of the payload.
@@ -476,8 +515,12 @@ async function provision(server, { restart = false } = {}, onStep = () => {}) {
     files.push({ name, body: fs.readFileSync(src, 'utf8') });
   }
 
+  const secrets = providerSecrets();
+  if (secrets === null) {
+    onStep('no provider keys could be read — leaving the ones on the server alone');
+  }
   const script = buildProvisionScript(home, files, server.remotePort, restart,
-                                      webPayload());
+                                      webPayload(), secrets);
 
   onStep('connecting over ssh…');
   onStep('uploading daemon files…');

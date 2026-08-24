@@ -31,6 +31,15 @@ Three of these were only true on a desktop.
 Groundwork for reaching a daemon through a browser rather than an ssh
 forward:
 
+- **The daemon can resolve a provider key itself.** The renderer has never
+  held a model API key — it sends the provider's id and the Mac's host server
+  swaps in the value from the login keychain. A reverse proxy cannot do that;
+  it can add a header, not rewrite a JSON body. So provisioning now syncs the
+  Mac's keys to `~/.caden/providers.json` (0600, created that way rather than
+  narrowed afterwards) and the daemon does the swap when nothing in front of
+  it did. The wire protocol is unchanged. A run that reads no keys at all —
+  a locked keychain — leaves the ones already on the server alone instead of
+  replacing them with nothing.
 - **The console hides what its host cannot do.** `/host/config` now says what
   the thing serving the page is able to do on the renderer's behalf — add a
   server, provision one over ssh, open a forward, pick a file with a native
