@@ -116,15 +116,57 @@ Two other things solve it, with different costs.
 Both leave everything above intact — the daemon serves the console the same
 way. Only the thing in front of it changes.
 
-## The password, and what stands behind it
+## Signing in
 
-`auth_basic` is the whole door. Behind it is a service that runs arbitrary
-commands and holds your model API keys, on a hostname that appeared in
-Certificate Transparency logs minutes after the certificate was issued and is
-scanned continuously. Generate the password; do not invent one.
+The daemon's bearer token is the right credential for a program and the wrong
+one for a person: a browser cannot put a header on the navigation that loads a
+page. HTTP basic auth covered that and cost too much — the dialog belongs to
+the browser rather than to Caden, it appears before anything has rendered, and
+Safari re-prompts on its own schedule, which ends any event stream open at the
+time.
 
-If you use one you can remember anyway — and people do — two things make that
-survivable, and the generator emits both.
+So the console owns its sign-in. Set the password on the gateway's daemon,
+from stdin so it does not survive in a shell history:
+
+```
+printf '%s\n' 'your password' | python3 ~/.caden/heartbeat.py --set-web-password
+```
+
+What nginx does with it is `auth_request`: before serving anything it asks the
+daemon whether the request carries a valid session, and sends it to the login
+page if not. That check has to live at the proxy rather than in a daemon,
+because a gateway fronts several of them — `/proxy/<other>/…` never reaches
+the process that owns the session.
+
+Three routes are reachable without one, and they are the whole unauthenticated
+surface: the login page, the form it posts to, and the verify endpoint nginx
+itself calls.
+
+Sessions last thirty days, are stored hashed (a copy of the file is not a
+usable session), and survive a daemon restart — being signed out by a routine
+upgrade would be its own small annoyance. Changing the password revokes them
+all, which is usually the reason for changing it. So does losing a phone:
+
+```
+curl -X POST -H "Authorization: Bearer $(cat ~/.caden/token)" \
+     http://127.0.0.1:7838/v1/web/logout-all
+```
+
+## What stands behind the password
+
+Behind it is a service that runs arbitrary commands and holds your model API
+keys, on a hostname that appeared in Certificate Transparency logs minutes
+after the certificate was issued and is scanned continuously. Generate the
+password; do not invent one.
+
+If you use one you can remember anyway — and people do — three things make
+that survivable, and the generator emits all of them.
+
+**The verifier is slow on purpose.** pbkdf2-sha256 at 600k iterations is about
+400ms on a small VPS. Paid once a month by whoever knows the password, and on
+every guess by anyone else. (pbkdf2 rather than scrypt because `hashlib.scrypt`
+needs a Python built against OpenSSL 1.1+, and this daemon's floor is whatever
+a minimal container ships.)
 
 **Rate limiting.** bcrypt at `htpasswd`'s default cost verifies in about ten
 milliseconds and nginx will do it as fast as anyone asks, so a guessable
@@ -140,12 +182,18 @@ which turns a hundred million combinations from days into longer than you will
 be alive.
 
 ```
+# /etc/fail2ban/filter.d/caden-login.conf
+[Definition]
+failregex = ^<HOST> .* "POST /v1/web/login HTTP/[0-9.]+" 401
+ignoreregex =
+
+# /etc/fail2ban/jail.d/caden.conf
 [caden-auth]
 enabled  = true
-filter   = nginx-http-auth
+filter   = caden-login
 port     = http,https
 backend  = polling
-logpath  = /var/log/nginx/error.log
+logpath  = /var/log/nginx/access.log
 maxretry = 5
 findtime = 600
 bantime  = 3600

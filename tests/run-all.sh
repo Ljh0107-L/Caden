@@ -102,6 +102,10 @@ step "provider credentials (key_ref resolved by the daemon, not by a proxy)"
 python3 tests/key_ref_test.py >/dev/null 2>&1
 result $? "key_ref_test.py"
 
+step "signing in to the console (password, cookie, and what next= may not do)"
+python3 tests/web_login_test.py >/dev/null 2>&1
+result $? "web_login_test.py"
+
 step "the console over HTTP (served, cached, and no way out of the web root)"
 python3 tests/console_serving_test.py >/dev/null 2>&1
 result $? "console_serving_test.py"

@@ -35,6 +35,7 @@ import base64
 import errno
 import hashlib
 import hmac
+import secrets
 import itertools
 import json
 import os
@@ -107,6 +108,10 @@ PATH_TOKEN = home("token")
 # Model credentials, keyed by provider id, as the Mac last synced them. See
 # resolve_key_ref.
 PATH_PROVIDERS = home("providers.json")
+# The console's own password, and the browser sessions it has handed out. Both
+# 0600; see web_password_set and web_session_new.
+PATH_WEB_PASSWORD = home("web-password")
+PATH_WEB_SESSIONS = home("web-sessions.json")
 PATH_LOG = home("heartbeat.log")
 PATH_PID = home("heartbeat.pid")
 # The port is recorded next to the pid because it is not always the one that
@@ -3304,6 +3309,118 @@ ENGINE_IDLE_SECONDS = 2 * 3600
 ENGINE_SWEEP_SECONDS = 300
 
 
+# --------------------------------------------------------------------------
+# the console's own login
+#
+# The daemon's bearer token is the right credential for a program and the
+# wrong one for a person: a browser cannot put a header on the navigation that
+# loads the page. What a reverse proxy could do instead was ask for HTTP basic
+# auth, and that worked, but the dialog is the browser's rather than Caden's,
+# it appears before anything has rendered, and Safari re-prompts on its own
+# schedule -- which, if it lands while an event stream is open, ends the
+# stream. So: a password here, a session cookie, and a page that looks like
+# the application it belongs to.
+#
+# nginx checks it through auth_request, not the daemon, because a gateway
+# fronts several daemons and only the proxy sees all of them. `/proxy/<id>/`
+# for some other machine never reaches this process, so a check that lived
+# only here would not cover it.
+# --------------------------------------------------------------------------
+
+WEB_COOKIE = "caden_web"
+WEB_SESSION_DAYS = 30
+# pbkdf2 rather than scrypt, which is the better function and is not always
+# there: hashlib.scrypt needs a Python built against OpenSSL 1.1+, and this
+# file's floor is 3.6 on whatever a minimal container happens to ship.
+# pbkdf2_hmac has been in the standard library since 3.4 with no such
+# condition, and an unconditional weaker function beats a stronger one that
+# raises AttributeError on somebody's server.
+#
+# 600k iterations is ~140ms here and ~400ms on a small VPS. Paid once a month
+# by the person logging in; paid on every guess by anyone else.
+PBKDF2_ITERS = 600000
+
+
+def web_password_set(password):
+    """Store a verifier for `password`. Never stores the password."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt,
+                                 PBKDF2_ITERS, dklen=32)
+    # The parameters travel with the hash so raising them later does not
+    # invalidate what is already stored.
+    atomic_write(PATH_WEB_PASSWORD,
+                 "pbkdf2_sha256$%d$%s$%s\n" % (
+                     PBKDF2_ITERS,
+                     base64.b64encode(salt).decode(),
+                     base64.b64encode(digest).decode()),
+                 mode=0o600)
+
+
+def web_password_check(password):
+    """True if `password` matches the stored verifier.
+
+    False when none is set: a console with no password is not one that lets
+    everybody in, it is one that cannot be signed into at all.
+    """
+    raw = read_text(PATH_WEB_PASSWORD).strip()
+    if not raw:
+        return False
+    try:
+        kind, iters, salt, want = raw.split("$")
+        if kind != "pbkdf2_sha256":
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                  base64.b64decode(salt), int(iters), dklen=32)
+    except Exception:
+        return False
+    return hmac.compare_digest(got, base64.b64decode(want))
+
+
+def web_sessions_load():
+    try:
+        with open(PATH_WEB_SESSIONS) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def web_sessions_save(sessions):
+    atomic_write(PATH_WEB_SESSIONS, json_dumps(sessions), mode=0o600)
+
+
+def _session_key(token):
+    """What goes on disk. A stolen file should not be a stolen session."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def web_session_new():
+    token = secrets.token_urlsafe(32)
+    sessions = web_sessions_load()
+    cutoff = now_ms()
+    # Expired ones go while we are here; nothing else ever prunes this file.
+    sessions = dict((k, v) for k, v in sessions.items() if v > cutoff)
+    sessions[_session_key(token)] = cutoff + WEB_SESSION_DAYS * 86400 * 1000
+    web_sessions_save(sessions)
+    return token
+
+
+def web_session_valid(token):
+    if not token:
+        return False
+    return web_sessions_load().get(_session_key(token), 0) > now_ms()
+
+
+def web_session_drop(token):
+    sessions = web_sessions_load()
+    if sessions.pop(_session_key(token or ""), None) is not None:
+        web_sessions_save(sessions)
+
+
+def web_sessions_drop_all():
+    web_sessions_save({})
+
+
 def provider_keys():
     """Credentials this daemon has been given, keyed by provider id.
 
@@ -5436,6 +5553,28 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _cookie(self, name):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
+
+    def _set_cookie(self, token, days):
+        """Secure everywhere but a loopback host.
+
+        The carve-out is for reading the page over an ssh forward while
+        working on it, where there is no TLS to be had. Anywhere else a
+        cookie without Secure is one that a downgrade can read.
+        """
+        host = (self.headers.get("Host") or "").split(":")[0]
+        local = host in ("localhost", "127.0.0.1", "::1", "")
+        bits = ["%s=%s" % (WEB_COOKIE, token), "Path=/", "HttpOnly",
+                "SameSite=Lax", "Max-Age=%d" % (days * 86400)]
+        if not local:
+            bits.append("Secure")
+        self.send_header("Set-Cookie", "; ".join(bits))
+
     def _send_text(self, text, status=200, ctype="text/plain; charset=utf-8"):
         payload = text.encode("utf-8")
         self.send_response(status)
@@ -5477,6 +5616,13 @@ class Handler(BaseHTTPRequestHandler):
             # rather than answering a stranger with a login-shaped page.
             if path == "/v1/ping" or (path == "/" and not os.path.isdir(DIR_WEB)):
                 return self._send_json(self._ping_body())
+            # The login itself cannot require being logged in. These three are
+            # the entire unauthenticated surface, and each is small on
+            # purpose: a form, its verifier, and the answer nginx asks for
+            # before it serves anything else.
+            if path in WEB_OPEN_PATHS.get(method, ()):
+                fn = WEB_OPEN_PATHS[method][path]
+                return fn(self, {}, query)
             self._auth()
             handler = self.server.router.match(method, path)
             if handler is None:
@@ -6172,6 +6318,138 @@ def h_shutdown(req, params, query):
     threading.Thread(target=req.server.request_shutdown).start()
 
 
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caden</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg:#fbfbfa; --card:#fff; --line:#e6e4e1; --text:#1c1b19; --dim:#78746e;
+    --accent:#1c1b19; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#191817; --card:#211f1e; --line:#333130; --text:#eceae7;
+            --dim:#8f8a84; --accent:#eceae7; --bad:#f2b8b5; } }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100dvh; display:flex; align-items:center;
+    justify-content:center; padding:24px; background:var(--bg); color:var(--text);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }
+  form { width:100%; max-width:320px; background:var(--card);
+    border:1px solid var(--line); border-radius:14px; padding:28px 24px; }
+  h1 { margin:0 0 4px; font-size:19px; letter-spacing:-0.2px; }
+  p  { margin:0 0 20px; color:var(--dim); font-size:13px; }
+  label { display:block; font-size:12px; color:var(--dim); margin-bottom:6px; }
+  input { width:100%; padding:11px 12px; border:1px solid var(--line);
+    border-radius:9px; background:var(--bg); color:var(--text);
+    /* 16px or iOS zooms in on focus and does not zoom back out. */
+    font-size:16px; }
+  input:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  button { width:100%; margin-top:14px; padding:11px; border:0; border-radius:9px;
+    background:var(--accent); color:var(--card); font-size:15px; font-weight:560;
+    cursor:pointer; }
+  .err { margin-top:12px; font-size:13px; color:var(--bad); min-height:19px; }
+</style></head><body>
+<form method="post" action="/v1/web/login">
+  <h1>Caden</h1>
+  <p>This console runs your agents. Sign in to reach them.</p>
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password"
+         autofocus required>
+  <input name="next" type="hidden" value="__NEXT__">
+  <button type="submit">Sign in</button>
+  <div class="err">__ERROR__</div>
+</form></body></html>
+"""
+
+
+def _login_html(error="", nxt="/"):
+    # The only two substitutions, and both are escaped: `next` arrives from a
+    # query string, which is to say from anywhere.
+    safe = nxt.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    return LOGIN_PAGE.replace("__ERROR__", error).replace("__NEXT__", safe)
+
+
+def h_web_login_page(req, params, query):
+    nxt = q1(query, "next", "/") or "/"
+    # Only paths on this host. An open redirect on a login page is how a
+    # convincing phishing link gets built out of a domain you trust.
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        nxt = "/"
+    req.send_response(200)
+    req.send_header("Content-Type", "text/html; charset=utf-8")
+    req.send_header("Cache-Control", "no-store")
+    body = _login_html(nxt=nxt).encode("utf-8")
+    req.send_header("Content-Length", str(len(body)))
+    req.end_headers()
+    req.wfile.write(body)
+
+
+def h_web_login(req, params, query):
+    raw = req._body().decode("utf-8", "replace")
+    fields = dict((k, v[0]) for k, v in parse_qs(raw).items())
+    if not fields and raw.strip().startswith("{"):
+        try:
+            fields = json.loads(raw)
+        except ValueError:
+            fields = {}
+    nxt = fields.get("next") or "/"
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        nxt = "/"
+
+    if not web_password_check(fields.get("password") or ""):
+        # The same pause the token path takes. Not a defence -- scrypt is the
+        # defence -- but it keeps a misconfigured proxy from also being a
+        # fast oracle, and it is what fail2ban counts.
+        time.sleep(0.25)
+        log("warn", "web login failed from %s", req.address_string())
+        body = _login_html("That password did not work.", nxt).encode("utf-8")
+        req.send_response(401)
+        req.send_header("Content-Type", "text/html; charset=utf-8")
+        req.send_header("Cache-Control", "no-store")
+        req.send_header("Content-Length", str(len(body)))
+        req.end_headers()
+        return req.wfile.write(body)
+
+    token = web_session_new()
+    req.send_response(303)
+    req._set_cookie(token, WEB_SESSION_DAYS)
+    req.send_header("Location", nxt)
+    req.send_header("Content-Length", "0")
+    req.end_headers()
+
+
+def h_web_verify(req, params, query):
+    """What nginx asks before serving anything. Body irrelevant; status is all."""
+    if web_session_valid(req._cookie(WEB_COOKIE)):
+        req.send_response(200)
+    else:
+        req.send_response(401)
+    req.send_header("Content-Length", "0")
+    req.end_headers()
+
+
+def h_web_logout(req, params, query):
+    web_session_drop(req._cookie(WEB_COOKIE))
+    req.send_response(303)
+    req._set_cookie("", 0)
+    req.send_header("Location", "/login")
+    req.send_header("Content-Length", "0")
+    req.end_headers()
+
+
+def h_web_logout_all(req, params, query):
+    """Every browser, everywhere -- the answer to a lost phone."""
+    web_sessions_drop_all()
+    req._send_json({"ok": True})
+
+
+# Reachable without a session, because requiring one would be circular.
+WEB_OPEN_PATHS = {
+    "GET": {"/login": h_web_login_page, "/v1/web/verify": h_web_verify},
+    "POST": {"/v1/web/login": h_web_login},
+}
+
+
 def build_router():
     r = Router()
     r.add("GET", "/v1/health", h_health)
@@ -6199,6 +6477,8 @@ def build_router():
     r.add("POST", "/v1/uploads", h_upload_begin)
     r.add("PUT", "/v1/uploads/<uid>", h_upload_chunk)
     r.add("POST", "/v1/uploads/<uid>/complete", h_upload_complete)
+    r.add("POST", "/v1/web/logout", h_web_logout)
+    r.add("POST", "/v1/web/logout-all", h_web_logout_all)
     r.add("POST", "/v1/shutdown", h_shutdown)
     return r
 
@@ -6543,6 +6823,8 @@ def main(argv):
             action = "status"
         elif a == "--print-token":
             action = "token"
+        elif a == "--set-web-password":
+            action = "web-password"
         elif a == "--selftest":
             action = "selftest"
         elif a in ("--version", "-V"):
@@ -6562,6 +6844,20 @@ def main(argv):
         return cmd_status(port)
     if action == "stop":
         return cmd_stop()
+    if action == "web-password":
+        # From stdin, never a flag: an argument is in the process list while
+        # it runs and in a shell history afterwards.
+        pw = sys.stdin.readline().rstrip("\n")
+        if len(pw) < 8:
+            sys.stderr.write("that password is too short to be worth storing\n")
+            return 2
+        ensure_dirs()
+        web_password_set(pw)
+        # Anything already signed in was signed in against the old one.
+        web_sessions_drop_all()
+        print("web password set; existing browser sessions revoked")
+        return 0
+
     if action == "token":
         print(token_load_or_create())
         return 0

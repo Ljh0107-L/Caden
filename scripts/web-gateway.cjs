@@ -77,12 +77,21 @@ const plan = servers.map(s => {
     here,
     port: here ? (s.remotePort || 7838) : next++,
     remotePort: s.remotePort || 7838,
+    home: (s.remoteHome || '~/.caden').replace(/^~\//, ''),
     token: daemonToken(s),
   };
 });
 
 const missing = plan.filter(p => !p.token);
 const usable = plan.filter(p => p.token);
+
+// The sign-in lives in one daemon -- the one on the gateway if there is one,
+// otherwise the first that has a tunnel there. nginx asks it about every
+// request, so it has to be reachable from nginx without going through the
+// check it is answering.
+const gateway = usable.find(p => p.here) || usable[0];
+const gwPort = gateway ? gateway.port : 7838;
+const gwHome = gateway ? gateway.home : '.caden';
 
 const say = (...l) => console.log(l.join('\n'));
 
@@ -98,9 +107,11 @@ say('# ─── 1. On the gateway',
     '# A certificate first, or certbot will rewrite the site file for you:',
     `#   certbot --nginx -d ${hostname}`,
     '#',
-    '# A password, generated rather than invented -- it is the only door in',
-    '# front of a service that runs commands and holds your model keys:',
-    `#   htpasswd -B -c /etc/nginx/${hostname}.htpasswd you`,
+    '# A password. The console owns its own sign-in, so this is set on the',
+    '# gateway daemon rather than in nginx -- from stdin, so it is not left in',
+    '# a shell history:',
+    `#   printf '%s\\n' 'your password' | CADEN_HOME=~/${gwHome} \\`,
+    `#       python3 ~/${gwHome}/heartbeat.py --set-web-password`,
     '#',
     '# And /etc/nginx/conf.d/caden-ratelimit.conf, which the block below needs:',
     '#',
@@ -124,8 +135,30 @@ say('');
 say('    limit_req zone=caden burst=50 nodelay;');
 say('    limit_req_status 429;');
 say('');
-say('    auth_basic           "Caden";');
-say(`    auth_basic_user_file /etc/nginx/${hostname}.htpasswd;`);
+say('    # Checked before anything is served, including the routes that proxy');
+say('    # to other machines. Those never reach the daemon that owns the');
+say('    # session, so a check living only in a daemon would not cover them.');
+say('    auth_request /_caden_verify;');
+say('    error_page 401 = @caden_login;');
+say('');
+say('    location = /_caden_verify {');
+say('        internal;');
+say(`        proxy_pass http://127.0.0.1:${gwPort}/v1/web/verify;`);
+say('        proxy_pass_request_body off;');
+say('        proxy_set_header Content-Length "";');
+say('    }');
+say('');
+say('    location @caden_login { return 302 /login?next=$request_uri; }');
+say('');
+say('    # Signing in cannot require being signed in. These three are the');
+say('    # whole of what an unauthenticated request reaches.');
+for (const r of ['/login', '/v1/web/login', '/v1/web/logout']) {
+  say(`    location = ${r} {`);
+  say('        auth_request off;');
+  say(`        proxy_pass http://127.0.0.1:${gwPort}${r};`);
+  say('        proxy_set_header Host $host;');
+  say('    }');
+}
 say('');
 say('    # Anything else under /host/ is the desktop app\'s control plane, and');
 say('    # does not exist here. Without this the fallback below answers a');
@@ -206,13 +239,18 @@ say('',
     '# in ten minutes and the address is gone for an hour, which turns the',
     '# arithmetic on a guessable password from days into never.',
     '#',
+    '#   /etc/fail2ban/filter.d/caden-login.conf',
+    '#     [Definition]',
+    '#     failregex = ^<HOST> .* "POST /v1/web/login HTTP/[0-9.]+" 401',
+    '#     ignoreregex =',
+    '#',
     '#   /etc/fail2ban/jail.d/caden.conf',
     '#     [caden-auth]',
     '#     enabled  = true',
-    '#     filter   = nginx-http-auth',
+    '#     filter   = caden-login',
     '#     port     = http,https',
     '#     backend  = polling',
-    '#     logpath  = /var/log/nginx/error.log',
+    '#     logpath  = /var/log/nginx/access.log',
     '#     maxretry = 5',
     '#     findtime = 600',
     '#     bantime  = 3600',

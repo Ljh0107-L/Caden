@@ -79,6 +79,17 @@ forward:
   it did. The wire protocol is unchanged. A run that reads no keys at all —
   a locked keychain — leaves the ones already on the server alone instead of
   replacing them with nothing.
+- **The console has a sign-in of its own.** A bearer token is the right
+  credential for a program and the wrong one for a person — a browser cannot
+  put a header on the navigation that loads a page — so reaching one through a
+  proxy meant HTTP basic auth, whose dialog belongs to the browser rather than
+  to Caden, appears before anything has rendered, and gets re-prompted by
+  Safari on its own schedule, ending any event stream open at the time. There
+  is a password, a session cookie and a page now. nginx checks it through
+  `auth_request`, which is where it has to live: a gateway fronts several
+  daemons, and `/proxy/<other>/…` never reaches the one that owns the session.
+  Sessions are stored hashed, last thirty days, survive a daemon restart, and
+  are all revoked by changing the password or by `POST /v1/web/logout-all`.
 - **The console hides what its host cannot do.** `/host/config` now says what
   the thing serving the page is able to do on the renderer's behalf — add a
   server, provision one over ssh, open a forward, pick a file with a native
