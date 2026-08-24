@@ -28,7 +28,18 @@ Three of these were only true on a desktop.
   a home provisioned by 0.1.0 is narrowed on the way up rather than left as it
   was found.
 
-And one that was not about screens at all:
+Groundwork for reaching a daemon through a browser rather than an ssh
+forward:
+
+- **The daemon says less to a stranger, and answers a wrong token more
+  slowly.** An unauthenticated `/v1/ping` named the software, the version and
+  the exact source revision — the first line of a scanner's report, on a port
+  that is one proxy misconfiguration away from the internet. It reports
+  liveness now and nothing else; `/v1/health` carries the same fields for a
+  caller holding the token, which is where the app reads them. The comparison
+  is constant-time, and a failed one costs 250ms.
+
+And one that was not about any of this:
 
 - **Tearing down one daemon home's supervision no longer takes another's with
   it.** The watchdog's crontab lines are tagged, and every home outside the

@@ -824,16 +824,22 @@ async function status(server) {
 
   const ping = await daemonGet(server, '/v1/ping', { auth: false, timeout: 4000 });
   out.daemon = !!(ping && ping.ok);
-  out.daemonVersion = ping?.version || null;
-  out.daemonRevision = ping?.revision || null;
+  out.daemonVersion = null;
+  out.daemonRevision = null;
   out.bundledRevision = bundledRevision;
-  // A daemon with no revision at all predates the field, so it is stale by
-  // definition -- that is exactly the build this check exists to catch.
-  out.daemonStale = !!(out.daemon && bundledRevision
-                       && out.daemonRevision !== bundledRevision);
 
   if (out.daemon && out.token) {
-    const engines = await daemonGet(server, '/v1/engines?latest=1');
+    // Which build is over there comes from the authenticated side. An
+    // unauthenticated ping answers `ok` and nothing else, so a daemon one
+    // proxy misconfiguration away from the internet does not hand a scanner
+    // its version and source revision; /v1/health carries both for a caller
+    // that can prove it belongs here.
+    const [health, engines] = await Promise.all([
+      daemonGet(server, '/v1/health'),
+      daemonGet(server, '/v1/engines?latest=1'),
+    ]);
+    out.daemonVersion = health?.version || null;
+    out.daemonRevision = health?.revision || null;
     if (engines?.engines) {
       out.engines = {
         claude: engines.engines.claude || { installed: false },
@@ -849,6 +855,12 @@ async function status(server) {
       }
     }
   }
+  // A daemon that answered but reports no revision predates the field, so it
+  // is stale by definition -- that is exactly the build this check exists to
+  // catch. Without a token there is nothing to compare and nothing is
+  // claimed: "I could not ask" is not the same as "it is out of date".
+  out.daemonStale = !!(out.daemon && out.token && bundledRevision
+                       && out.daemonRevision !== bundledRevision);
   out.ready = !!(out.daemon && out.token
                  && (out.engines?.claude?.installed || out.engines?.codex?.installed));
   return out;

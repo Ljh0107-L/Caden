@@ -34,6 +34,7 @@ Layout under $CADEN_HOME (default ~/.caden):
 import base64
 import errno
 import hashlib
+import hmac
 import itertools
 import json
 import os
@@ -5301,17 +5302,50 @@ class Handler(BaseHTTPRequestHandler):
         if LOG_LEVEL == "debug":
             log("debug", "%s %s", self.address_string(), fmt % args)
 
-    def _auth(self):
+    def _token_ok(self):
+        """Does this request carry the token? No side effects -- see `_auth`.
+
+        `compare_digest` rather than `!=`. The token is 264 bits and a timing
+        attack on it over a network is not a real threat, but the one-line
+        version of "not a real threat" is cheaper than the argument.
+        """
         expected = self.server.token
         if not expected:
-            return
+            return True
         given = self.headers.get("Authorization") or ""
         if given.startswith("Bearer "):
             given = given[7:]
         else:
             given = self.headers.get("X-Caden-Token") or ""
-        if given.strip() != expected:
-            raise HttpError(401, "bad or missing token")
+        return hmac.compare_digest(given.strip(), expected)
+
+    def _auth(self):
+        if self._token_ok():
+            return
+        # A throttle, not a defence -- guessing the token is not the threat
+        # model. It is here so that a proxy misconfigured in front of this
+        # daemon does not also become a free high-rate oracle. Deliberately
+        # short: the handler thread is held for the duration and there are a
+        # limited number of them.
+        time.sleep(0.25)
+        raise HttpError(401, "bad or missing token")
+
+    def _ping_body(self):
+        """Liveness for anyone; what is running here only for the token holder.
+
+        `ok` is all the liveness checks read -- app/host.js pings a forward
+        without authenticating to decide whether it is still usable, and has
+        to keep working when the token is missing or wrong. The version and
+        the source revision are a different matter: on a port that is one
+        proxy misconfiguration away from the internet, `heartbeat 0.1.0 rev
+        abc123` is the first line of a scanner's report. Anyone holding the
+        token can read the same two fields off /v1/health.
+        """
+        body = {"ok": True, "service": "heartbeat"}
+        if self._token_ok():
+            body.update({"version": VERSION, "protocol": PROTOCOL,
+                         "revision": REVISION})
+        return body
 
     def _body(self):
         try:
@@ -5376,9 +5410,7 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         try:
             if path in ("/v1/ping", "/"):
-                return self._send_json({"ok": True, "service": "heartbeat",
-                                        "version": VERSION, "protocol": PROTOCOL,
-                                        "revision": REVISION})
+                return self._send_json(self._ping_body())
             self._auth()
             handler = self.server.router.match(method, path)
             if handler is None:
