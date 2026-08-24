@@ -28,6 +28,10 @@ const SUPPORT = flavor.support;
 const CONFIG_PATH = process.env.CADEN_CONFIG || path.join(SUPPORT, 'config.json');
 const CONTROL_DIR = flavor.controlDir;
 const DAEMON_DIR = path.join(__dirname, '..', 'server');
+const WEB_DIR = path.join(__dirname, 'web');
+/// Everything else under web/ is source text and rides the same heredoc the
+/// daemon does. These cannot: a woff2 through a heredoc is not a woff2.
+const WEB_BINARY = /\.(woff2?|png|jpe?g|gif|ico)$/i;
 const KEYCHAIN_SERVICE = flavor.keychainService;
 const REMOTE_HOME = flavor.remoteHome;
 
@@ -356,7 +360,28 @@ const findServer = id => (readConfig().servers || []).find(s => s.id === id);
 /// already running, which is what you want when setting a server up but means
 /// a freshly uploaded heartbeat.py would not take effect. Upgrading has to ask for
 /// the restart explicitly.
-function buildProvisionScript(home, files, port, restart) {
+/// The console's own files, for a daemon that will serve them itself.
+///
+/// Dotfiles are skipped rather than filtered by name: the one that keeps
+/// turning up is .DS_Store, and a bundle is not the place to discover the
+/// next one.
+function webPayload(dir = WEB_DIR, out = []) {
+  if (!fs.existsSync(dir)) return out;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) { webPayload(full, out); continue; }
+    out.push({
+      // Posix separators: this string becomes a path on the server.
+      name: path.relative(WEB_DIR, full).split(path.sep).join('/'),
+      binary: WEB_BINARY.test(entry.name),
+      body: fs.readFileSync(full),
+    });
+  }
+  return out;
+}
+
+function buildProvisionScript(home, files, port, restart, web = []) {
   const remoteHome = shellPath(home);
   // A random heredoc marker prevents a source line from terminating the file
   // early while keeping the payload independent of base64/tar availability on
@@ -375,11 +400,55 @@ function buildProvisionScript(home, files, port, restart) {
       marker,
       `chmod 700 ${remoteHome}/${name}.tmp && mv -f ${remoteHome}/${name}.tmp ${remoteHome}/${name}`,
     ]),
+    ...webScript(remoteHome, web, marker),
     `sh ${remoteHome}/bootstrap.sh --home ${remoteHome} --port ${Number(port) || DEFAULT_PORT} --supervise`
       + (restart ? ' --restart' : ''),
     '',
   ].join('\n');
   return script;
+}
+
+/// The console half of the payload.
+///
+/// Text goes the way the daemon sources go. The two fonts have to be base64,
+/// and the comment on buildProvisionScript's heredoc explains why that is not
+/// the default: the target may be a container with no base64 to decode them
+/// with. So they are guarded rather than assumed -- a console in the fallback
+/// mono beats no console, and both beat a provisioning run that fails on a
+/// minimal host over a typeface.
+function webScript(remoteHome, web, marker) {
+  if (!web.length) return [];
+  const dirs = [...new Set(web.map(f => path.posix.dirname(f.name)))]
+    .map(d => (d === '.' ? `${remoteHome}/web` : `${remoteHome}/web/${d}`));
+  const lines = [
+    `rm -rf ${remoteHome}/web.new`,
+    ...dirs.map(d => `mkdir -p ${d.replace(`${remoteHome}/web`, `${remoteHome}/web.new`)}`),
+  ];
+  let guarded = false;
+  for (const f of web) {
+    const dest = `${remoteHome}/web.new/${f.name}`;
+    if (f.binary) {
+      if (!guarded) {
+        lines.push('if command -v base64 >/dev/null 2>&1; then');
+        guarded = true;
+      }
+      lines.push(`base64 -d > ${dest} <<'${marker}'`,
+                 f.body.toString('base64').replace(/(.{76})/g, '$1\n'),
+                 marker);
+      continue;
+    }
+    if (guarded) { lines.push('fi'); guarded = false; }
+    const text = f.body.toString('utf8');
+    lines.push(`cat > ${dest} <<'${marker}'`,
+               text.endsWith('\n') ? text.slice(0, -1) : text,
+               marker);
+  }
+  if (guarded) lines.push('fi');
+  // Swapped in whole, so a run that dies partway leaves the console that was
+  // working there rather than half of two of them.
+  lines.push(`rm -rf ${remoteHome}/web && mv ${remoteHome}/web.new ${remoteHome}/web`,
+             `chmod 700 ${remoteHome}/web`);
+  return lines;
 }
 
 async function provision(server, { restart = false } = {}, onStep = () => {}) {
@@ -407,7 +476,8 @@ async function provision(server, { restart = false } = {}, onStep = () => {}) {
     files.push({ name, body: fs.readFileSync(src, 'utf8') });
   }
 
-  const script = buildProvisionScript(home, files, server.remotePort, restart);
+  const script = buildProvisionScript(home, files, server.remotePort, restart,
+                                      webPayload());
 
   onStep('connecting over ssh…');
   onStep('uploading daemon files…');
@@ -1249,5 +1319,5 @@ async function ensureLocalServer() {
 
 module.exports = {
   route, readConfig, daemonBase, daemonToken, providerKey, expandTilde,
-  buildProvisionScript, provision, shutdown, ensureLocalServer,
+  buildProvisionScript, webPayload, provision, shutdown, ensureLocalServer,
 };

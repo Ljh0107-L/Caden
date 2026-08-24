@@ -31,6 +31,14 @@ Three of these were only true on a desktop.
 Groundwork for reaching a daemon through a browser rather than an ssh
 forward:
 
+- **Provisioning sends the console with the daemon.** The payload was three
+  text files in a heredoc, chosen so a minimal container with no `tar` and no
+  `base64` could still be provisioned. The renderer is 258K of text, which
+  goes the same way — but a woff2 does not survive a heredoc, so the two fonts
+  are base64 and guarded by `command -v base64`. A host without it gets a
+  working console in the fallback mono rather than a provisioning run that
+  fails over a typeface. The tree is swapped in whole, so a run that dies
+  partway leaves the console that was already working.
 - **The daemon serves the console itself.** Dropped into `~/.caden/web` by
   provisioning, behind the same token as everything else, with ETags so that
   340K of renderer and fonts is not re-fetched on every open over a phone
