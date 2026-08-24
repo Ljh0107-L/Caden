@@ -27,6 +27,26 @@ public address, and none needs a hole in a firewall.
 The gateway does need a public address and a name in DNS. One machine, one
 record.
 
+## Provision the daemon as an ordinary user
+
+Not as root. The daemon runs the agents, and the agents run arbitrary commands
+— on a machine a browser can now reach. Claude Code enforces half of this
+itself: `bypassPermissions` is `--dangerously-skip-permissions` underneath and
+the CLI refuses it under a uid of 0, so the default permission mode simply
+does not work on a root daemon. Caden says so when the session is created
+rather than letting the engine die on its first line.
+
+```
+adduser --disabled-password --gecos "Caden agent" caden
+install -d -m 700 -o caden -g caden /home/caden/.ssh
+cp ~/.ssh/authorized_keys /home/caden/.ssh/          # so provisioning can reach it
+chown caden:caden /home/caden/.ssh/authorized_keys
+loginctl enable-linger caden                         # its service starts at boot
+```
+
+Then `scripts/provision.sh caden@your-host`. An ssh alias for that user is
+worth adding, since every later upgrade goes the same way.
+
 ## What runs where
 
 | | |

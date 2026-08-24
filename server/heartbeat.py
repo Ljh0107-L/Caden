@@ -1940,6 +1940,8 @@ class ClaudeEngine(BaseEngine):
             self.emit("log", stream="caden",
                       text="model -> %s" % (want.get("model") or "default"))
         if want.get("permission_mode") != have.get("permission_mode"):
+            require_usable_permission_mode(self.session.meta.get("engine"),
+                                           want.get("permission_mode"))
             self._control("set_permission_mode", mode=want["permission_mode"])
             self.emit("log", stream="caden",
                       text="permission mode -> %s" % want["permission_mode"])
@@ -3464,6 +3466,42 @@ def resolve_key_ref(spec):
     return spec
 
 
+# Claude Code refuses --dangerously-skip-permissions, which is what
+# bypassPermissions asks for, when it is running as root. That is a sensible
+# guardrail -- the agent runs arbitrary commands, and doing so as root on a
+# box reachable from a browser is not a thing to make easy -- so Caden does
+# not work around it. It says so before the turn instead.
+#
+# Only that one mode. acceptEdits, plan and dontAsk all start fine as root.
+ROOT_FORBIDS = ("bypassPermissions",)
+
+
+def running_as_root():
+    try:
+        return os.geteuid() == 0
+    except AttributeError:      # not POSIX; the question does not arise
+        return False
+
+
+def require_usable_permission_mode(engine, mode):
+    """Reject a mode this daemon cannot actually run in.
+
+    Without this the session is created, the turn starts, and the engine dies
+    on its first line with a message about a flag Caden never showed anyone --
+    which reads as "Caden is broken" rather than "this daemon is root".
+    """
+    if engine != "claude" or not running_as_root():
+        return
+    if (mode or "bypassPermissions") not in ROOT_FORBIDS:
+        return
+    raise ValueError(
+        "this daemon runs as root, and Claude Code refuses Full access there "
+        "(it is --dangerously-skip-permissions underneath). Pick Workspace "
+        "write or Read only for this session, or -- better -- provision the "
+        "daemon as an ordinary user: an agent that runs commands should not "
+        "be running them as root.")
+
+
 def require_credential(engine, provider):
     """Reject a session that has no credential of its own.
 
@@ -4270,6 +4308,7 @@ class SessionManager(object):
         if engine not in ENGINES:
             raise ValueError("unsupported engine %r" % engine)
         require_credential(engine, provider)
+        require_usable_permission_mode(engine, spec.get("permission_mode"))
         sid = new_id("s")
         cwd = spec.get("cwd") or ""
         if cwd:
@@ -4552,6 +4591,9 @@ def host_facts():
         "python": sys.version.split()[0],
         "caden_home": CADEN_HOME,
         "user": os.environ.get("USER") or os.environ.get("LOGNAME") or "",
+        # The Servers pane reads this: a daemon that cannot run the default
+        # permission mode should not be reporting itself simply ready.
+        "root": running_as_root(),
         "home": os.path.expanduser("~"),
         "engines": tc,
         "cpu_count": os.cpu_count() or 1,

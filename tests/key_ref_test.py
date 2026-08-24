@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Ljh0107-L. SPDX-License-Identifier: MIT
 
-"""The daemon turning a `key_ref` into the key it names.
+"""What the daemon settles before it will start a session, and why.
+
+Two checks, both of which exist because the alternative is a session that is
+created, starts a turn, and dies on the engine's first line with a message
+about something Caden never showed anyone -- which reads as "Caden is broken"
+rather than as the one-line fact it is.
+
+The first is turning a `key_ref` into the key it names.
 
 The renderer has never held a model API key: it sends the provider's id and
 something in front of the daemon supplies the value. On the Mac that is
@@ -48,6 +55,59 @@ def load(home):
     return mod
 
 
+def root_refusal(caden):
+    """Full access is what Claude Code will not do as root.
+
+    It is --dangerously-skip-permissions underneath, and the CLI refuses it
+    with a uid check. Caden does not work around that -- an agent that runs
+    arbitrary commands should not be running them as root, least of all on a
+    machine a browser can reach -- so the job here is to say so first.
+
+    running_as_root is stubbed rather than the test being run as root, which
+    would be a strange thing to require of a test suite.
+    """
+    real = caden.running_as_root
+    try:
+        caden.running_as_root = lambda: True
+        try:
+            caden.require_usable_permission_mode("claude", "bypassPermissions")
+            check("as root, Full access is refused", False, "no error raised")
+        except ValueError as exc:
+            msg = str(exc)
+            check("as root, Full access is refused", True)
+            # The message has to name the cause and the way out; "invalid
+            # permission mode" would send someone to the wrong place.
+            check("and the message says it is about root",
+                  "root" in msg, msg[:70])
+            check("and offers something to do about it",
+                  "Workspace write" in msg and "ordinary user" in msg, msg[:90])
+
+        # The others start fine as root; refusing them would be a lie that
+        # costs someone their only usable mode.
+        for mode in ("acceptEdits", "plan", "dontAsk"):
+            try:
+                caden.require_usable_permission_mode("claude", mode)
+                check("as root, %s is still allowed" % mode, True)
+            except ValueError as exc:
+                check("as root, %s is still allowed" % mode, False, str(exc)[:60])
+
+        # Codex has no such check of its own.
+        try:
+            caden.require_usable_permission_mode("codex", "bypassPermissions")
+            check("codex is not affected", True)
+        except ValueError as exc:
+            check("codex is not affected", False, str(exc)[:60])
+
+        caden.running_as_root = lambda: False
+        try:
+            caden.require_usable_permission_mode("claude", "bypassPermissions")
+            check("as anyone else, Full access is allowed", True)
+        except ValueError as exc:
+            check("as anyone else, Full access is allowed", False, str(exc)[:60])
+    finally:
+        caden.running_as_root = real
+
+
 def main():
     keep = os.environ.get("CADEN_HOME")
     home = tempfile.mkdtemp(prefix="caden-keyref-")
@@ -92,6 +152,9 @@ def main():
         check("a daemon with no providers file is not an error",
               caden.provider_keys() == {}
               and "key_ref" not in caden.resolve_key_ref({"key_ref": "prov-a"}))
+
+        print("the permission mode a root daemon cannot run in")
+        root_refusal(caden)
     finally:
         shutil.rmtree(home, ignore_errors=True)
         if keep is None:

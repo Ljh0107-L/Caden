@@ -97,6 +97,15 @@ forward:
   it did. The wire protocol is unchanged. A run that reads no keys at all —
   a locked keychain — leaves the ones already on the server alone instead of
   replacing them with nothing.
+- **A root daemon says so before the turn, not during it.** `bypassPermissions`
+  is `--dangerously-skip-permissions` underneath, and Claude Code refuses it
+  under a uid of 0 — so on a daemon provisioned as root the default permission
+  mode produced "engine exited unexpectedly" and a line about a flag Caden
+  never showed anyone. It is refused at session creation now, with a message
+  naming the cause and both ways out. Caden does not work around the check:
+  an agent that runs arbitrary commands should not be running them as root,
+  least of all on a machine a browser can reach. `docs/WEB.md` sets the daemon
+  up as an ordinary user.
 - **The console has a sign-in of its own.** A bearer token is the right
   credential for a program and the wrong one for a person — a browser cannot
   put a header on the navigation that loads a page — so reaching one through a
