@@ -27,6 +27,30 @@ public address, and none needs a hole in a firewall.
 The gateway does need a public address and a name in DNS. One machine, one
 record.
 
+## Both installs on one gateway
+
+Caden installs twice — the build you use and a development one beside it —
+and they are meant to share nothing. They can share a machine to be proxied
+through; they must not share a hostname. A session cookie is per origin, so
+one address would mean one sign-in covering both, one server list holding
+both, and one install's nginx block being rewritten by the other's.
+
+So: `caden.example.net` for the real one, `caden-dev.example.net` for the
+other, both pointing at the same box. What that separates, and what it does
+not:
+
+| | |
+| --- | --- |
+| daemon home, port, keychain | separate — from `app/flavor.js` |
+| systemd unit | `heartbeat.service` / `heartbeat-dev.service` |
+| nginx site, web root | per hostname |
+| rate limit | shared, and should be — it counts per source address |
+| fail2ban | shared, and should be — it watches the whole access log |
+
+Changing the hostname and applying takes the old site down. The certificate
+is left, because deleting one is not a thing to do without being asked;
+`certbot delete --cert-name <old>` when you want it gone.
+
 ## Provision the daemon as an ordinary user
 
 Not as root. The daemon runs the agents, and the agents run arbitrary commands

@@ -1411,7 +1411,12 @@ const webRoot = hostname => `${WEB_ROOT_BASE}/${hostname}`;
 
 function webConfig() {
   const cfg = readConfig();
-  return { hostname: '', gatewayHost: '', serverId: '', ...(cfg.web || {}) };
+  // `appliedHostname` is what is actually configured on the gateway right
+  // now, which is not the same as what the settings say the moment somebody
+  // types a new one -- and the difference is what tells apply there is an old
+  // site to take down.
+  return { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
+           ...(cfg.web || {}) };
 }
 
 function saveWebConfig(patch) {
@@ -1670,6 +1675,25 @@ async function applyWebGateway(onStep = () => {}) {
   ].join('\n')).catch(e => {
     throw new Error(`nginx refused the configuration and it was rolled back: ${String(e.message || e).slice(0, 300)}`);
   });
+
+  // A renamed gateway leaves its old site enabled, still answering, still
+  // renewing a certificate for a name nobody uses. Taken down only after the
+  // new one is up and nginx has accepted it.
+  const { appliedHostname } = webConfig();
+  if (appliedHostname && appliedHostname !== hostname) {
+    onStep(`taking down the old address, ${appliedHostname}…`);
+    await sh([
+      `rm -f /etc/nginx/sites-enabled/${appliedHostname}`,
+      `rm -f /etc/nginx/sites-available/${appliedHostname}`,
+      `rm -rf ${webRoot(appliedHostname)}`,
+      'nginx -t >/dev/null && systemctl reload nginx',
+    ].join('\n')).catch(() => {});
+    // The certificate is left alone. Deleting one is not something to do
+    // without being asked, and an unused one costs nothing but a renewal.
+    onStep(`the certificate for ${appliedHostname} is still there; `
+         + `certbot delete --cert-name ${appliedHostname} removes it`);
+  }
+  saveWebConfig({ appliedHostname: hostname });
 
   onStep('installing the brute-force ban…');
   await sh([

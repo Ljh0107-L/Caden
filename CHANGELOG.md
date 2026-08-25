@@ -97,6 +97,12 @@ forward:
   it did. The wire protocol is unchanged. A run that reads no keys at all —
   a locked keychain — leaves the ones already on the server alone instead of
   replacing them with nothing.
+- **Renaming the gateway takes the old address down.** Changing the hostname
+  and applying left the previous site enabled, still answering, still renewing
+  a certificate for a name nobody uses. The old site and its web root go once
+  the new one is up and nginx has accepted it. The certificate is left alone —
+  deleting one is not a thing to do without being asked — and the step says
+  the command that removes it.
 - **Two installs can share a gateway without sharing anything on it.** The
   development build and the real one already keep separate config, keychain
   items, ports and daemon homes; the gateway had one place they collided,
