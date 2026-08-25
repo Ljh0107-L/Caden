@@ -44,7 +44,8 @@ assert.equal(prod.defaultPort, 7838);
 // Every axis on which the two could collide has to differ. A new field that
 // names a path or an identifier belongs in this list.
 for (const key of ['support', 'controlDir', 'keychainService', 'bundleId',
-                   'icon', 'remoteHome', 'defaultPort', 'label']) {
+                   'icon', 'remoteHome', 'defaultPort', 'tunnelBase',
+                   'localPortEnd', 'label']) {
   assert.notEqual(dev[key], prod[key], `dev and prod share ${key}`);
 }
 
@@ -57,6 +58,33 @@ assert.ok(!dev.remoteHome.startsWith(prod.remoteHome + '/'),
 // Far enough apart that neither install's search for a free local port can
 // walk into the other's range. Each one only knows the servers in its own
 // config, so they cannot avoid each other any other way.
+// The gateway's loopback is the one place the two can meet on a machine
+// neither of them owns: both walk up from their base consulting only their own
+// config, so a shared gateway put dev's second server and production's third on
+// the same port. Whichever tunnel bound it first owned it, and the other
+// console reached a daemon holding a different token -- which reads as "bad or
+// missing token" on a server that is running perfectly.
+// Local forward ports are a block per install, not an open-ended walk. Both
+// allocators start at their own `defaultPort` and consult only their own
+// config, so an unbounded walk on the production side reaches 7938 -- the port
+// the development daemon listens on -- and development stops working because
+// of how many servers production happens to have. Which install is "just
+// development" does not make it acceptable in either direction.
+const block = f => ({ from: f.defaultPort, to: f.localPortEnd });
+const P = block(prod), D = block(dev);
+assert.ok(P.to > P.from && D.to > D.from, 'each install needs a usable block');
+assert.ok(P.to < D.from || D.to < P.from,
+          `the local port blocks overlap: ${P.from}-${P.to} vs ${D.from}-${D.to}`);
+assert.ok(dev.defaultPort > prod.localPortEnd,
+          "production's walk must never reach the development daemon's port");
+
+assert.equal(prod.tunnelBase, 7901);
+assert.ok(Math.abs(dev.tunnelBase - prod.tunnelBase) >= 100,
+          'the tunnel port ranges have to be far enough apart that neither '
+          + "walk reaches the other's");
+assert.ok(dev.tunnelBase > prod.defaultPort && dev.tunnelBase > dev.defaultPort,
+          'tunnel ports must not collide with either daemon port');
+
 assert.ok(Math.abs(dev.defaultPort - prod.defaultPort) >= 100,
           'the local port bases are close enough to collide');
 

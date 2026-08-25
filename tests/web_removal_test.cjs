@@ -17,6 +17,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const flavor = require('../app/flavor');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'caden-removal-'));
 const configPath = path.join(tmp, 'config.json');
@@ -34,8 +35,10 @@ write({
   ],
   // No hostname: with no gateway configured there is nothing to reach out to,
   // which is what keeps this test on one machine.
+  // In this flavor's own range: a port from the other install's range is
+  // dropped on load now, and this test is about removal, not that migration.
   web: { hostname: '', gatewayHost: '', serverId: 'keep',
-         tunnels: { keep: 7901, drop: 7902 } },
+         tunnels: { keep: flavor.tunnelBase, drop: flavor.tunnelBase + 1 } },
 });
 
 const { removeServer } = require('../app/host');

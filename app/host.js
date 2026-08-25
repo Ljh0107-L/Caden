@@ -83,11 +83,41 @@ function shellPath(p) {
 
 function readConfig() {
   migrateSecrets();
+  let cfg;
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch {
     return { servers: [], providers: [], models: [] };
   }
+  return migrateTunnelPorts(cfg);
+}
+
+/// Tunnel ports were allocated from one hardcoded base by both installs.
+///
+/// On a gateway they share -- the ordinary arrangement, since the gateway is
+/// somebody's server and both installs can be pointed at it -- dev's second
+/// server and production's third both came out as 7903. Whichever tunnel bound
+/// it first owned it, and the other console reached a daemon holding a
+/// different token, which reads as "bad or missing token" on a server that is
+/// running perfectly.
+///
+/// The ranges are per-flavor now. A port from before that is dropped rather
+/// than kept, so the next connect allocates inside this install's range: a
+/// recorded port that may belong to the other install is worse than no
+/// recorded port, because the route it produces reaches the wrong machine
+/// while looking correct. Written back rather than filtered on the way past,
+/// so that removing a server can still find the entry it is removing.
+function migrateTunnelPorts(cfg) {
+  const tunnels = cfg.web?.tunnels;
+  if (!tunnels) return cfg;
+  const stale = Object.keys(tunnels).filter(id => tunnels[id] < flavor.tunnelBase);
+  if (!stale.length) return cfg;
+  for (const id of stale) {
+    delete cfg.web.tunnels[id];
+    if (cfg.web.tunnelHow) delete cfg.web.tunnelHow[id];
+  }
+  try { writeConfig(cfg); } catch { /* read-only config; the drop still holds */ }
+  return cfg;
 }
 
 function writeConfig(cfg) {
@@ -355,6 +385,11 @@ function addServer(alias) {
   const used = new Set(servers.map(s => s.localPort || s.remotePort));
   let localPort = DEFAULT_PORT;
   while (used.has(localPort)) localPort++;
+  // Past this install's block is the other install's daemon, and taking it
+  // would break that one for as long as this server exists.
+  if (localPort > flavor.localPortEnd) {
+    throw new Error(`no local port left below ${flavor.localPortEnd} for another server`);
+  }
   const entry = {
     id: newId(), name: alias, mode: 'tunnel',
     sshUser: '', sshHost: alias, sshPort: 22,
@@ -732,10 +767,15 @@ async function forwardUsable(server) {
 async function freeLocalPort(server) {
   const want = localPortOf(server);
   if (!(await canConnect(want))) return want;
-  for (let port = want + 1; port < want + 40; port++) {
+  // Inside this install's block only. Walking past it lands on the other
+  // install's daemon port, and a forward that takes it is a development build
+  // that stops the real one from starting -- the sort of interference the
+  // whole flavor split exists to prevent.
+  for (let port = want + 1; port <= flavor.localPortEnd; port++) {
     if (!(await canConnect(port))) return port;
   }
-  throw new Error(`no free local port near ${want} for the forward to ${server.name || server.sshHost}`);
+  throw new Error(`no free local port between ${want} and ${flavor.localPortEnd} `
+                  + `for the forward to ${server.name || server.sshHost}`);
 }
 
 function canConnect(port) {
@@ -1605,10 +1645,11 @@ function webConfig() {
   // now, which is not the same as what the settings say the moment somebody
   // types a new one -- and the difference is what tells apply there is an old
   // site to take down.
-  return { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
-           // serverId -> the loopback port its tunnel binds on the gateway,
-           // and serverId -> what is holding that tunnel open there.
-           tunnels: {}, tunnelHow: {}, ...(cfg.web || {}) };
+  const out = { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
+                // serverId -> the loopback port its tunnel binds on the
+                // gateway, and serverId -> what holds that tunnel open there.
+                tunnels: {}, tunnelHow: {}, ...(cfg.web || {}) };
+  return out;
 }
 
 /// A gateway port for this server's tunnel, stable once chosen: the unit on
@@ -1618,7 +1659,7 @@ function tunnelPortFor(serverId) {
   const web = webConfig();
   if (web.tunnels[serverId]) return web.tunnels[serverId];
   const taken = new Set(Object.values(web.tunnels));
-  let port = 7901;
+  let port = flavor.tunnelBase;
   while (taken.has(port)) port++;
   saveWebConfig({ tunnels: { ...web.tunnels, [serverId]: port } });
   return port;
@@ -1976,11 +2017,28 @@ async function startTunnelProcess(server, sh, cmd, port, onStep) {
     '# This machine has neither a systemd user session nor cron, so nothing',
     '# else would start the tunnel again -- not after a crash, and not after',
     '# a first attempt that simply failed to connect.',
+    // Its own pid, so the next install can stop it by number. Matching on the
+    // script name would not do: the command that installs it has that name in
+    // it too, and would kill itself partway through.
+    'echo $$ > "$HOME/.caden-tunnel.pid"',
     'while true; do',
     `  ${cmd} >> "$HOME/.caden-tunnel.log" 2>&1`,
     '  sleep 5',
     'done',
   ].join('\n');
+
+  // Whatever is already holding a tunnel here, whichever rung put it there.
+  // Reconnecting can move the port -- the ranges are per-flavor now, and a
+  // server set up before that gets a new one -- and a loop left running would
+  // go on restoring the old forward, holding a port on the gateway that
+  // belongs to somebody else.
+  const stop = [
+    '[ -f "$HOME/.caden-tunnel.pid" ] && kill "$(cat "$HOME/.caden-tunnel.pid")" 2>/dev/null || true',
+    'rm -f "$HOME/.caden-tunnel.pid"',
+    'systemctl --user stop caden-tunnel.service >/dev/null 2>&1 || true',
+    `pkill -f "R [0-9]*:127.0.0.1:${server.remotePort || DEFAULT_PORT}" >/dev/null 2>&1 || true`,
+  ].join('\n');
+  await sh(stop).catch(() => {});
 
   const tried = [];
   for (const l of TUNNEL_LAUNCHERS) {

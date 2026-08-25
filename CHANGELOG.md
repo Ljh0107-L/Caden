@@ -35,6 +35,24 @@ Two things a devbox found.
   the password and certificate checks, that is a pane sitting on "Checking…"
   long enough to read as broken. None of them depend on each other. Web went
   from that to 1.7s, and a server's own status from 26s to 1.9s.
+- **The two installs stop sharing ports they were never meant to share.** The
+  flavor split gives each install its own config, keychain, daemon home and
+  daemon port, and says in as many words that the bases have to be far enough
+  apart that neither walk reaches the other's. Two allocators had been left out
+  of that. Tunnel ports on the web gateway started at a hardcoded 7901 for
+  both, so on a gateway they share — the ordinary arrangement, since the
+  gateway is somebody's server — development's second server and production's
+  third both came out as 7903; whichever tunnel bound it first owned it, and
+  the other console reached a daemon holding a different token. That reads as
+  "bad or missing token" on a server that is running perfectly, and it was
+  happening on both consoles at once. Local forward ports had the same shape
+  and had not bitten yet: the walk starts at the daemon port and had no upper
+  bound, so a hundredth server on the production side would have taken 7938 —
+  the port the development daemon listens on — and stopped development working
+  because of how many servers production happened to have. Each install now
+  has a closed block for both, and a port recorded before the split is dropped
+  so the next connect allocates inside it. Which install is "just development"
+  does not make the interference acceptable in either direction.
 - **The Web pane draws itself before the answers arrive.** Almost everything on
   it is already on this machine — the address, which machine runs the proxy,
   which daemon serves the console, the list of servers — and only the ticks
