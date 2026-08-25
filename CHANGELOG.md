@@ -35,6 +35,14 @@ Two things a devbox found.
   the password and certificate checks, that is a pane sitting on "Checking…"
   long enough to read as broken. None of them depend on each other. Web went
   from that to 1.7s, and a server's own status from 26s to 1.9s.
+- **The Web pane draws itself before the answers arrive.** Almost everything on
+  it is already on this machine — the address, which machine runs the proxy,
+  which daemon serves the console, the list of servers — and only the ticks
+  beside them need asking. Waiting on the asking left the whole pane blank for
+  as long as the slowest check took. It fills in from the config first, in
+  about seven milliseconds, and the rows that need an answer say so until they
+  have one. A server with a tunnel reads as "checking…" rather than as "not on
+  the web", which would have offered an Add button for a server already on it.
 - **A dropped connection no longer takes the app down.** Provisioning writes
   its payload to ssh's stdin, and `child.on('error')` is the process's error,
   not the pipe's — so when the far end went away mid-write, `stdin` emitted

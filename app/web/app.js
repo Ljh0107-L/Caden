@@ -605,6 +605,14 @@ function openPane(pane) {
   dismissOverlaySidebar();
   if (pane === 'web') {
     state.web = null;                       // so the pane paints "checking…"
+    // The settings and the server list are already on this machine; only the
+    // ticks beside them need asking. Draw what is known first, then fill the
+    // answers in -- waiting for the slowest check before drawing anything is
+    // what made the pane look broken rather than busy.
+    webStatus({ quick: true })
+      .then(w => { if (state.pane === 'web' && !state.web?.probed) {
+                     state.web = w; renderWebPane(); } })
+      .catch(() => {});
     webStatus().then(w => { state.web = w; renderWebPane(); })
                .catch(e => { state.web = { error: String(e.message || e) };
                              renderWebPane(); });
@@ -3393,13 +3401,20 @@ function renderWebPane() {
     // supervisor -- but that rung restarts itself now, so the distinction
     // stopped being one the reader has to act on, and a row that is up should
     // look like a row that is up.
-    const mark = how === 'gateway' || how === 'tunnel' ? 'ok'
+    // `null` is the first pass answering from the config alone: this server
+    // has a tunnel and whether it carries anything has not been asked yet.
+    // Drawing that as "not on the web" would offer an Add button for a server
+    // that is already on it, which is worse than saying nothing for a second.
+    const asking = how == null;
+    const mark = asking ? 'busy'
+               : how === 'gateway' || how === 'tunnel' ? 'ok'
                : how === 'down' ? 'bad' : 'none';
-    const detail = how === 'gateway' ? 'its daemon is on the proxy itself'
+    const detail = asking ? 'checking…'
+      : how === 'gateway' ? 'its daemon is on the proxy itself'
       : how === 'tunnel' ? 'reached through the tunnel it opens'
       : how === 'down' ? 'has a tunnel, but nothing is answering on it'
       : 'not on the web — add it here';
-    const act = how === 'gateway' ? null
+    const act = (asking || how === 'gateway') ? null
       : srvBtn(how === 'none' ? 'Add' : 'Reconnect',
                () => webConnect(s.id, s.name),
                how === 'none' ? 'accent' : undefined);

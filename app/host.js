@@ -1389,7 +1389,10 @@ async function route(req, res, url) {
   }
 
   if (p === '/host/web/status') {
-    try { json(res, 200, await webStatus()); }
+    // `?quick=1` is the config-only answer, so the pane can draw itself before
+    // any of the checks have come back.
+    const quick = url.searchParams.get('quick') === '1';
+    try { json(res, 200, await webStatus({ probe: !quick })); }
     catch (e) { json(res, 500, { error: String(e.message || e) }); }
     return true;
   }
@@ -2174,12 +2177,30 @@ async function applyWebGateway(onStep = () => {}) {
 /// Put a freshly provisioned server on the phone.
 ///
 /// Whether the console has a password yet, and whether the address answers.
-async function webStatus() {
+/// `probe: false` answers from the config alone -- no ssh, no network.
+///
+/// Almost everything the pane draws is already known here: the address, which
+/// machine runs the proxy, which daemon serves the console, the list of
+/// servers. Only the ticks beside them need asking. Making the whole pane wait
+/// on the asking meant it sat blank for as long as the slowest check, which
+/// reads as a pane that is broken rather than one that is still counting.
+async function webStatus({ probe = true } = {}) {
   const web = webConfig();
   const servers = (readConfig().servers || []).filter(s => s.provisioned);
   const out = { ...web, servers: servers.map(s => ({ id: s.id, name: s.name || s.sshHost || s.id })),
                 sshHosts: sshHosts().map(h => h.host), passwordSet: null,
-                cert: null, reachable: null };
+                cert: null, reachable: null, probed: probe };
+  if (!probe) {
+    // What is knowable without asking anyone. `null` where a check would go,
+    // which the pane draws as "still counting" rather than as an answer.
+    out.reach = {};
+    for (const sv of servers) {
+      out.reach[sv.id] = isLocalServer(sv) ? 'local'
+        : (sv.id === web.serverId && !web.tunnels[sv.id]) ? 'gateway'
+        : web.tunnels[sv.id] ? null : 'none';
+    }
+    return out;
+  }
   // Which servers the gateway can actually reach, and how.
   const gwSh = web.gatewayHost ? gatewayShell(web.gatewayHost) : null;
   out.reach = {};

@@ -110,7 +110,8 @@ export async function provision(id, opts = {}, onStep) {
 /// with this Mac switched off. All of it needs ssh and root somewhere, so all
 /// of it is the host's; a console served through the gateway declares no
 /// capabilities and never shows the pane that calls these.
-export const webStatus       = ()      => hostCall('GET', '/host/web/status');
+export const webStatus       = ({ quick = false } = {}) =>
+  hostCall('GET', `/host/web/status${quick ? '?quick=1' : ''}`);
 export const saveWebSettings = patch   => hostCall('POST', '/host/web/settings', patch);
 export const setWebPassword  = password => hostCall('POST', '/host/web/password', { password });
 export const logoutBrowsers  = ()      => hostCall('POST', '/host/web/logout-all');
