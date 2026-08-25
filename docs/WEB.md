@@ -27,6 +27,31 @@ public address, and none needs a hole in a firewall.
 The gateway does need a public address and a name in DNS. One machine, one
 record.
 
+## More than one server
+
+The proxy has a route per server, and each route needs a way to reach that
+server's daemon. One of them is easy: the daemon on the gateway itself is
+already on its loopback. The others dial out.
+
+**Provisioning does it.** Set a server up while a gateway is configured and
+Caden also gives it a key, authorises that key on the gateway for forwarding
+and nothing else, installs a service that holds the tunnel open, and brings
+the proxy's configuration in line. Nothing to do afterwards; the server is on
+the phone by the time the provision finishes.
+
+The Web pane lists what the proxy can reach and why, and has a button for the
+servers that were already there when the gateway was — and for repairing one
+that has stopped answering.
+
+The direction matters and is worth saying again: the server dials the gateway.
+The gateway holds no key for it, never connects to it, and the server needs no
+public address and no hole in a firewall. `ssh -R` binds the far end on
+127.0.0.1, so nothing but nginx can reach what comes out.
+
+The key each server gets is its own, and the line it goes into is
+`restrict,port-forwarding` — no shell, no agent, no pty. Revoking one server's
+tunnel is deleting one line.
+
 ## Both installs on one gateway
 
 Caden installs twice — the build you use and a development one beside it —

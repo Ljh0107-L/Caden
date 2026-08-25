@@ -163,7 +163,7 @@ try {
   //     button leaves about 150px, so "2.1.241 (Claude Code) · daemon too old
   //     to check" became "2.1.241 (Claud…".
   await page.locator('.collapsed-strip button').click();
-  await page.locator('#sidebar .nav-row', { hasText: 'Servers' }).click();
+  await page.locator('#sidebar .sidebar-header .nav-row', { hasText: 'Servers' }).click();
   await page.locator('.pane-intro-title', { hasText: 'Servers' }).waitFor({ timeout: 8000 });
   await page.waitForTimeout(500);
   const cut = await clipped(page);

@@ -222,6 +222,14 @@ function ssh(server, command, opts = {}) {
 
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
+/// A daemon on this Mac's own loopback. The one server a gateway cannot use,
+/// because a gateway is what you set up so the Mac can be closed.
+function isLocalServer(s) {
+  if (s.sshHost) return false;
+  try { return LOOPBACK.has(new URL(s.directURL || '').hostname); }
+  catch { return false; }
+}
+
 /// A shell on the machine the daemon runs on, which is what provisioning
 /// needs: it copies files there and runs bootstrap. An ssh server gets ssh; a
 /// `direct` server pointed at loopback is this machine, so it gets a local
@@ -564,6 +572,29 @@ async function provision(server, { restart = false } = {}, onStep = () => {}) {
       } catch {}
     }
     writeConfig(cfg);
+  }
+
+  // A server that has just been set up should show up on the phone without a
+  // second errand. Everything this needs -- ssh to the machine, ssh to the
+  // gateway -- this process already has, and doing it here is the whole
+  // difference between "add a server" and "add a server, then go and wire it
+  // up somewhere else".
+  //
+  // Best effort, and it says so when it fails. The daemon is installed and
+  // working either way, and turning a successful provision into an error
+  // because a proxy elsewhere could not be reached is the wrong trade.
+  const web = webConfig();
+  if (web.hostname && web.gatewayHost) {
+    try {
+      if (entry && entry.id !== web.serverId && !isLocalServer(entry)) {
+        onStep('connecting it to the web gateway…');
+        await setupTunnel(entry, onStep);
+      }
+      onStep('bringing the web gateway in line…');
+      await applyWebGateway(onStep);
+    } catch (e) {
+      onStep(`the daemon is up; the web gateway was not updated: ${String(e.message || e)}`);
+    }
   }
   return { ...result, remotePort: entry ? entry.remotePort : server.remotePort };
 }
@@ -1312,6 +1343,27 @@ async function route(req, res, url) {
     return true;
   }
 
+  if (p === '/host/web/tunnel' && req.method === 'POST') {
+    const body = await readBody(req);
+    const server = (readConfig().servers || []).find(x => x.id === body.serverId);
+    if (!server) return json(res, 404, { error: 'no such server' }), true;
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+    });
+    const send = e => res.write(`${JSON.stringify(e)}\n`);
+    try {
+      const out = await setupTunnel(server, text => send({ type: 'step', text }));
+      send({ type: 'step', text: 'bringing the web gateway in line…' });
+      await applyWebGateway(text => send({ type: 'step', text }));
+      send({ type: 'done', ok: true, result: out });
+    } catch (e) {
+      send({ type: 'done', ok: false, error: String(e.message || e) });
+    }
+    res.end();
+    return true;
+  }
+
   if (p === '/host/web/password' && req.method === 'POST') {
     const body = await readBody(req);
     const pw = String(body.password || '');
@@ -1450,6 +1502,19 @@ async function route(req, res, url) {
 const WEB_ROOT_BASE = '/srv/caden-web';
 const webRoot = hostname => `${WEB_ROOT_BASE}/${hostname}`;
 
+/// Where the gateway is, as a machine somewhere else would have to say it.
+///
+/// `gatewayHost` is an alias in this Mac's ssh config, which means nothing on
+/// any other machine -- and the unit that dials the tunnel runs on the other
+/// machine. `ssh -G` resolves the alias the way ssh itself would.
+async function gatewayTarget(gatewayHost) {
+  const out = await run('ssh', ['-G', gatewayHost], { timeout: 15000 });
+  const read = key => (new RegExp(`^${key} (.+)$`, 'm').exec(out.stdout) || [])[1];
+  const host = read('hostname');
+  if (!host) throw new Error(`could not resolve the ssh alias ${gatewayHost}`);
+  return { host, user: read('user') || 'root', port: Number(read('port')) || 22 };
+}
+
 function webConfig() {
   const cfg = readConfig();
   // `appliedHostname` is what is actually configured on the gateway right
@@ -1457,7 +1522,21 @@ function webConfig() {
   // types a new one -- and the difference is what tells apply there is an old
   // site to take down.
   return { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
-           ...(cfg.web || {}) };
+           // serverId -> the loopback port its tunnel binds on the gateway.
+           tunnels: {}, ...(cfg.web || {}) };
+}
+
+/// A gateway port for this server's tunnel, stable once chosen: the unit on
+/// the server and the nginx block on the gateway have to agree on it, and
+/// they are written at different times.
+function tunnelPortFor(serverId) {
+  const web = webConfig();
+  if (web.tunnels[serverId]) return web.tunnels[serverId];
+  const taken = new Set(Object.values(web.tunnels));
+  let port = 7901;
+  while (taken.has(port)) port++;
+  saveWebConfig({ tunnels: { ...web.tunnels, [serverId]: port } });
+  return port;
 }
 
 function saveWebConfig(patch) {
@@ -1498,7 +1577,7 @@ function webProxyBlocks(servers, ports) {
   }).join('\n\n');
 }
 
-function webSiteConfig({ hostname, consolePort, servers, ports }) {
+function webSiteConfig({ hostname, consolePort, servers, ports, consoleToken }) {
   return `# Written by Caden. Edits here are replaced the next time the Web
 # pane applies its settings.
 server {
@@ -1566,7 +1645,7 @@ ${webProxyBlocks(servers, ports)}
     # no second copy on this machine to fall out of step.
     location / {
         proxy_pass http://127.0.0.1:${consolePort}/;
-        proxy_set_header Authorization "Bearer ${daemonToken(servers.find(x => ports.get(x.id) === consolePort) || servers[0])}";
+        proxy_set_header Authorization "Bearer ${consoleToken}";
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_buffering off;
@@ -1603,6 +1682,92 @@ function webHostConfig(servers) {
   }, null, 2);
 }
 
+/// Give a server a tunnel to the gateway, so the proxy can reach its daemon.
+///
+/// The direction is the whole point: the server dials out. The gateway never
+/// connects to it, needs no key for it, and the server needs no public
+/// address and no hole in a firewall. `ssh -R` binds the far end on 127.0.0.1,
+/// so nothing but nginx can reach what comes out of it.
+///
+/// Idempotent -- it is also how a tunnel gets repaired after the gateway
+/// moves or the port changes.
+async function setupTunnel(server, onStep = () => {}) {
+  const { gatewayHost } = webConfig();
+  if (!gatewayHost) throw new Error('set the gateway up first');
+  const port = tunnelPortFor(server.id);
+  const gw = await gatewayTarget(gatewayHost);
+  const sh = provisionShell(server);
+  const gwSh = gatewayShell(gatewayHost);
+
+  // A key of its own, not the one the person uses. Revoking a tunnel should
+  // not be a decision about anything else, and the entry it goes into on the
+  // gateway is deliberately allowed to do nothing but forward.
+  onStep('making a key for the tunnel…');
+  const key = await sh(
+    'set -eu; mkdir -p ~/.ssh; chmod 700 ~/.ssh; '
+    + '[ -f ~/.ssh/caden-tunnel ] || ssh-keygen -q -t ed25519 -N "" '
+    + '-C "caden-tunnel" -f ~/.ssh/caden-tunnel; cat ~/.ssh/caden-tunnel.pub');
+  const pub = String(key.stdout).trim().split('\n').pop();
+  if (!/^ssh-/.test(pub)) throw new Error(`could not read a public key from ${server.name}`);
+
+  onStep('authorising it on the gateway, for forwarding only…');
+  const tag = `caden-tunnel:${server.id}`;
+  // restrict turns everything off; port-forwarding turns back on the one
+  // thing this key is for. No shell, no agent, no pty.
+  const line = `restrict,port-forwarding ${pub.split(/\s+/).slice(0, 2).join(' ')} ${tag}`;
+  await gwSh([
+    'set -eu',
+    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys',
+    // Replace this server's entry rather than accumulating one per run.
+    `grep -v ' ${tag}$' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true`,
+    `printf '%s\\n' ${JSON.stringify(line)} >> ~/.ssh/authorized_keys.tmp`,
+    'chmod 600 ~/.ssh/authorized_keys.tmp && mv -f ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys',
+  ].join('\n'));
+
+  onStep('installing the tunnel service…');
+  const remotePort = server.remotePort || DEFAULT_PORT;
+  const unit = `[Unit]
+Description=Caden tunnel to the web gateway
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -T -i %h/.ssh/caden-tunnel \\
+    -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \\
+    -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new \\
+    -o IdentitiesOnly=yes -p ${gw.port} \\
+    -R ${port}:127.0.0.1:${remotePort} ${gw.user}@${gw.host}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
+  const marker = `__CADEN_${require('crypto').randomBytes(9).toString('hex')}__`;
+  await sh([
+    'set -eu',
+    'mkdir -p ~/.config/systemd/user',
+    `cat > ~/.config/systemd/user/caden-tunnel.service <<'${marker}'`,
+    unit.replace(/\n$/, ''),
+    marker,
+    'systemctl --user daemon-reload',
+    'systemctl --user enable caden-tunnel.service >/dev/null 2>&1 || true',
+    'systemctl --user restart caden-tunnel.service',
+    // Best effort, and it is refused on hosts where the user has no polkit
+    // rights -- there the tunnel starts on first login, like the daemon it
+    // serves already does.
+    'loginctl enable-linger "$(whoami)" >/dev/null 2>&1 || true',
+  ].join('\n'));
+
+  onStep('checking the gateway can reach it…');
+  for (let i = 0; i < 20; i++) {
+    await sleep(500);
+    const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`);
+    if (/"ok"\s*:\s*true/.test(probe.stdout)) return { port };
+  }
+  const why = await sh('systemctl --user status caden-tunnel.service --no-pager -n 6 2>&1 | tail -6');
+  throw new Error(`the tunnel did not come up on ${port}: ${String(why.stdout).trim().slice(0, 300)}`);
+}
+
 /// Set the gateway up, or bring it in line with the settings. Idempotent:
 /// this is also how you apply a changed hostname or a new server.
 ///
@@ -1619,8 +1784,22 @@ async function applyWebGateway(onStep = () => {}) {
     throw new Error(`no daemon token for ${server.name || serverId} — provision it first`);
   }
 
-  const consolePort = server.remotePort || DEFAULT_PORT;
-  const ports = new Map([[server.id, consolePort]]);
+  // Every server the proxy can actually reach: the one on the gateway, which
+  // is on its own loopback, plus any that have dialled a tunnel to it. A
+  // server with neither is left out rather than given a route to nothing --
+  // a row that reads as broken is a worse answer than a row that is absent.
+  const web = webConfig();
+  const wired = [];
+  const ports = new Map();
+  for (const s of (readConfig().servers || [])) {
+    if (!s.provisioned || !daemonToken(s)) continue;
+    if (web.tunnels[s.id]) { ports.set(s.id, web.tunnels[s.id]); wired.push(s); }
+    else if (s.id === serverId) {
+      ports.set(s.id, s.remotePort || DEFAULT_PORT); wired.push(s);
+    }
+  }
+  const consolePort = ports.get(server.id);
+  if (!consolePort) throw new Error(`${server.name || serverId} has no route from the gateway`);
   const sh = gatewayShell(gatewayHost);
   const marker = `__CADEN_${require('crypto').randomBytes(9).toString('hex')}__`;
   const file = (path_, body, mode) => [
@@ -1692,7 +1871,9 @@ async function applyWebGateway(onStep = () => {}) {
   }
 
   onStep('writing the proxy configuration…');
-  const site = webSiteConfig({ hostname, consolePort, servers: [server], ports });
+  onStep(wired.length === 1 ? 'one server' : `${wired.length} servers`);
+  const site = webSiteConfig({ hostname, consolePort, servers: wired, ports,
+                              consoleToken: daemonToken(server) });
   await sh([
     'set -eu',
     file('/etc/nginx/conf.d/caden-ratelimit.conf',
@@ -1701,7 +1882,7 @@ async function applyWebGateway(onStep = () => {}) {
        + '# the site below covers a cold page load. What it caps is guessing.\n'
        + 'limit_req_zone $binary_remote_addr zone=caden:1m rate=120r/m;\n'),
     `mkdir -p ${webRoot(hostname)}/host`,
-    file(`${webRoot(hostname)}/host/config.tmp`, webHostConfig([server])),
+    file(`${webRoot(hostname)}/host/config.tmp`, webHostConfig(wired)),
     `mv -f ${webRoot(hostname)}/host/config.tmp ${webRoot(hostname)}/host/config`,
     // Written beside the live one and moved into place only once nginx has
     // agreed to it, so a rejected config cannot take the site down.
@@ -1765,6 +1946,20 @@ async function webStatus() {
   const out = { ...web, servers: servers.map(s => ({ id: s.id, name: s.name || s.sshHost || s.id })),
                 sshHosts: sshHosts().map(h => h.host), passwordSet: null,
                 cert: null, reachable: null };
+  // Which servers the gateway can actually reach, and how.
+  const gwSh = web.gatewayHost ? gatewayShell(web.gatewayHost) : null;
+  out.reach = {};
+  for (const s of servers) {
+    if (isLocalServer(s)) { out.reach[s.id] = 'local'; continue; }
+    if (s.id === web.serverId && !web.tunnels[s.id]) { out.reach[s.id] = 'gateway'; continue; }
+    const port = web.tunnels[s.id];
+    if (!port) { out.reach[s.id] = 'none'; continue; }
+    if (!gwSh) { out.reach[s.id] = 'unknown'; continue; }
+    const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`)
+      .catch(() => null);
+    out.reach[s.id] = probe && /"ok"\s*:\s*true/.test(probe.stdout) ? 'tunnel' : 'down';
+  }
+
   const server = servers.find(s => s.id === web.serverId);
   if (server) {
     const sh = provisionShell(server);

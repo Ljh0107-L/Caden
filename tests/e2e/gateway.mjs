@@ -145,7 +145,7 @@ try {
 
   // -- what must not be offered ------------------------------------------
   await page.locator('.collapsed-strip button').click();
-  await page.locator('#sidebar .nav-row', { hasText: 'Servers' }).click();
+  await page.locator('#sidebar .sidebar-header .nav-row', { hasText: 'Servers' }).click();
   await page.locator('.pane-intro-title', { hasText: 'Servers' }).waitFor({ timeout: 8000 });
 
   // The status check is a round trip that starts when the pane opens, so give

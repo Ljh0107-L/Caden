@@ -9,7 +9,7 @@ import { hostConfig, DaemonAPI, sshHosts, addServer, removeServer, installViaHos
          serverStatus, provision, startTunnel, stopTunnel,
          pickFiles, attachFile, attachBytes,
          webStatus, saveWebSettings, applyWeb, setWebPassword,
-         logoutBrowsers } from './api.js';
+         logoutBrowsers, connectServerToWeb } from './api.js';
 import { Transcript, groupRows, toolVerb, toolBucket, visibleFrom } from './transcript.js';
 import { renderMarkdown } from './markdown.js';
 import { renderDiff, diffFromToolInput } from './diff.js';
@@ -3303,9 +3303,54 @@ function renderWebPane() {
         el('span', { class: 'prov-url' }, w.hostname ? `https://${w.hostname}/` : '')),
       acts), state_));
 
+  // -- which servers the phone can actually reach ----------------------
+  //
+  // A server is reachable because its daemon is on the gateway, or because it
+  // has dialled a tunnel there. Provisioning a server sets its tunnel up on
+  // its own; this is for the ones that were already there when the gateway
+  // was, and for repairing one that has stopped.
+  const reach = w.reach || {};
+  const rows = el('div', { class: 'prov-card' });
+  const listed = (w.servers || []).filter(s => reach[s.id] !== 'local');
+  if (!listed.length) {
+    rows.append(srvLine('busy', 'No servers yet', 'provision one and it appears here'));
+  }
+  for (const s of listed) {
+    const how = reach[s.id];
+    const mark = how === 'gateway' || how === 'tunnel' ? 'ok'
+               : how === 'down' ? 'bad' : 'none';
+    const detail = how === 'gateway' ? 'its daemon is on the proxy itself'
+      : how === 'tunnel' ? 'reached through the tunnel it opens'
+      : how === 'down' ? 'has a tunnel, but nothing is answering on it'
+      : 'not reachable from the proxy yet';
+    const act = how === 'gateway' ? null
+      : srvBtn(how === 'none' ? 'Connect' : 'Reconnect',
+               () => webConnect(s.id, s.name),
+               how === 'none' ? 'accent' : undefined);
+    rows.append(srvLine(mark, s.name, detail, act));
+  }
+  body.append(el('div', { class: 'prov-section' },
+    el('div', { class: 'prov-title-row' },
+      el('div', { class: 'prov-id' },
+        el('span', { class: 'prov-name' }, 'Servers'),
+        el('span', { class: 'prov-url' }, 'each one dials the proxy; the proxy never dials back'))),
+    rows));
+
   paintPane('Web',
     el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
        body));
+}
+
+async function webConnect(serverId, name) {
+  setWebBusy(`connecting ${name}…`);
+  try {
+    await connectServerToWeb(serverId, text => setWebBusy(`${name}: ${text}`));
+    state.web = await webStatus();
+    setWebBusy(null);
+  } catch (e) {
+    state.web = { ...state.web, error: String(e.message || e) };
+    setWebBusy(null);
+  }
 }
 
 function setWebBusy(text) { state.webBusy = text; renderWebPane(); }

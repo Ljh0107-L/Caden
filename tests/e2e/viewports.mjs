@@ -122,7 +122,7 @@ try {
 
     if (await page.locator('.collapsed-strip button').count())
       await page.locator('.collapsed-strip button').click();
-    await page.locator('#sidebar .nav-row', { hasText: 'Servers' }).click();
+    await page.locator('#sidebar .sidebar-header .nav-row', { hasText: 'Servers' }).click();
     await page.locator('.pane-intro-title').waitFor({ timeout: 8000 });
     await page.waitForTimeout(300);
     look('servers', await survey(page));

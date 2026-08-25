@@ -144,6 +144,36 @@ export async function applyWeb(onStep) {
   return done.result;
 }
 
+/// Give a server a way to be reached through the gateway. Streams, because
+/// it is a key, an authorisation and a service on two different machines.
+export async function connectServerToWeb(serverId, onStep) {
+  const res = await fetch('/host/web/tunnel', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ serverId }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', done = null;
+  for (;;) {
+    const { value, done: ended } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !ended });
+    let nl;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      let ev; try { ev = JSON.parse(line); } catch { continue; }
+      if (ev.type === 'step') onStep?.(ev.text);
+      if (ev.type === 'done') done = ev;
+    }
+    if (ended) break;
+  }
+  if (!done) throw new Error('the stream ended without a result');
+  if (!done.ok) throw new Error(done.error || 'connecting the server failed');
+  return done.result;
+}
+
 export const startTunnel = id   => hostCall('POST', `/host/servers/${id}/tunnel`);
 export const stopTunnel  = id   => hostCall('DELETE', `/host/servers/${id}/tunnel`);
 

@@ -128,6 +128,17 @@ forward:
   week for that name. The address is resolved from the gateway and compared
   with the address the gateway answers on, before anything is written, and the
   message names the IP to point at.
+- **A server set up while a gateway exists is on the phone when it finishes.**
+  The proxy needs a route to each daemon, and only the one running on the
+  gateway itself is already reachable. Provisioning now gives the others a key
+  of their own, authorises it on the gateway for forwarding and nothing else
+  (`restrict,port-forwarding` — no shell, no agent, no pty), installs a service
+  that holds the tunnel open, and brings the proxy's configuration in line. The
+  server dials the gateway, never the reverse, so it needs no public address
+  and the gateway holds no key for it. The Web pane lists what the proxy can
+  reach and why, with a button for servers that predate the gateway and for
+  repairing one that has stopped. Failing to wire the proxy does not fail the
+  provision — the daemon is up either way, and it says what did not happen.
 - **The Web pane sets the gateway up.** Under Models in the desktop app: it
   asks for the three facts only a person knows — the hostname, which machine
   runs the proxy, which server's daemon serves the console — and does the rest
