@@ -31,12 +31,14 @@ const check = (label, ok, detail = '') => {
 
 // A machine, as far as the launcher can tell: which detections succeed, and
 // which installs blow up once tried.
-function machine({ systemd = false, cron = false, breaks = [] } = {}) {
+function machine({ systemd = false, linger = true, cron = false, breaks = [] } = {}) {
   const ran = [];
   const sh = async script => {
     ran.push(script);
     if (/systemctl --user show-environment/.test(script)) {
-      return { stdout: systemd ? 'yes' : 'no' };
+      // The rung's own detection is bus *and* lingering: a user manager that
+      // stops with the last login session takes the unit with it.
+      return { stdout: systemd && linger ? 'yes' : 'no' };
     }
     if (/command -v crontab/.test(script)) return { stdout: cron ? 'yes' : 'no' };
     if (/^true &&/.test(script)) return { stdout: 'yes' };
@@ -90,6 +92,20 @@ const load = () => {
   check('the keepalive is a no-op while the tunnel is up',
         /pgrep -f "R 7902:127\.0\.0\.1:"/.test(cronScript),
         'otherwise the every-minute line starts a second tunnel every minute');
+
+  // 2b. A user bus that will not outlive the session. `systemctl --user`
+  //     answers, so the rung looked available -- but without lingering the
+  //     manager stops with the last login and the unit goes with it. It reads
+  //     as a tunnel that works while somebody is ssh'd in and is gone by the
+  //     time anyone opens the console, which is the worst of the three ways
+  //     this can fail.
+  m = machine({ systemd: true, linger: false, cron: true });
+  out = await run(m);
+  check('a systemd that dies with the session is declined', out.how === 'cron', out.how);
+  // Written, not merely mentioned: the stop step that runs before every
+  // install names the unit too, so matching the name alone always hits.
+  check('and no unit is written for it',
+        !m.ran.some(r => /cat > ~\/\.config\/systemd/.test(r)));
 
   // 3. Dev's case: neither. Started bare, and honest about it.
   m = machine({ systemd: false, cron: false });

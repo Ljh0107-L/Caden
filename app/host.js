@@ -1960,10 +1960,16 @@ const TUNNEL_LAUNCHERS = [
   {
     how: 'systemd',
     supervised: 'reboot',
-    // A user bus, or there is nothing to talk to. `is-system-running` answers
-    // `offline` and exits non-zero where there is none, which is exactly the
-    // case this rung has to decline rather than fail on.
-    detect: 'systemctl --user show-environment >/dev/null 2>&1',
+    // A user bus is not enough: without lingering, the user manager stops
+    // with the last login session and takes the unit with it. That looks like
+    // a tunnel that works while you are watching -- an ssh session is what
+    // keeps the manager alive -- and is gone by the time anyone reaches the
+    // console. Enabling it needs polkit rights the account may not have, and
+    // where it is refused this rung has nothing to offer that the ones below
+    // do not, so it declines and lets them have it.
+    detect: 'systemctl --user show-environment >/dev/null 2>&1 && '
+      + '{ [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = yes ] || '
+      + 'loginctl enable-linger "$(id -un)" >/dev/null 2>&1; }',
     install: (cmd, unitCmd) => [
       'mkdir -p ~/.config/systemd/user',
       `cat > ~/.config/systemd/user/caden-tunnel.service <<'CADEN_UNIT'`,
@@ -1982,9 +1988,6 @@ const TUNNEL_LAUNCHERS = [
       'systemctl --user daemon-reload',
       'systemctl --user enable caden-tunnel.service >/dev/null 2>&1 || true',
       'systemctl --user restart caden-tunnel.service',
-      // Refused where the user has no polkit rights; there the tunnel comes
-      // back on first login, like the daemon it serves already does.
-      'loginctl enable-linger "$(whoami)" >/dev/null 2>&1 || true',
     ].join('\n'),
     diagnose: 'systemctl --user status caden-tunnel.service --no-pager -n 6 2>&1 | tail -6',
   },
