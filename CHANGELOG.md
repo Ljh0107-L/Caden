@@ -105,6 +105,12 @@ forward:
   directory per hostname now. What they do share — the rate limit and the ban
   rule — is shared on purpose: the jail watches the whole access log, so it
   covers both.
+- **The gateway checks the address before spending a certificate on it.** A
+  wrong A record is the likeliest thing to get wrong here, and it surfaces as
+  a certbot failure — which costs one of Let's Encrypt's five certificates a
+  week for that name. The address is resolved from the gateway and compared
+  with the address the gateway answers on, before anything is written, and the
+  message names the IP to point at.
 - **The Web pane sets the gateway up.** Under Models in the desktop app: it
   asks for the three facts only a person knows — the hostname, which machine
   runs the proxy, which server's daemon serves the console — and does the rest

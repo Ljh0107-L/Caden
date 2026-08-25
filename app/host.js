@@ -1589,6 +1589,32 @@ async function applyWebGateway(onStep = () => {}) {
   }
   const haveCertbot = /certbot/.test(pre.stdout);
 
+  // Resolved from the gateway, and compared with the address the gateway
+  // answers on. Getting the A record wrong is the likeliest thing to go wrong
+  // here, and the way it surfaces otherwise is a certbot failure -- which
+  // costs one of Let's Encrypt's five certificates a week for this name, so
+  // it is worth a question first rather than an attempt.
+  const certPath = `/etc/letsencrypt/live/${hostname}/fullchain.pem`;
+  const haveCert = /yes/.test((await sh(`test -f ${certPath} && echo yes || echo no`)).stdout);
+  if (!haveCert) {
+    onStep(`checking that ${hostname} points here…`);
+    const dns = await sh(`getent hosts ${hostname} | awk '{print $1}' | sort -u | tr '\\n' ' '; `
+                       + "echo '|'; curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true");
+    const [resolvedRaw, mineRaw] = String(dns.stdout).split('|');
+    const resolved = (resolvedRaw || '').trim().split(/\s+/).filter(Boolean);
+    const mine = (mineRaw || '').trim();
+    if (!resolved.length) {
+      throw new Error(`${hostname} does not resolve. Add an A record for it `
+                    + `pointing at ${mine || 'this machine'}, wait for it to `
+                    + 'take, and try again.');
+    }
+    if (mine && !resolved.includes(mine)) {
+      throw new Error(`${hostname} resolves to ${resolved.join(', ')}, but this `
+                    + `machine answers on ${mine}. Point the A record at `
+                    + `${mine}, or choose the machine it already points at.`);
+    }
+  }
+
   // A plain HTTP site first, so certbot has something to attach to and its
   // challenge is not behind the sign-in that does not exist yet.
   onStep('writing a temporary site so a certificate can be issued…');
@@ -1603,9 +1629,7 @@ async function applyWebGateway(onStep = () => {}) {
     'systemctl reload nginx',
   ].join('\n'));
 
-  const certPath = `/etc/letsencrypt/live/${hostname}/fullchain.pem`;
-  const existing = await sh(`test -f ${certPath} && echo yes || echo no`);
-  if (!/yes/.test(existing.stdout)) {
+  if (!haveCert) {
     if (!haveCertbot) throw new Error(`${gatewayHost} has no certbot, and there is no certificate for ${hostname}`);
     onStep(`asking Let's Encrypt for a certificate for ${hostname}…`);
     const out = await sh(`certbot --nginx -d ${hostname} --non-interactive --agree-tos `
