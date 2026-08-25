@@ -3381,7 +3381,6 @@ function renderWebPane() {
   // otherwise gone perfectly. Adding a server and publishing it are different
   // things to want.
   const reach = w.reach || {};
-  const held = w.how || {};
   const rows = el('div', { class: 'prov-card' });
   const listed = (w.servers || []).filter(s => reach[s.id] !== 'local');
   if (!listed.length) {
@@ -3389,17 +3388,15 @@ function renderWebPane() {
   }
   for (const s of listed) {
     const how = reach[s.id];
-    // A tunnel nothing supervises answers exactly like a supervised one until
-    // the machine restarts, so it is its own state rather than a tick.
-    const bare = how === 'tunnel' && held[s.id] === 'nohup';
-    const mark = how === 'gateway' ? 'ok'
-               : how === 'tunnel' ? (bare ? 'warn' : 'ok')
+    // Reachable or not. Which of the three things is holding the tunnel open
+    // was drawn here for a while, as a third state for the one that had no
+    // supervisor -- but that rung restarts itself now, so the distinction
+    // stopped being one the reader has to act on, and a row that is up should
+    // look like a row that is up.
+    const mark = how === 'gateway' || how === 'tunnel' ? 'ok'
                : how === 'down' ? 'bad' : 'none';
     const detail = how === 'gateway' ? 'its daemon is on the proxy itself'
-      : bare ? 'reachable, but nothing on that machine will restart the tunnel '
-               + '— it has no systemd user session and no cron, so a reboot ends it'
-      : how === 'tunnel' ? `reached through the tunnel it opens${
-          held[s.id] === 'cron' ? ' — kept alive by cron' : ''}`
+      : how === 'tunnel' ? 'reached through the tunnel it opens'
       : how === 'down' ? 'has a tunnel, but nothing is answering on it'
       : 'not on the web — add it here';
     const act = how === 'gateway' ? null

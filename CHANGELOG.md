@@ -19,12 +19,22 @@ Two things a devbox found.
   fails falls through to the next. `supervise.sh` has always done exactly this
   for the daemon, down to giving up gracefully when neither exists — the
   tunnel simply never learned it.
-- **A tunnel nothing will restart says so.** The last rung reaches the gateway
-  exactly as well as the other two until the machine reboots, which makes a
-  tick the wrong thing to draw: the pane says the tunnel is up and that
-  nothing on that machine will bring it back. And when no rung takes at all,
-  that is an error naming every one that was tried, in the pane, rather than a
-  silence to be discovered later as a 502.
+- **The last rung restarts itself.** It has to: on a machine with no systemd
+  user session and no cron there is nothing else to run it again, and the
+  first attempt is not always the one that works. A server whose egress drops
+  half its outbound connections took the ladder correctly down to the bottom
+  rung, failed to connect once, and that was the end of it — a tunnel that
+  never existed on a machine where the mechanism had been chosen correctly.
+  It loops now, and the ssh it runs gives up on a dead path in ten seconds
+  rather than waiting out the default. When no rung takes at all, that is an
+  error in the pane naming every one that was tried, rather than a silence to
+  be discovered later as a 502.
+- **The Servers and Web panes stop asking one question at a time.** Every
+  reachability check is an ssh round trip, and a server whose tunnel is down
+  costs a three-second curl on top; run in sequence across four servers, plus
+  the password and certificate checks, that is a pane sitting on "Checking…"
+  long enough to read as broken. None of them depend on each other. Web went
+  from that to 1.7s, and a server's own status from 26s to 1.9s.
 - **A dropped connection no longer takes the app down.** Provisioning writes
   its payload to ssh's stdin, and `child.on('error')` is the process's error,
   not the pipe's — so when the far end went away mid-write, `stdin` emitted
