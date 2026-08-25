@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Ljh0107-L. SPDX-License-Identifier: MIT
 
-"""Fast mode reaches the engine, and says so honestly when it does not.
+"""The fast tier rides on the turn, and says so when the model has none.
 
-Claude Code's fast mode is the one session setting with no command-line flag
-behind it. Everything else Caden puts in the composer -- model, permission
-mode, effort -- is an argument, so a freshly spawned process already has it.
-Fast mode is a `control_request` sent afterwards, and an SDK session reports
-`sdk_opt_in_required` until it is asked for explicitly.
+Codex calls the `priority` service tier "Fast" -- 1.5x speed, increased usage
+-- and it is a field of `TurnStartParams`, beside `effort` and
+`sandboxPolicy`. That is the whole reason Caden offers this one and not Claude
+Code's fast mode: a per-turn parameter travels through a gateway as part of
+the request, and switching it costs neither the process nor its prompt cache.
 
-That difference is the whole of this file. Two things follow from it and both
-were wrong first:
-
-  * a spawn has to be recorded as fast-off whatever the session wanted, or
-    `reconcile` sees nothing to do and the opt-in is never sent;
-  * `apply_settings` runs at the top of a turn, before the engine exists on
-    the first one, and returns early -- so the opt-in had to move to the
-    spawn itself. Until it did, `fast` worked from the second message on,
-    which is indistinguishable from a switch that does not work.
-
-And wanting it is not having it: Sonnet reports `off` with no reason at all,
-an unpaid plan reports one. What the CLI says is what gets stored, so the
-composer can show the reason rather than a lit switch that does nothing.
+Which models have the tier is Codex's catalog to say. Caden reads it rather
+than keeping a list, because the list moves with every CLI release. The one
+case Caden decides is a model the catalog has never heard of -- the ordinary
+case behind a gateway -- and it decides to ask: `write_model_catalog` clones
+the catalog's first entry for such a model, and that entry carries the tier.
 
     python3 tests/fast_mode_test.py
 """
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -52,43 +45,44 @@ def load_daemon(home):
     return mod
 
 
-def engine_for(hb, session):
-    """A ClaudeEngine with the process replaced by a recording stub.
+# A catalog shaped like the one `codex debug models` prints: the first entry
+# carries the tier, one further down does not.
+CATALOG = json.dumps({"models": [
+    {"slug": "gpt-5.6-sol", "context_window": 400000,
+     "service_tiers": [{"id": "priority", "name": "Fast",
+                        "description": "1.5x speed, increased usage"}]},
+    {"slug": "gpt-5.4-mini", "context_window": 400000, "service_tiers": []},
+]})
 
-    Nothing here starts `claude`: the questions are about which control
-    requests get sent and when, and a real CLI would answer them slower and
-    less precisely.
+
+def engine_for(hb, session, catalog=CATALOG):
+    """A CodexEngine with the catalog subprocess replaced and no process.
+
+    Nothing here starts `codex`: the question is which fields land on
+    `turn/start`, and a real app-server would answer it slower and no more
+    precisely.
     """
 
-    class Stub(hb.ClaudeEngine):
+    class Stub(hb.CodexEngine):
         def __init__(self, sess):
-            hb.ClaudeEngine.__init__(self, sess)
-            self.sent = []
-            self.spawned = 0
-            self.refuse = False
+            hb.CodexEngine.__init__(self, sess)
+            self.requests = []
+            self.catalog_reads = 0
 
-        # Shadows BaseEngine's property, which reads a real pid. Dead until
-        # spawned matters here: `ensure_started` returns early on a live
-        # engine, so an always-alive stub would never reach the code under
-        # test.
-        @property
-        def alive(self):
-            return self.spawned > 0
+        def _catalog_json(self):
+            self.catalog_reads += 1
+            return catalog
 
-        def spawn(self, argv, stdin_pipe=True):
-            self.spawned += 1
-
-        def argv(self):
-            return ["claude", "--print"]
-
-        def spawn_signature(self, argv):
-            return "sig"
-
-        def _control(self, subtype, timeout=20, **fields):
-            if self.refuse:
-                raise hb.EngineError("unknown subtype: %s" % subtype)
-            self.sent.append((subtype, fields))
+        def _request(self, method, params=None, **kw):
+            self.requests.append((method, params or {}))
             return {}
+
+        # The turn is the subject; getting a process up to receive it is not.
+        def ensure_started(self):
+            self.session.meta.setdefault("native_id", "th_test")
+
+        def _await_goal_probe(self, timeout=1.0):
+            pass
 
         def emit(self, *a, **kw):
             pass
@@ -96,130 +90,126 @@ def engine_for(hb, session):
     return Stub(session)
 
 
-def flag_settings(eng):
-    """Every `apply_flag_settings` payload the engine was sent."""
-    return [f.get("settings") for s, f in eng.sent if s == "apply_flag_settings"]
+def turn_params(eng):
+    return [p for m, p in eng.requests if m == "turn/start"]
 
 
 def main():
     home = tempfile.mkdtemp(prefix="caden-fast-")
     hb = load_daemon(home)
-
     mgr = hb.SessionManager()
 
     def new_session(**over):
-        spec = {"engine": "claude", "model": "claude-opus-5",
-                "cwd": home, "effort": "high", "permission_mode": "acceptEdits",
-                "provider": {"protocol": "anthropic-messages",
+        spec = {"engine": "codex", "model": "gpt-5.6-sol", "cwd": home,
+                "effort": "high", "permission_mode": "acceptEdits",
+                "provider": {"protocol": "openai-responses",
                              "api_key": "sk-test"}}
         spec.update(over)
         return mgr.create(spec)
 
     # -- the wish survives being written down ------------------------------
     s = new_session(fast=True)
-    check("a session created with fast on keeps it",
-          s.meta.get("fast") is True, repr(s.meta.get("fast")))
-    check("and reports it to the client",
-          s.to_dict().get("fast") is True)
+    check("a session created with fast on keeps it", s.meta.get("fast") is True)
+    check("and reports it to the client", s.to_dict().get("fast") is True)
     check("a session created without it does not invent one",
           new_session().to_dict().get("fast") is False)
 
-    # -- a fresh process has it off, whatever was asked for ----------------
+    # -- it lands on the turn, beside effort -------------------------------
     eng = engine_for(hb, s)
-    check("the session's wish is fast on",
-          eng.hot_settings().get("fast") is True)
-    check("but a spawn is recorded as fast off",
-          eng.spawn_hot_settings().get("fast") is False,
-          "otherwise reconcile has nothing to do and the opt-in is never sent")
+    eng.submit("t1", "hello")
+    p = turn_params(eng)[0]
+    check("the turn carries the fast tier", p.get("serviceTier") == "priority",
+          repr(p.get("serviceTier")))
+    check("alongside the settings that were already there",
+          p.get("effort") == "high" and "sandboxPolicy" in p)
+    check("and the session reports the tier it got",
+          s.to_dict().get("fast_state") == "on"
+          and s.to_dict().get("fast_reason") is None)
 
-    # -- and the opt-in reaches it on the first turn, not the second -------
-    eng.ensure_started()
-    check("starting the engine spawns it", eng.spawned == 1)
-    check("and opts in to fast mode straight away",
-          {"fastMode": True} in flag_settings(eng),
-          "sent: %r" % (flag_settings(eng),))
-    check("the engine is now recorded as having it",
-          eng._hot.get("fast") is True)
-    check("so a second turn sends nothing further",
-          eng.reconcile() is True and flag_settings(eng).count({"fastMode": True}) == 1)
+    # -- nobody asked, nothing is sent -------------------------------------
+    plain = new_session()
+    pe = engine_for(hb, plain)
+    pe.submit("t1", "hello")
+    check("a session without it sends no tier",
+          "serviceTier" not in turn_params(pe)[0])
+    check("and is not reported as refused",
+          plain.to_dict().get("fast_reason") is None,
+          "nobody asked, so there is nothing to explain")
 
-    # -- a session that never asked is left alone --------------------------
-    plain = engine_for(hb, new_session())
-    plain.ensure_started()
-    check("a session without fast mode sends no opt-in",
-          not any("fastMode" in (fs or {}) for fs in flag_settings(plain)),
-          "sent: %r" % (flag_settings(plain),))
+    # -- a model the catalog says has no tier ------------------------------
+    mini = new_session(model="gpt-5.4-mini", fast=True)
+    me = engine_for(hb, mini)
+    me.submit("t1", "hello")
+    check("a model without the tier does not get one",
+          "serviceTier" not in turn_params(me)[0])
+    check("and the session says why",
+          me.session.to_dict().get("fast_state") == "off"
+          and me.session.to_dict().get("fast_reason") == "model_not_supported")
 
-    # -- turning it off mid-session is a request too -----------------------
+    # -- a model the catalog has never heard of ----------------------------
+    # The ordinary case behind a gateway. `write_model_catalog` clones the
+    # catalog's first entry for it, and that entry carries the tier, so
+    # refusing here would refuse every model that is not on OpenAI's own list.
+    relay = new_session(model="my-gateway-model", fast=True)
+    re_ = engine_for(hb, relay)
+    re_.submit("t1", "hello")
+    check("an unknown model is asked for anyway",
+          turn_params(re_)[0].get("serviceTier") == "priority")
+
+    # -- no catalog at all -------------------------------------------------
+    blind = new_session(fast=True)
+    be = engine_for(hb, blind, catalog=None)
+    be.submit("t1", "hello")
+    check("an install that cannot list its models is still asked",
+          turn_params(be)[0].get("serviceTier") == "priority",
+          "too old to list is also too old to be trusted to have dropped it")
+
+    # -- toggling costs nothing --------------------------------------------
+    # The reason this one is offered and Claude Code's is not. A per-turn
+    # field has no process to replace: `stale()` reads the spawn signature,
+    # and there is no fast flag in argv to appear in it.
+    check("the tier is not part of the spawn signature",
+          "serviceTier" not in eng.spawn_signature(["codex", "app-server"]))
     s.meta["fast"] = False
     s.save()
-    eng.reconcile()
-    check("turning it off sends the opposite",
-          {"fastMode": False} in flag_settings(eng))
-
-    # -- toggling it mid-session keeps the process, and the cache with it --
-    # The reason fast mode is a hot setting at all. `stale()` is what forces a
-    # respawn, and it compares the spawn signature -- argv, env, cwd. There is
-    # no fast flag to appear in any of them, so the only way a toggle could
-    # cost the process is `reconcile` failing, which is why the refusal below
-    # matters.
-    s.meta["fast"] = False
-    s.save()
-    check("a toggle does not make the process stale", eng.stale() is False)
-    was = eng.spawned
-    eng.reconcile()
-    check("so turning it off keeps the running engine", eng.spawned == was)
+    eng.submit("t2", "again")
+    check("turning it off just stops sending it",
+          "serviceTier" not in turn_params(eng)[1])
+    check("and says so", s.to_dict().get("fast_state") == "off")
     s.meta["fast"] = True
     s.save()
-    eng.reconcile()
-    check("and turning it back on keeps it too", eng.spawned == was)
+    eng.submit("t3", "and back")
+    check("turning it back on sends it again",
+          turn_params(eng)[2].get("serviceTier") == "priority")
 
-    # -- a refusal costs the turn nothing ----------------------------------
-    # `reconcile` returning False is how an engine says "replace me", which is
-    # the right answer for a model or a permission mode and the wrong one for
-    # this: an install that does not know the subtype would trade its warm
-    # process for nothing, once per turn, forever.
-    s.meta["fast"] = True
-    s.save()
-    eng.refuse = True
-    check("an install too old to know the subtype does not fail the reconcile",
-          eng.reconcile() is True)
-    check("and the process is left alone", eng.spawned == 1)
-    # A refusal for anything else still replaces the process, which is what
-    # says the swallow above is specific rather than a hole.
-    s.meta["permission_mode"] = "plan"
-    s.save()
-    check("but a refused permission mode still asks to be replaced",
-          eng.reconcile() is False)
-
-    # -- what the CLI says beats what was asked for ------------------------
-    eng.refuse = False
-    eng._note_fast({"fast_mode_state": "off",
-                    "fast_mode_disabled_reason": "not_entitled"})
-    check("the CLI's own answer is what gets stored",
-          s.to_dict().get("fast_state") == "off"
-          and s.to_dict().get("fast_reason") == "not_entitled")
-    check("the wish is reported alongside it, not overwritten by it",
-          s.to_dict().get("fast") is True,
-          "the composer shows both: the switch, and why it did not take")
-    # Sonnet's case: off, and no reason offered. A missing reason is a fact
-    # about the answer, not an absence of one, so it has to replace the old.
-    eng._note_fast({"fast_mode_state": "off"})
-    check("a state with no reason clears the previous reason",
-          s.to_dict().get("fast_reason") is None,
-          repr(s.to_dict().get("fast_reason")))
-    # An event that says nothing about fast mode -- every `result` before the
-    # CLI grew the field -- must not read as "off".
-    eng._note_fast({"fast_mode_state": "on"})
-    eng._note_fast({"subtype": "success"})
-    check("an event that is silent about fast mode changes nothing",
-          s.to_dict().get("fast_state") == "on")
+    # -- the catalog is read once ------------------------------------------
+    # It is a subprocess with a 30s timeout, and both the window patch and the
+    # tier want it. The real `_catalog_json` is the thing under test here, so
+    # this one stubs the layer below it instead.
+    counted = new_session(fast=True)
+    real = hb.CodexEngine(counted)
+    calls = []
+    hb.run_capture = lambda argv, **kw: (calls.append(argv), (0, CATALOG, ""))[1]
+    hb.TOOLCHAIN.binary_for = lambda name: "/nowhere/codex"
+    for _ in range(3):
+        real._catalog_json()
+    check("the catalog subprocess runs once per engine", len(calls) == 1,
+          "%d runs" % len(calls))
+    # And a failure is remembered as a failure, rather than retried every turn.
+    again = hb.CodexEngine(counted)
+    calls[:] = []
+    hb.run_capture = lambda argv, **kw: (calls.append(argv), (1, "", "boom"))[1]
+    for _ in range(3):
+        again._catalog_json()
+    check("an install with no catalog is not asked three times",
+          len(calls) == 1 and again._catalog_json() is None,
+          "%d runs" % len(calls))
 
     print()
     if failed:
         print("FAILED: %s" % ", ".join(failed))
     else:
-        print("all fast-mode checks passed")
+        print("all fast-tier checks passed")
     return 1 if failed else 0
 
 

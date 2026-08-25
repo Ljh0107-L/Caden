@@ -1932,20 +1932,7 @@ class ClaudeEngine(BaseEngine):
             out["effort"] = self.session.meta.get("effort") or None
         else:
             out["thinking"] = self.thinking_tokens()
-        out["fast"] = bool(self.session.meta.get("fast"))
         return out
-
-    def spawn_hot_settings(self):
-        """What the process actually has the moment it starts.
-
-        Model, permission mode and effort are command-line flags, so a fresh
-        process already has them. Fast mode is not a flag -- there is none --
-        it is a setting sent over the control channel afterwards, so a fresh
-        process always has it off no matter what the session asked for.
-        Recording the wish here instead of the fact would leave `reconcile`
-        with nothing to do and fast mode quietly never applied.
-        """
-        return dict(self.hot_settings(), fast=False)
 
     def apply_hot_settings(self, want, have):
         """Tell the running engine, over the same control channel as interrupt.
@@ -1977,27 +1964,6 @@ class ClaudeEngine(BaseEngine):
                           thinking_display="summarized")
             self.emit("log", stream="caden",
                       text="thinking budget -> %s" % (want.get("thinking") or "default"))
-        if want.get("fast") != have.get("fast"):
-            # The same request effort uses. There is no flag for this: an SDK
-            # session reports `sdk_opt_in_required` until it is asked for
-            # explicitly, which is what this is.
-            #
-            # Alone among these, a refusal is swallowed. Everything else here
-            # is something the session must have -- the caller answers a
-            # failure by replacing the process, which is right for a model or
-            # a permission mode and absurd for fast mode: an install that does
-            # not know the subtype would trade its warm process for nothing,
-            # once per turn, forever. Fast mode is an optimisation, so failing
-            # to get it costs the turn nothing. What the CLI reports about it
-            # is separate and unaffected, so the composer still shows off.
-            try:
-                self._control("apply_flag_settings",
-                              settings={"fastMode": bool(want.get("fast"))})
-                self.emit("log", stream="caden",
-                          text="fast mode -> %s" % ("on" if want.get("fast") else "off"))
-            except EngineError as exc:
-                log("info", "[%s] fast mode not available on this install: %s",
-                    self.session.id, exc)
 
     def ensure_started(self):
         with self.lock:
@@ -2010,16 +1976,6 @@ class ClaudeEngine(BaseEngine):
             # Any subsequent (re)start must resume rather than claim the id.
             self.session.meta["resumed"] = True
             self.session.save()
-        # Settings that are not command-line flags have to be sent, and a
-        # fresh process does not have them. apply_settings runs before the
-        # engine exists on a first turn and returns early, so waiting for it
-        # would leave fast mode off until the second message -- which reads
-        # as a switch that only works sometimes.
-        try:
-            self.reconcile()
-        except Exception:
-            log("info", "[%s] could not apply settings after start: %s",
-                self.session.id, traceback.format_exc().strip().split("\n")[-1])
 
     def submit(self, turn_id, text, images=None):
         self._await_goal_probe()
@@ -2073,37 +2029,15 @@ class ClaudeEngine(BaseEngine):
         elif kind == "error":
             self.emit("error", message=str(ev.get("error") or ev.get("message") or ev))
 
-    def _note_fast(self, ev):
-        """Record what the CLI says about fast mode, which is not what we asked.
-
-        Wanting it is not having it: it needs an Opus model and a plan that
-        carries it, and the CLI says which of those is missing. Storing the
-        answer is what lets the composer show the reason instead of a switch
-        that appears to do nothing.
-        """
-        state = ev.get("fast_mode_state")
-        if state is None:
-            return
-        reason = ev.get("fast_mode_disabled_reason")
-        if (self.session.meta.get("fast_state") == state
-                and self.session.meta.get("fast_reason") == reason):
-            return
-        self.session.meta["fast_state"] = state
-        self.session.meta["fast_reason"] = reason
-        self.session.save()
-
     def _on_system(self, ev):
         if ev.get("subtype") == "init":
             self.session.set_native_id(ev.get("session_id"))
-            self._note_fast(ev)
             self.emit("session.init",
                       engine="claude",
                       model=ev.get("model"),
                       native_id=ev.get("session_id"),
                       cwd=ev.get("cwd"),
                       permission_mode=ev.get("permissionMode"),
-                      fast_mode=self.session.meta.get("fast_state"),
-                      fast_mode_reason=self.session.meta.get("fast_reason"),
                       tools=ev.get("tools") or [])
         elif ev.get("subtype") == "status":
             self._on_status(ev)
@@ -2297,10 +2231,6 @@ class ClaudeEngine(BaseEngine):
                           is_error=bool(block.get("is_error")))
 
     def _on_result(self, ev):
-        # The same two fields ride the result, and that is the copy worth
-        # having: a turn can start in fast mode and end in cooldown after a
-        # rate limit, and only this says so.
-        self._note_fast(ev)
         if self._goal_probe:
             # Caden's own `/goal`, which was never a turn: it closes nothing and
             # says nothing. Its answer has already been read.
@@ -2401,6 +2331,100 @@ class CodexEngine(BaseEngine):
     def catalog_path(self):
         return self.session.path("engine", "model_catalog.json")
 
+    def _catalog_json(self):
+        """`codex debug models`, read once per process.
+
+        Two callers want it now -- the window patch below and the service tier
+        -- and it is a subprocess with a 30s timeout, so the second one reads
+        what the first got. The text is cached rather than the parsed object:
+        `write_model_catalog` edits every entry it is handed, and a shared
+        parse would hand the tier lookup a catalog with the windows already
+        rewritten.
+        """
+        if self._catalog_raw is not None:
+            return self._catalog_raw or None
+        binary = TOOLCHAIN.binary_for("codex")
+        if not binary:
+            return None
+        code, out, err = run_capture([binary, "debug", "models"],
+                                     env=self.build_env(), timeout=30)
+        if code != 0 or not out.strip():
+            # An install too old to render one.  The session still runs; it
+            # just keeps Codex's own window.
+            log("info", "[%s] model catalog unavailable (%s); leaving codex to "
+                "its own window", self.session.id, (err or "exit %s" % code)[:200])
+            self._catalog_raw = ""
+            return None
+        self._catalog_raw = out
+        return out
+
+    # Codex's own name for the `priority` tier is "Fast", and its catalog
+    # describes it as 1.5x speed for increased usage.
+    FAST_TIER = "priority"
+
+    # `codex debug models`, read at most once per engine. "" means it was asked
+    # for and there was no answer, which is not the same as not having asked.
+    # A class attribute rather than an `__init__` line because engines get
+    # built with `object.__new__` in places -- see `tests/engine_wiring_test.py`
+    # -- and a catalog read is not a reason for those to have to know about it.
+    _catalog_raw = None
+
+    def fast_tier(self):
+        """The service tier this turn should ask for, and why when there is none.
+
+        Returns `(tier, reason)`. `tier` is None when the turn should not carry
+        one; `reason` is None when that is simply because nobody asked.
+
+        Unlike Claude Code's fast mode this is a per-turn parameter, so there
+        is nothing to opt in to and nothing to reconcile -- it rides on
+        `turn/start` beside `effort`, and toggling it costs neither the process
+        nor the cache.
+
+        Which models have it is Codex's catalog to say, not Caden's: the list
+        moves with every CLI release, so a copy here would be wrong by the next
+        one. A model the catalog has never heard of -- the ordinary case behind
+        a gateway -- is the one case Caden decides, and it decides yes: the
+        entry `write_model_catalog` clones for it is the catalog's first, which
+        carries the tier. Asking for a tier the upstream will not honour costs
+        the turn nothing; the alternative is refusing a switch for every model
+        that is not on OpenAI's own list.
+        """
+        if not self.session.meta.get("fast"):
+            return None, None
+        model = self.session.meta.get("model")
+        raw = self._catalog_json()
+        if not raw:
+            # No catalog to consult. Send it: an install too old to list its
+            # models is also too old to be trusted to have dropped the tier.
+            return self.FAST_TIER, None
+        try:
+            models = json.loads(raw)["models"]
+        except (ValueError, KeyError, TypeError):
+            return self.FAST_TIER, None
+        entry = next((m for m in models if m.get("slug") == model), None)
+        if entry is None:
+            return self.FAST_TIER, None
+        tiers = [t.get("id") for t in (entry.get("service_tiers") or [])]
+        if self.FAST_TIER in tiers:
+            return self.FAST_TIER, None
+        return None, "model_not_supported"
+
+    def _note_fast(self, tier, why):
+        """Record what the turn actually asked for, which is not what was asked of it.
+
+        The composer draws the switch from `fast` and explains it from these:
+        wanting a tier and getting one are different, and a switch that lights
+        up over a model with no fast tier is exactly the thing this is here to
+        prevent.
+        """
+        state = "on" if tier else "off"
+        if (self.session.meta.get("fast_state") == state
+                and self.session.meta.get("fast_reason") == why):
+            return
+        self.session.meta["fast_state"] = state
+        self.session.meta["fast_reason"] = why
+        self.session.save()
+
     def write_model_catalog(self):
         """Give Codex a model catalog that says what the session declared.
 
@@ -2430,19 +2454,11 @@ class CodexEngine(BaseEngine):
         window = self.session.meta.get("context_window")
         if not window:
             return None
-        binary = TOOLCHAIN.binary_for("codex")
-        if not binary:
-            return None
-        code, out, err = run_capture([binary, "debug", "models"],
-                                     env=self.build_env(), timeout=30)
-        if code != 0 or not out.strip():
-            # An install too old to render one.  The session still runs; it
-            # just keeps Codex's own window.
-            log("info", "[%s] model catalog unavailable (%s); leaving codex to "
-                "its own window", self.session.id, (err or "exit %s" % code)[:200])
+        raw = self._catalog_json()
+        if raw is None:
             return None
         try:
-            catalog = json.loads(out)
+            catalog = json.loads(raw)
             models = catalog["models"]
             if not models:
                 raise ValueError("empty catalog")
@@ -2720,6 +2736,12 @@ class CodexEngine(BaseEngine):
                       self.session.meta.get("effort") or "")
         if effort:
             params["effort"] = effort
+        # Fast mode, which is a service tier here rather than a mode: one field
+        # on the turn, no process to replace and no control channel to wait on.
+        tier, why = self.fast_tier()
+        if tier:
+            params["serviceTier"] = tier
+        self._note_fast(tier, why)
         # Reasoning arrives encrypted and unreadable unless a summary is asked
         # for -- the field was simply never sent, so every Codex turn thought
         # in silence.

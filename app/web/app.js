@@ -559,37 +559,34 @@ const EFFORTS = [
 const effortLabel = v =>
   (EFFORTS.find(e => e.value === v) || EFFORTS[2]).label;
 
-// Claude Code's fast mode: same Opus, quicker tokens. The engine only offers
-// it on Opus 4.8 and 5 and only on a paid plan, and it is off unless the
-// session opts in over the control channel -- so anywhere else the switch
-// would be a control that does nothing, and it is better not to draw one.
-// When the engine turns it down anyway (an unpaid plan, say) it says why, and
-// `fastNote` puts that sentence on the chip rather than leaving it lit and
-// lying.
-const fastCapable = model =>
-  !!model && engineOf(model.proto) === 'claude'
-  && /opus-(4-8|5)\b/.test(model.modelID || '');
+// Codex's `priority` service tier, which Codex itself calls Fast: 1.5x speed
+// for increased usage. A tier on the turn rather than a mode on the process,
+// so switching it costs neither the engine nor its cache.
+//
+// Claude Code has a fast mode too and Caden does not offer it. It is not a
+// parameter — it asks Anthropic to route Opus to faster hardware — so behind
+// a gateway the CLI reports it on while nothing upstream is any quicker,
+// which is a switch that lies. The tier is a request field and travels.
+//
+// Which Codex models have it is the daemon's to say, from the catalog the CLI
+// ships; the renderer would only have a copy going stale. So the switch is
+// drawn for Codex, and a model without the tier comes back
+// `model_not_supported` after the first turn.
+const fastCapable = model => !!model && engineOf(model.proto) === 'codex';
 
 const FAST_REASONS = {
-  sdk_opt_in_required: 'the engine did not accept the opt-in',
-  not_entitled: 'your plan does not include fast mode',
-  model_not_supported: 'this model has no fast mode',
+  model_not_supported: 'this model has no fast tier',
 };
 const fastNote = session => {
-  if (!session || !session.fast) return 'Same Opus, faster tokens';
-  if (session.fast_state === 'on') return 'Fast mode on';
+  if (!session || !session.fast) return 'Codex fast tier — 1.5x speed, more usage';
+  if (session.fast_state === 'on') return 'Fast tier on';
   if (session.fast_reason) {
     const why = session.fast_reason;
-    return `Fast mode unavailable: ${FAST_REASONS[why] || why}`;
+    return `Fast tier unavailable: ${FAST_REASONS[why] || why}`;
   }
-  // No state at all is the gap between asking and the first turn; a state of
-  // `off` with no reason is a refusal that declined to give one. A gateway
-  // that drops the setting on its way upstream looks exactly like this, and
-  // reading it as "not yet" would leave the switch lit over nothing -- which
-  // is the failure it exists to prevent.
-  return session.fast_state
-    ? 'Fast mode was asked for and did not take — the provider may not pass it on'
-    : 'Fast mode starts on the next turn';
+  // Nothing recorded yet is the gap between asking and the first turn, which
+  // is when the tier is chosen -- there is no state to report before then.
+  return 'Fast tier starts on the next turn';
 };
 
 // ---------------------------------------------------------------- navigation
@@ -2159,9 +2156,9 @@ function buildStatusRow(ctl, entry, onToggleContext) {
   paintGoal();
   ctl.listeners.add(paintGoal);
 
-  // Fast mode, beside the effort switch it reads as a sibling of. Only for
-  // the models that have it -- see `fastCapable`. The session carries what the
-  // engine said about it, so a switch the engine refused says so on hover
+  // The fast tier, beside the effort switch it reads as a sibling of -- and
+  // is one: both are fields on the turn. The session carries which tier the
+  // last turn actually asked for, so a model without one says so on hover
   // rather than sitting lit and doing nothing.
   const fastBtn = fastCapable(modelOfSession(ctl.session))
     ? el('button', { class: 'effort-btn', title: fastNote(ctl.session),
@@ -2598,7 +2595,7 @@ function renderDraft() {
       }))),
     },
     fast: fastCapable(model) ? {
-      title: 'Same Opus, faster tokens',
+      title: 'Codex fast tier — 1.5x speed, more usage',
       label: () => 'Fast',
       on: () => !!d.fast,
       onToggle: () => { d.fast = !d.fast; renderMain(); },

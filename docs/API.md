@@ -110,25 +110,28 @@ Create spec:
   "context_window": 256000,              // claude: enforced via CLAUDE_CODE_MAX_CONTEXT_TOKENS
   "env": {"FOO": "bar"},
   "engine_args": ["--effort", "high"],
-  "fast": true,                          // claude only; see below
+  "fast": true,                          // codex only; see below
   "message": "optional first turn"
 }
 ```
 
-`fast` asks Claude Code for fast mode, which has no flag: the daemon sends
-`apply_flag_settings {"fastMode": true}` on the control channel as soon as the
-process is up, because an SDK session reports `sdk_opt_in_required` until
-something asks. Asking is not getting — it needs an Opus model and a plan that
-carries it — so the session also reports what the engine said:
+`fast` asks for Codex's `priority` service tier — the CLI's own name for it is
+Fast, at 1.5x speed for increased usage. It is a field on `turn/start`, beside
+`effort`, so it costs neither a new process nor the prompt cache and takes
+effect on the turn after it is set. Which models have it comes from the
+catalog `codex debug models` prints, read once per engine; a model that
+catalog has never heard of — the ordinary case behind a gateway — is asked for
+anyway, because the entry Caden clones for it carries the tier.
 
 | Field | Meaning |
 | --- | --- |
 | `fast` | what was asked for |
-| `fast_state` | `on` / `off`, as the CLI last reported it |
-| `fast_reason` | why not, when the CLI gives one (`sdk_opt_in_required`, …) |
+| `fast_state` | `on` / `off` — whether the last turn carried a tier |
+| `fast_reason` | `model_not_supported`, when the catalog says the model has none |
 
-`PATCH` takes `fast` too, and it applies at the start of the next turn like
-every other setting.
+`PATCH` takes `fast` too. Claude Code's fast mode is deliberately not offered:
+it is not a request parameter but a routing decision at Anthropic's end, so
+through a relay the CLI reports it on while nothing upstream is quicker.
 
 ## Uploads
 

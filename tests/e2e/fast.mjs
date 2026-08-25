@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Ljh0107-L. SPDX-License-Identifier: MIT
 
-// The fast-mode switch, and the models it is not offered for.
+// The fast-tier switch, and the engine it is not offered for.
 //
-// Fast mode is the one composer setting the engine can refuse after agreeing
-// to draw a switch for it: it needs an Opus model and a plan that carries it.
-// A chip that lights up and changes nothing is worse than no chip, so the
-// rule is that it appears only where it can work, and that what the engine
-// said about it is what the chip reports.
+// Codex has a `priority` service tier -- it calls it Fast -- and it is a field
+// on the turn, so it travels as part of the request and a gateway can pass it
+// on. Claude Code's fast mode is not a parameter at all; behind a relay the
+// CLI reports it on while nothing upstream is quicker, which is a switch that
+// lies. So the switch is Codex's, and this pins down that it stays there.
 //
 // The daemon half is `tests/fast_mode_test.py`; this is the half a person
 // touches. It runs against the mock daemon -- no turn is ever sent, because
@@ -22,19 +22,20 @@ const check = (label, ok, detail = '') => {
   if (!ok) failed++;
 };
 
-// Two Claude models and a Codex one. Opus 5 first, so it is the default pick
-// and the composer opens on the case that has the switch.
+// A Codex model first, so the composer opens on the case that has the switch,
+// and a Claude one to show it is not offered there.
 const harness = await start({
   providers: [{
-    id: 'anth', name: 'Anthropic', proto: 'anthropic-messages', baseURL: '',
+    id: 'oai', name: 'OpenAI', proto: 'openai-responses', baseURL: '',
     models: [
-      { id: 'op5', modelID: 'claude-opus-5', alias: 'Opus 5', contextWindow: 200000 },
-      { id: 'son', modelID: 'claude-sonnet-4-6', alias: 'Sonnet 4.6',
-        contextWindow: 200000 },
+      { id: 'sol', modelID: 'gpt-5.6-sol', alias: 'GPT-5.6 Sol',
+        contextWindow: 400000 },
+      { id: 'relay', modelID: 'my-gateway-model', alias: 'Gateway',
+        contextWindow: 400000 },
     ],
   }, {
-    id: 'oai', name: 'OpenAI', proto: 'openai-responses', baseURL: '',
-    models: [{ id: 'g5', modelID: 'gpt-5-codex', alias: 'GPT-5 Codex',
+    id: 'anth', name: 'Anthropic', proto: 'anthropic-messages', baseURL: '',
+    models: [{ id: 'op5', modelID: 'claude-opus-5', alias: 'Opus 5',
                contextWindow: 200000 }],
   }],
 });
@@ -58,8 +59,8 @@ try {
   await page.goto(harness.appUrl);
   await page.locator('.empty-state .composer-editor').waitFor({ timeout: 15000 });
 
-  // 1. Opus has it, and it starts off -- fast mode is a choice, not a default.
-  await check('the switch is drawn for Opus', await fastChip().count() === 1);
+  // 1. Codex has it, and it starts off -- the tier is a choice, not a default.
+  await check('the switch is drawn for Codex', await fastChip().count() === 1);
   check('and starts off',
         await fastChip().getAttribute('data-on') === null);
 
@@ -71,27 +72,27 @@ try {
   check('and clicking again turns it off',
         await fastChip().getAttribute('data-on') === null);
 
-  // 3. Sonnet reports fast mode off and offers no reason for it, so a switch
-  //    there would be a control with no effect and no explanation.
+  // 3. Claude Code is where the switch would lie, so it is not drawn there.
   await fastChip().click();
-  await pickModel('Sonnet');
-  check('a model without fast mode has no switch',
-        await fastChip().count() === 0);
+  await pickModel('Opus 5');
+  check('the claude side has no switch', await fastChip().count() === 0);
 
   // 4. And the wish does not survive the model that could not grant it: going
   //    back must not silently start the next session in a mode the user last
-  //    saw refused.
-  await pickModel('Opus 5');
+  //    saw withdrawn.
+  await pickModel('GPT-5.6 Sol');
   check('coming back, the switch is off again',
         await fastChip().count() === 1
         && await fastChip().getAttribute('data-on') === null);
 
-  // 5. Codex has no such thing at all.
-  await pickModel('GPT-5 Codex');
-  check('the codex side has no switch', await fastChip().count() === 0);
+  // 5. A model the CLI's catalog has never heard of still gets the switch:
+  //    behind a gateway that is every model, and the daemon is what decides
+  //    -- after the first turn it says `model_not_supported` if it has to.
+  await pickModel('Gateway');
+  check('a gateway model keeps the switch', await fastChip().count() === 1);
 
   // 6. Nothing else in the toolbar was displaced by it.
-  await pickModel('Opus 5');
+  await pickModel('GPT-5.6 Sol');
   const labels = await page.locator('.empty-state .effort-btn .effort-label')
     .allTextContents();
   check('it sits alongside permission and effort, not instead of them',

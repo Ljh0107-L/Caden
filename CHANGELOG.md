@@ -221,23 +221,19 @@ forward:
 
 And two that were not about any of this:
 
-- **Fast mode is a switch in the composer.** Claude Code will run Opus at
-  several times the token rate, and the setting has no command-line flag
-  behind it: an SDK session reports `sdk_opt_in_required` and stays slow until
-  something asks for it over the control channel. Everything else the composer
-  sets — model, permission mode, effort — is an argument, so a fresh process
-  already has it; this one has to be sent, and sent at the spawn rather than
-  at the top of the next turn, or it takes effect from the second message on.
-  The switch is only drawn on the models that have it, because asking is not
-  getting: Sonnet reports it off and offers no reason, an ineligible plan gives
-  one, and what the engine says is what the chip shows rather than staying lit
-  over a setting that did not take. A proxy in front of the model that drops
-  the setting on its way upstream looks the same from here — off, with no
-  reason offered — and reads as a refusal rather than as "not yet", because
-  the alternative is a lit switch over nothing. A refusal costs the session
-  nothing either way: it is the one setting whose failure does not replace the
-  process, since trading a warm engine for an optimisation it cannot have
-  would repeat every turn.
+- **The composer can ask for Codex's fast tier.** Codex has a `priority`
+  service tier — its own name for it is Fast, at 1.5x speed for increased
+  usage — and it is a field on `turn/start`, beside `effort`. That is what
+  makes it worth offering: a per-turn parameter travels as part of the
+  request, so a relay can pass it on, and switching it costs neither the
+  process nor the prompt cache. Which models have it comes from the catalog
+  the CLI ships rather than a list here, which would be wrong by the next
+  release; a model that catalog has never heard of is asked for anyway,
+  because behind a gateway that is every model and the entry Caden clones for
+  it carries the tier. Claude Code's fast mode is deliberately not offered.
+  It is not a parameter at all — it asks for Opus to be routed to faster
+  hardware — so through a relay the CLI reports it on while nothing upstream
+  is any quicker, which is a switch that lies.
 - **Tearing down one daemon home's supervision no longer takes another's with
   it.** The watchdog's crontab lines are tagged, and every home outside the
   `~/.caden-<flavor>` convention carries the *same* tag as `~/.caden` — so
