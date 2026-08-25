@@ -108,6 +108,16 @@ SID=$(echo "$ID" | cut -f1); TOKEN=$(echo "$ID" | cut -f2); HOSTNAME=$(echo "$ID
 
 security add-generic-password -s "$SERVICE" -a "server.$SID" -w "$TOKEN" -U
 echo "==> $HOSTNAME ready; token stored in the login keychain under $SERVICE"
+
+# And on the phone, if there is a gateway to put it on. The app does this at
+# the end of provisioning; a server set up from here has to end up in the same
+# state, or "provisioned" means two different things depending on which way
+# you did it.
+CADEN_FLAVOR="$FLAVOR" SID="$SID" node -e '
+const host = require("./app/host");
+const server = (host.readConfig().servers || []).find(s => s.id === process.env.SID);
+if (server) host.attachToWebGateway(server, t => console.log("==> " + t));
+' || echo "==> the web gateway was not updated"
 echo
 echo "Open the forward, then start $LABEL:"
 echo "  ssh -N -L $PORT:127.0.0.1:$PORT $TARGET"

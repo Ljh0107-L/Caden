@@ -52,6 +52,12 @@ The key each server gets is its own, and the line it goes into is
 `restrict,port-forwarding` — no shell, no agent, no pty. Revoking one server's
 tunnel is deleting one line.
 
+**Removing a server removes its way in.** The key is withdrawn from the
+gateway first, because that is the end which grants access and it works
+whether or not the machine still answers; then the tunnel is stopped on the
+machine, and the proxy is rewritten without it. Its daemon is left running —
+it is your machine, and there may be work on it.
+
 ## Both installs on one gateway
 
 Caden installs twice — the build you use and a development one beside it —

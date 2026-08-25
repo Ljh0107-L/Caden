@@ -128,6 +128,13 @@ forward:
   week for that name. The address is resolved from the gateway and compared
   with the address the gateway answers on, before anything is written, and the
   message names the IP to point at.
+- **Removing a server removes its way in.** Dropping the entry left the proxy
+  still routing to it, the console still listing it and — the part that
+  matters — a key of its own still authorised to open a tunnel into the
+  gateway. "I removed that server" has to mean the server can no longer get
+  in. The key is withdrawn from the gateway first, because that is the end
+  which grants access and it works whether or not the machine still answers.
+  Its daemon is left running: it is your machine, and there may be work on it.
 - **A server set up while a gateway exists is on the phone when it finishes.**
   The proxy needs a route to each daemon, and only the one running on the
   gateway itself is already reachable. Provisioning now gives the others a key

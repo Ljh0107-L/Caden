@@ -347,14 +347,73 @@ function addServer(alias) {
   return entry;
 }
 
-function removeServer(id) {
+/// Take away a server's way in to the gateway.
+///
+/// The gateway end first, and deliberately: it is the end that grants access,
+/// and it works whether or not the machine being removed still answers. The
+/// service on the machine is stopped afterwards as a courtesy -- with the
+/// key gone it can no longer connect anyway, and a machine being removed is
+/// often a machine that has gone.
+async function revokeTunnel(server, onStep = () => {}) {
+  const web = webConfig();
+  if (!web.tunnels[server.id]) return;
+
+  if (web.gatewayHost) {
+    onStep('withdrawing its key from the gateway…');
+    const tag = `caden-tunnel:${server.id}`;
+    await gatewayShell(web.gatewayHost)([
+      'set -eu',
+      'test -f ~/.ssh/authorized_keys || exit 0',
+      `grep -v ' ${tag}$' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true`,
+      'chmod 600 ~/.ssh/authorized_keys.tmp',
+      'mv -f ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys',
+    ].join('\n')).catch(() => {});
+  }
+
+  onStep('stopping the tunnel on the server…');
+  await provisionShell(server)(
+    'systemctl --user disable --now caden-tunnel.service >/dev/null 2>&1 || true; '
+    + 'rm -f ~/.config/systemd/user/caden-tunnel.service ~/.ssh/caden-tunnel ~/.ssh/caden-tunnel.pub; '
+    + 'systemctl --user daemon-reload >/dev/null 2>&1 || true',
+    { timeout: 20000 }).catch(() => {});
+
+  const tunnels = { ...webConfig().tunnels };
+  delete tunnels[server.id];
+  saveWebConfig({ tunnels });
+}
+
+/// Removing a server has to reach further than this Mac.
+///
+/// Dropping the entry left the gateway still routing to it, the console still
+/// listing it, and -- the part that matters -- a key of its own still
+/// authorised to open a tunnel in. "I removed that server" has to mean the
+/// server can no longer get in.
+async function removeServer(id, onStep = () => {}) {
+  const gone = findServer(id);
+  const web = webConfig();
+  if (gone) {
+    await revokeTunnel(gone, onStep).catch(() => {});
+    stopTunnel(gone).catch(() => {});
+  }
+
   const cfg = readConfig();
-  const gone = (cfg.servers || []).find(s => s.id === id);
   cfg.servers = (cfg.servers || []).filter(s => s.id !== id);
   writeConfig(cfg);
-  if (gone) stopTunnel(gone).catch(() => {});
   execFile('security', ['delete-generic-password', '-s', KEYCHAIN_SERVICE,
                         '-a', `server.${id}`], () => {});
+
+  if (!web.hostname || !web.gatewayHost) return;
+  if (web.serverId === id) {
+    // The console came from the one being removed, so there is nothing to
+    // rewrite the configuration around. Left as it is rather than half torn
+    // down: the address keeps working until another server is chosen.
+    saveWebConfig({ serverId: '' });
+    onStep('this was the server the console came from — pick another in the Web pane');
+    return;
+  }
+  onStep('bringing the web gateway in line…');
+  await applyWebGateway(onStep).catch(e =>
+    onStep(`the server is gone; the web gateway was not updated: ${String(e.message || e)}`));
 }
 
 const findServer = id => (readConfig().servers || []).find(s => s.id === id);
@@ -583,19 +642,7 @@ async function provision(server, { restart = false } = {}, onStep = () => {}) {
   // Best effort, and it says so when it fails. The daemon is installed and
   // working either way, and turning a successful provision into an error
   // because a proxy elsewhere could not be reached is the wrong trade.
-  const web = webConfig();
-  if (web.hostname && web.gatewayHost) {
-    try {
-      if (entry && entry.id !== web.serverId && !isLocalServer(entry)) {
-        onStep('connecting it to the web gateway…');
-        await setupTunnel(entry, onStep);
-      }
-      onStep('bringing the web gateway in line…');
-      await applyWebGateway(onStep);
-    } catch (e) {
-      onStep(`the daemon is up; the web gateway was not updated: ${String(e.message || e)}`);
-    }
-  }
+  await attachToWebGateway(entry || server, onStep);
   return { ...result, remotePort: entry ? entry.remotePort : server.remotePort };
 }
 
@@ -1424,8 +1471,11 @@ async function route(req, res, url) {
     const action = seg[3];
 
     if (!action && req.method === 'DELETE') {
-      removeServer(server.id);
-      return json(res, 200, { ok: true }), true;
+      // Reaching two other machines, so it can take a moment. The renderer
+      // already awaits it.
+      try { await removeServer(server.id); json(res, 200, { ok: true }); }
+      catch (e) { json(res, 500, { error: String(e.message || e) }); }
+      return true;
     }
     if (action === 'status') {
       return json(res, 200, await status(server)), true;
@@ -1939,6 +1989,31 @@ async function applyWebGateway(onStep = () => {}) {
   return { hostname, url: `https://${hostname}/` };
 }
 
+/// Put a freshly provisioned server on the phone.
+///
+/// Called from provisioning rather than left as a second errand, because
+/// everything it needs -- ssh to the machine, ssh to the gateway -- is
+/// already here. Also called by scripts/provision.sh, so that a server set up
+/// from a terminal ends up in the same state as one set up from the app;
+/// "provisioned" meaning two different things is how the two drift.
+///
+/// Best effort, and it says what did not happen. The daemon is installed and
+/// working whether or not a proxy elsewhere could be reached.
+async function attachToWebGateway(server, onStep = () => {}) {
+  const web = webConfig();
+  if (!web.hostname || !web.gatewayHost) return;
+  try {
+    if (server && server.id !== web.serverId && !isLocalServer(server)) {
+      onStep('connecting it to the web gateway…');
+      await setupTunnel(server, onStep);
+    }
+    onStep('bringing the web gateway in line…');
+    await applyWebGateway(onStep);
+  } catch (e) {
+    onStep(`the daemon is up; the web gateway was not updated: ${String(e.message || e)}`);
+  }
+}
+
 /// Whether the console has a password yet, and whether the address answers.
 async function webStatus() {
   const web = webConfig();
@@ -2048,6 +2123,6 @@ async function ensureLocalServer() {
 module.exports = {
   route, readConfig, daemonBase, daemonToken, providerKey, expandTilde,
   buildProvisionScript, webPayload, providerSecrets, provision, shutdown,
-  forwardUsable,
+  forwardUsable, attachToWebGateway, removeServer,
   ensureLocalServer,
 };

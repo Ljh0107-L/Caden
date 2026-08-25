@@ -86,6 +86,10 @@ step "SSH provisioning payload (exact file bytes)"
 node tests/provision-upload_test.cjs
 result $? "provision-upload_test.cjs"
 
+step "removing a server (its tunnel and its port go with it)"
+node tests/web_removal_test.cjs >/dev/null 2>&1
+result $? "web_removal_test.cjs"
+
 step "forward identity (a port answering is not the daemon you meant)"
 node tests/forward_identity_test.cjs >/dev/null 2>&1
 result $? "forward_identity_test.cjs"
