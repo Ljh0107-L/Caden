@@ -15,6 +15,10 @@
 // because a tunnel that works until the next reboot beats no tunnel -- as
 // long as the pane says which one you have.
 //
+// It also holds the ssh helper's own robustness, which is the same subject
+// from the other end: a launcher that cannot report why it failed is no better
+// than one that never ran.
+//
 //   node tests/tunnel_launcher_test.cjs
 'use strict';
 const assert = require('node:assert');
@@ -135,6 +139,31 @@ const load = () => {
   check('the script does not either, so both ways agree',
         !/attachToWebGateway/.test(sh),
         '"provisioned" meaning two things is how the two drift');
+
+  // 7. A far end that goes away mid-write must not take the app with it.
+  //
+  //    `child.on('error')` is the process's, not the pipe's, so nothing was
+  //    listening when `stdin` emitted EPIPE -- and an 'error' event nobody
+  //    listens for is an uncaught exception, which in Electron is a dialog
+  //    over the whole app and a main process that stops. Harmless while the
+  //    payload was three small files; provisioning now pushes a third of a
+  //    megabyte of console through the same pipe, so a connection that dies
+  //    partway is ordinary rather than rare.
+  //
+  //    `head -c1` is the far end: it reads one byte and exits.
+  let crashed = null;
+  const onCrash = e => { crashed = e; };
+  process.on('uncaughtException', onCrash);
+  const r = await host.__testing__.run('sh', ['-c', 'head -c1 >/dev/null'],
+                                       { input: 'x'.repeat(8 * 1024 * 1024),
+                                         timeout: 10000 });
+  await new Promise(done => setTimeout(done, 300));
+  process.removeListener('uncaughtException', onCrash);
+  check('a far end that closes mid-write does not crash the process',
+        !crashed, crashed ? crashed.message : '');
+  check('it is a failed run instead', r.code === -1);
+  check('and the reason survives into the step stream',
+        /EPIPE/.test(r.stderr), JSON.stringify(r.stderr.trim().slice(0, 60)));
 
   console.log(failed ? '\ntunnel launcher: FAILED' : '\ntunnel launcher: OK');
   process.exit(failed ? 1 : 0);

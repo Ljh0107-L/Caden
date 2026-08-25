@@ -199,7 +199,21 @@ function run(cmd, args, { input, timeout = 60000 } = {}) {
     child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
     child.on('error', e => { stderr += String(e.message); finish(-1); });
-    child.on('close', finish);
+    // `child.on('error')` is the process's, not the pipe's. When the far end
+    // goes away mid-write -- an ssh that timed out, a proxy that dropped the
+    // connection, a remote shell that exited early -- `stdin` emits EPIPE, and
+    // an 'error' event nobody listens for is an uncaught exception. In Electron
+    // that is a dialog over the whole app and a main process that stops.
+    //
+    // Harmless while the payload was three small files: the write completed in
+    // one go before anything could close. Provisioning now pushes the console
+    // through the same pipe, a third of a megabyte of it, and a connection that
+    // dies partway is an ordinary thing rather than a rare one. A failed write
+    // is a failed run, which the step stream already knows how to report.
+    child.stdin.on('error', e => {
+      stderr += `\ncould not send to ${cmd}: ${e.code || e.message}`;
+      finish(-1);
+    });
     if (input !== undefined) child.stdin.end(input);
     else child.stdin.end();
   });
@@ -2244,5 +2258,5 @@ module.exports = {
   // Reached only by the suites: the launcher ladder is worth testing against
   // fake machines, and copying it into the test would make the copy the thing
   // that goes stale.
-  __testing__: { startTunnelProcess, TUNNEL_LAUNCHERS },
+  __testing__: { startTunnelProcess, TUNNEL_LAUNCHERS, run },
 };

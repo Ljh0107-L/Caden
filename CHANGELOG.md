@@ -25,6 +25,17 @@ Two things a devbox found.
   nothing on that machine will bring it back. And when no rung takes at all,
   that is an error naming every one that was tried, in the pane, rather than a
   silence to be discovered later as a 502.
+- **A dropped connection no longer takes the app down.** Provisioning writes
+  its payload to ssh's stdin, and `child.on('error')` is the process's error,
+  not the pipe's — so when the far end went away mid-write, `stdin` emitted
+  EPIPE with nobody listening, which is an uncaught exception, which in
+  Electron is a dialog over the whole app and a main process that stops. Two
+  servers sat on "uploading daemon files…" for good, because the thing that
+  was going to tell them otherwise had died. This was survivable while the
+  payload was three small text files and the write finished before anything
+  could close it; 0.2.0 started pushing the whole console through the same
+  pipe, a third of a megabyte, and made a mid-write close ordinary rather than
+  rare. It is a failed run now, and the step that failed says EPIPE.
 - **Setting a server up is not publishing it.** Provisioning ended by wiring
   the new server into the web gateway, so adding a machine reached out to a
   third host, and a gateway that was down turned into a warning on an
