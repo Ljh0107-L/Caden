@@ -1839,6 +1839,32 @@ async function setupTunnel(server, onStep = () => {}) {
   // A key of its own, not the one the person uses. Revoking a tunnel should
   // not be a decision about anything else, and the entry it goes into on the
   // gateway is deliberately allowed to do nothing but forward.
+  // Can this machine reach the gateway at all? A key, an authorisation and a
+  // service all get installed before anything is tried, and a devbox with no
+  // default route -- reachable inbound through a corporate proxy and with no
+  // outbound network of its own -- takes every one of those steps and then
+  // fails a minute later saying nothing answered. That is a true sentence
+  // about the wrong thing.
+  //
+  // Three attempts, because the honest failures here do not look alike: a
+  // machine with no route says so instantly and always, while one whose
+  // egress drops connections times out and then works. Only the first is
+  // worth refusing.
+  onStep('checking this server can reach the gateway…');
+  const probe = await sh(
+    `for i in 1 2 3; do `
+    + `(exec 3<>/dev/tcp/${gw.host}/${gw.port}) 2>&1 && echo caden-reach && break; `
+    + `done`, { timeout: 30000 });
+  if (!String(probe.stdout).includes('caden-reach')) {
+    const why = (String(probe.stdout) + String(probe.stderr))
+      .split('\n').map(l => l.trim()).filter(Boolean).pop() || 'no answer';
+    throw new Error(
+      `${server.name || 'this server'} cannot open a connection to the gateway `
+      + `at ${gw.host}:${gw.port} — ${why}. The tunnel is dialled from the `
+      + `server, so it needs outbound access to that address; nothing here can `
+      + `be set up until it has one.`);
+  }
+
   onStep('making a key for the tunnel…');
   const key = await sh(
     'set -eu; mkdir -p ~/.ssh; chmod 700 ~/.ssh; '
@@ -1884,8 +1910,20 @@ async function setupTunnel(server, onStep = () => {}) {
   // nowhere -- so a ten-second window judged the loop before it had tried
   // twice, and reported a failure while the thing was still working on it.
   const tries = started.supervised === 'none' ? 120 : 20;
+  const began = Date.now();
+  let said = 0;
   for (let i = 0; i < tries; i++) {
     await sleep(500);
+    // A minute of one unchanging line reads as a hang, and this is exactly
+    // the wait where it is not one: the launcher is retrying, each failed
+    // attempt costs its connect timeout, and the tunnel usually arrives. Say
+    // how long it has been rather than going quiet for the whole window.
+    const secs = Math.round((Date.now() - began) / 1000);
+    if (secs >= said + 5) {
+      said = secs;
+      onStep(`waiting for the tunnel to reach the gateway — ${secs}s`
+             + (started.supervised === 'none' ? ', retrying' : ''));
+    }
     const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`);
     if (/"ok"\s*:\s*true/.test(probe.stdout)) {
       rememberTunnel(server.id, port, started.how);
@@ -2041,6 +2079,11 @@ async function startTunnelProcess(server, sh, cmd, port, onStep) {
   const stop = [
     '[ -f "$HOME/.caden-tunnel.pid" ] && kill "$(cat "$HOME/.caden-tunnel.pid")" 2>/dev/null || true',
     'rm -f "$HOME/.caden-tunnel.pid"',
+    // A loop from before the pidfile existed has nothing to kill it by number.
+    // Anchored on the end of the command line so it matches the loop and not
+    // the command installing it, which carries the same name inside a heredoc
+    // and would otherwise kill itself partway through.
+    "pkill -f 'sh .*caden-tunnel\\.sh$' >/dev/null 2>&1 || true",
     'systemctl --user stop caden-tunnel.service >/dev/null 2>&1 || true',
     `pkill -f "R [0-9]*:127.0.0.1:${server.remotePort || DEFAULT_PORT}" >/dev/null 2>&1 || true`,
   ].join('\n');

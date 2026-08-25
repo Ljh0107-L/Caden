@@ -35,6 +35,20 @@ Two things a devbox found.
   the password and certificate checks, that is a pane sitting on "Checking…"
   long enough to read as broken. None of them depend on each other. Web went
   from that to 1.7s, and a server's own status from 26s to 1.9s.
+- **A server that cannot reach the gateway is told so before anything is
+  installed.** The tunnel is dialled from the server, so a machine with no
+  outbound network of its own — a devbox reachable inbound through a corporate
+  proxy and nothing more — can never open one. It got a key, an authorisation
+  on the gateway and a service anyway, waited out the whole probe window, and
+  failed with "nothing answered", which is true about the wrong thing. It is
+  three quick connection attempts up front now, and a refusal that names the
+  address and the reason. Three rather than one because the two failures do
+  not look alike: a machine with no route says so instantly and always, and a
+  machine whose egress drops connections times out and then works — only the
+  first is worth refusing.
+- **A wait that is going somewhere says how long it has been.** The bottom rung
+  retries, so the probe window has to be long enough to let it, and a minute of
+  one unchanging line reads as a hang in exactly the case where it is not one.
 - **The two installs stop sharing ports they were never meant to share.** The
   flavor split gives each install its own config, keychain, daemon home and
   daemon port, and says in as many words that the bases have to be far enough
