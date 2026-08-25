@@ -19,12 +19,78 @@ Two things a devbox found.
   fails falls through to the next. `supervise.sh` has always done exactly this
   for the daemon, down to giving up gracefully when neither exists — the
   tunnel simply never learned it.
-- **A tunnel nothing will restart says so.** The last rung reaches the gateway
-  exactly as well as the other two until the machine reboots, which makes a
-  tick the wrong thing to draw: the pane says the tunnel is up and that
-  nothing on that machine will bring it back. And when no rung takes at all,
-  that is an error naming every one that was tried, in the pane, rather than a
-  silence to be discovered later as a 502.
+- **The last rung restarts itself.** It has to: on a machine with no systemd
+  user session and no cron there is nothing else to run it again, and the
+  first attempt is not always the one that works. A server whose egress drops
+  half its outbound connections took the ladder correctly down to the bottom
+  rung, failed to connect once, and that was the end of it — a tunnel that
+  never existed on a machine where the mechanism had been chosen correctly.
+  It loops now, and the ssh it runs gives up on a dead path in ten seconds
+  rather than waiting out the default. When no rung takes at all, that is an
+  error in the pane naming every one that was tried, rather than a silence to
+  be discovered later as a 502.
+- **The Servers and Web panes stop asking one question at a time.** Every
+  reachability check is an ssh round trip, and a server whose tunnel is down
+  costs a three-second curl on top; run in sequence across four servers, plus
+  the password and certificate checks, that is a pane sitting on "Checking…"
+  long enough to read as broken. None of them depend on each other. Web went
+  from that to 1.7s, and a server's own status from 26s to 1.9s.
+- **A server that cannot reach the gateway is told so before anything is
+  installed.** The tunnel is dialled from the server, so a machine with no
+  outbound network of its own — a devbox reachable inbound through a corporate
+  proxy and nothing more — can never open one. It got a key, an authorisation
+  on the gateway and a service anyway, waited out the whole probe window, and
+  failed with "nothing answered", which is true about the wrong thing. It is
+  three quick connection attempts up front now, and a refusal that names the
+  address and the reason. Three rather than one because the two failures do
+  not look alike: a machine with no route says so instantly and always, and a
+  machine whose egress drops connections times out and then works — only the
+  first is worth refusing.
+- **Reasoning is on screen while it is arriving.** A fold starts closed —
+  `open` is the set the reader has opened by hand — so a reasoning block
+  streamed into a collapsed one, and the body a delta appends to is only built
+  when the fold opens. So the deltas had nowhere to land: not hidden, not
+  rendered, rebuilt from scratch on the first click. What a long think looked
+  like was a chevron and a header that never changed, which is exactly what a
+  turn that has stopped looks like — and on a model that reasons for a minute
+  before its first visible word, that is the whole turn. The live block is open
+  now and grows in place, and folds away when the header stops saying
+  "Thinking…" and starts saying how long it took.
+- **A turn with nothing back yet says it is waiting, not working.** "Working…"
+  was drawn whenever a tool had run earlier in the turn — earlier, not now — so
+  a turn stalled on the network claimed progress it was not making. Before
+  anything at all has arrived the honest word is that we are waiting, and past
+  three quarters of a minute of silence the row says so rather than leaving the
+  reader to compare two timestamps.
+- **A wait that is going somewhere says how long it has been.** The bottom rung
+  retries, so the probe window has to be long enough to let it, and a minute of
+  one unchanging line reads as a hang in exactly the case where it is not one.
+- **The two installs stop sharing ports they were never meant to share.** The
+  flavor split gives each install its own config, keychain, daemon home and
+  daemon port, and says in as many words that the bases have to be far enough
+  apart that neither walk reaches the other's. Two allocators had been left out
+  of that. Tunnel ports on the web gateway started at a hardcoded 7901 for
+  both, so on a gateway they share — the ordinary arrangement, since the
+  gateway is somebody's server — development's second server and production's
+  third both came out as 7903; whichever tunnel bound it first owned it, and
+  the other console reached a daemon holding a different token. That reads as
+  "bad or missing token" on a server that is running perfectly, and it was
+  happening on both consoles at once. Local forward ports had the same shape
+  and had not bitten yet: the walk starts at the daemon port and had no upper
+  bound, so a hundredth server on the production side would have taken 7938 —
+  the port the development daemon listens on — and stopped development working
+  because of how many servers production happened to have. Each install now
+  has a closed block for both, and a port recorded before the split is dropped
+  so the next connect allocates inside it. Which install is "just development"
+  does not make the interference acceptable in either direction.
+- **The Web pane draws itself before the answers arrive.** Almost everything on
+  it is already on this machine — the address, which machine runs the proxy,
+  which daemon serves the console, the list of servers — and only the ticks
+  beside them need asking. Waiting on the asking left the whole pane blank for
+  as long as the slowest check took. It fills in from the config first, in
+  about seven milliseconds, and the rows that need an answer say so until they
+  have one. A server with a tunnel reads as "checking…" rather than as "not on
+  the web", which would have offered an Add button for a server already on it.
 - **A dropped connection no longer takes the app down.** Provisioning writes
   its payload to ssh's stdin, and `child.on('error')` is the process's error,
   not the pipe's — so when the far end went away mid-write, `stdin` emitted

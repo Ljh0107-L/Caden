@@ -83,11 +83,41 @@ function shellPath(p) {
 
 function readConfig() {
   migrateSecrets();
+  let cfg;
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch {
     return { servers: [], providers: [], models: [] };
   }
+  return migrateTunnelPorts(cfg);
+}
+
+/// Tunnel ports were allocated from one hardcoded base by both installs.
+///
+/// On a gateway they share -- the ordinary arrangement, since the gateway is
+/// somebody's server and both installs can be pointed at it -- dev's second
+/// server and production's third both came out as 7903. Whichever tunnel bound
+/// it first owned it, and the other console reached a daemon holding a
+/// different token, which reads as "bad or missing token" on a server that is
+/// running perfectly.
+///
+/// The ranges are per-flavor now. A port from before that is dropped rather
+/// than kept, so the next connect allocates inside this install's range: a
+/// recorded port that may belong to the other install is worse than no
+/// recorded port, because the route it produces reaches the wrong machine
+/// while looking correct. Written back rather than filtered on the way past,
+/// so that removing a server can still find the entry it is removing.
+function migrateTunnelPorts(cfg) {
+  const tunnels = cfg.web?.tunnels;
+  if (!tunnels) return cfg;
+  const stale = Object.keys(tunnels).filter(id => tunnels[id] < flavor.tunnelBase);
+  if (!stale.length) return cfg;
+  for (const id of stale) {
+    delete cfg.web.tunnels[id];
+    if (cfg.web.tunnelHow) delete cfg.web.tunnelHow[id];
+  }
+  try { writeConfig(cfg); } catch { /* read-only config; the drop still holds */ }
+  return cfg;
 }
 
 function writeConfig(cfg) {
@@ -199,6 +229,12 @@ function run(cmd, args, { input, timeout = 60000 } = {}) {
     child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
     child.on('error', e => { stderr += String(e.message); finish(-1); });
+    // The ordinary way a run ends. Dropped once while the handler below was
+    // being added, which left every `run` resolving on its timeout instead:
+    // a status check that had its answer in half a second sat there for the
+    // full 25s, and a provision that had finished held the step on screen for
+    // the whole 240s it was allowed. Both read as a hang, and both were.
+    child.on('close', finish);
     // `child.on('error')` is the process's, not the pipe's. When the far end
     // goes away mid-write -- an ssh that timed out, a proxy that dropped the
     // connection, a remote shell that exited early -- `stdin` emits EPIPE, and
@@ -349,6 +385,11 @@ function addServer(alias) {
   const used = new Set(servers.map(s => s.localPort || s.remotePort));
   let localPort = DEFAULT_PORT;
   while (used.has(localPort)) localPort++;
+  // Past this install's block is the other install's daemon, and taking it
+  // would break that one for as long as this server exists.
+  if (localPort > flavor.localPortEnd) {
+    throw new Error(`no local port left below ${flavor.localPortEnd} for another server`);
+  }
   const entry = {
     id: newId(), name: alias, mode: 'tunnel',
     sshUser: '', sshHost: alias, sshPort: 22,
@@ -726,10 +767,15 @@ async function forwardUsable(server) {
 async function freeLocalPort(server) {
   const want = localPortOf(server);
   if (!(await canConnect(want))) return want;
-  for (let port = want + 1; port < want + 40; port++) {
+  // Inside this install's block only. Walking past it lands on the other
+  // install's daemon port, and a forward that takes it is a development build
+  // that stops the real one from starting -- the sort of interference the
+  // whole flavor split exists to prevent.
+  for (let port = want + 1; port <= flavor.localPortEnd; port++) {
     if (!(await canConnect(port))) return port;
   }
-  throw new Error(`no free local port near ${want} for the forward to ${server.name || server.sshHost}`);
+  throw new Error(`no free local port between ${want} and ${flavor.localPortEnd} `
+                  + `for the forward to ${server.name || server.sshHost}`);
 }
 
 function canConnect(port) {
@@ -1383,7 +1429,10 @@ async function route(req, res, url) {
   }
 
   if (p === '/host/web/status') {
-    try { json(res, 200, await webStatus()); }
+    // `?quick=1` is the config-only answer, so the pane can draw itself before
+    // any of the checks have come back.
+    const quick = url.searchParams.get('quick') === '1';
+    try { json(res, 200, await webStatus({ probe: !quick })); }
     catch (e) { json(res, 500, { error: String(e.message || e) }); }
     return true;
   }
@@ -1596,10 +1645,11 @@ function webConfig() {
   // now, which is not the same as what the settings say the moment somebody
   // types a new one -- and the difference is what tells apply there is an old
   // site to take down.
-  return { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
-           // serverId -> the loopback port its tunnel binds on the gateway,
-           // and serverId -> what is holding that tunnel open there.
-           tunnels: {}, tunnelHow: {}, ...(cfg.web || {}) };
+  const out = { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
+                // serverId -> the loopback port its tunnel binds on the
+                // gateway, and serverId -> what holds that tunnel open there.
+                tunnels: {}, tunnelHow: {}, ...(cfg.web || {}) };
+  return out;
 }
 
 /// A gateway port for this server's tunnel, stable once chosen: the unit on
@@ -1609,7 +1659,7 @@ function tunnelPortFor(serverId) {
   const web = webConfig();
   if (web.tunnels[serverId]) return web.tunnels[serverId];
   const taken = new Set(Object.values(web.tunnels));
-  let port = 7901;
+  let port = flavor.tunnelBase;
   while (taken.has(port)) port++;
   saveWebConfig({ tunnels: { ...web.tunnels, [serverId]: port } });
   return port;
@@ -1789,6 +1839,32 @@ async function setupTunnel(server, onStep = () => {}) {
   // A key of its own, not the one the person uses. Revoking a tunnel should
   // not be a decision about anything else, and the entry it goes into on the
   // gateway is deliberately allowed to do nothing but forward.
+  // Can this machine reach the gateway at all? A key, an authorisation and a
+  // service all get installed before anything is tried, and a devbox with no
+  // default route -- reachable inbound through a corporate proxy and with no
+  // outbound network of its own -- takes every one of those steps and then
+  // fails a minute later saying nothing answered. That is a true sentence
+  // about the wrong thing.
+  //
+  // Three attempts, because the honest failures here do not look alike: a
+  // machine with no route says so instantly and always, while one whose
+  // egress drops connections times out and then works. Only the first is
+  // worth refusing.
+  onStep('checking this server can reach the gateway…');
+  const probe = await sh(
+    `for i in 1 2 3; do `
+    + `(exec 3<>/dev/tcp/${gw.host}/${gw.port}) 2>&1 && echo caden-reach && break; `
+    + `done`, { timeout: 30000 });
+  if (!String(probe.stdout).includes('caden-reach')) {
+    const why = (String(probe.stdout) + String(probe.stderr))
+      .split('\n').map(l => l.trim()).filter(Boolean).pop() || 'no answer';
+    throw new Error(
+      `${server.name || 'this server'} cannot open a connection to the gateway `
+      + `at ${gw.host}:${gw.port} — ${why}. The tunnel is dialled from the `
+      + `server, so it needs outbound access to that address; nothing here can `
+      + `be set up until it has one.`);
+  }
+
   onStep('making a key for the tunnel…');
   const key = await sh(
     'set -eu; mkdir -p ~/.ssh; chmod 700 ~/.ssh; '
@@ -1817,6 +1893,10 @@ async function setupTunnel(server, onStep = () => {}) {
   // without it ssh stays connected after the remote bind is refused, and every
   // rung below would report a tunnel that forwards nothing.
   const cmd = `ssh -N -T -i "$HOME/.ssh/caden-tunnel" `
+    // A path that drops the SYN costs the default connect timeout otherwise,
+    // and on a machine where half the attempts do that, the retry below is
+    // only as good as how quickly a bad attempt gives up.
+    + '-o ConnectTimeout=10 '
     + '-o ExitOnForwardFailure=yes -o ServerAliveInterval=30 '
     + '-o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new '
     + `-o IdentitiesOnly=yes -p ${gw.port} `
@@ -1824,8 +1904,26 @@ async function setupTunnel(server, onStep = () => {}) {
   const started = await startTunnelProcess(server, sh, cmd, port, onStep);
 
   onStep('checking the gateway can reach it…');
-  for (let i = 0; i < 20; i++) {
+  // Long enough for a launcher that retries to get several goes. The bottom
+  // rung loops, and on a machine whose egress drops half its outbound
+  // connections a single attempt can spend the whole connect timeout getting
+  // nowhere -- so a ten-second window judged the loop before it had tried
+  // twice, and reported a failure while the thing was still working on it.
+  const tries = started.supervised === 'none' ? 120 : 20;
+  const began = Date.now();
+  let said = 0;
+  for (let i = 0; i < tries; i++) {
     await sleep(500);
+    // A minute of one unchanging line reads as a hang, and this is exactly
+    // the wait where it is not one: the launcher is retrying, each failed
+    // attempt costs its connect timeout, and the tunnel usually arrives. Say
+    // how long it has been rather than going quiet for the whole window.
+    const secs = Math.round((Date.now() - began) / 1000);
+    if (secs >= said + 5) {
+      said = secs;
+      onStep(`waiting for the tunnel to reach the gateway — ${secs}s`
+             + (started.supervised === 'none' ? ', retrying' : ''));
+    }
     const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`);
     if (/"ok"\s*:\s*true/.test(probe.stdout)) {
       rememberTunnel(server.id, port, started.how);
@@ -1919,12 +2017,14 @@ const TUNNEL_LAUNCHERS = [
     // no tunnel -- but the pane has to say so rather than draw a tick.
     supervised: 'none',
     detect: 'true',
-    install: (cmd, unitCmd, keep) => [
-      `cat > ~/.caden-tunnel.sh <<'CADEN_KEEP'`,
-      keep,
-      'CADEN_KEEP',
+    install: (cmd, unitCmd, keep, loop) => [
+      `cat > ~/.caden-tunnel.sh <<'CADEN_LOOP'`,
+      loop,
+      'CADEN_LOOP',
       'chmod 700 ~/.caden-tunnel.sh',
-      '~/.caden-tunnel.sh',
+      // setsid so it outlives the ssh session that installed it, and </dev/null
+      // so it does not hold that session open waiting for input.
+      '(setsid ~/.caden-tunnel.sh </dev/null >/dev/null 2>&1 &)',
     ].join('\n'),
     diagnose: 'tail -6 ~/.caden-tunnel.log 2>/dev/null',
   },
@@ -1939,12 +2039,55 @@ async function startTunnelProcess(server, sh, cmd, port, onStep) {
   // Restarts the tunnel unless it is already running, so it is safe as both
   // the starter and the every-minute watchdog. `pgrep -f` on the exact remote
   // port is what tells this tunnel from any other ssh on the box.
+  // Two scripts, because the two lower rungs need different things of them.
+  //
+  // Under cron this runs every minute and must be a no-op while the tunnel is
+  // up, so it checks and exits. Started bare there is nothing to run it again,
+  // so it has to be its own supervisor -- and on a machine whose egress drops
+  // half its outbound SYNs, that is the difference between a tunnel and no
+  // tunnel: the first attempt is a coin flip, and one that lost used to be
+  // the end of it.
+  const once = `pgrep -f "R ${port}:127.0.0.1:" >/dev/null 2>&1`;
   const keep = [
     '#!/bin/sh',
     '# Written by Caden. Starts the web-gateway tunnel unless it is up.',
-    `pgrep -f "R ${port}:127.0.0.1:" >/dev/null 2>&1 && exit 0`,
+    `${once} && exit 0`,
     `exec setsid nohup ${cmd} >> "$HOME/.caden-tunnel.log" 2>&1 &`,
   ].join('\n');
+  const loop = [
+    '#!/bin/sh',
+    '# Written by Caden. Holds the web-gateway tunnel open.',
+    '#',
+    '# This machine has neither a systemd user session nor cron, so nothing',
+    '# else would start the tunnel again -- not after a crash, and not after',
+    '# a first attempt that simply failed to connect.',
+    // Its own pid, so the next install can stop it by number. Matching on the
+    // script name would not do: the command that installs it has that name in
+    // it too, and would kill itself partway through.
+    'echo $$ > "$HOME/.caden-tunnel.pid"',
+    'while true; do',
+    `  ${cmd} >> "$HOME/.caden-tunnel.log" 2>&1`,
+    '  sleep 5',
+    'done',
+  ].join('\n');
+
+  // Whatever is already holding a tunnel here, whichever rung put it there.
+  // Reconnecting can move the port -- the ranges are per-flavor now, and a
+  // server set up before that gets a new one -- and a loop left running would
+  // go on restoring the old forward, holding a port on the gateway that
+  // belongs to somebody else.
+  const stop = [
+    '[ -f "$HOME/.caden-tunnel.pid" ] && kill "$(cat "$HOME/.caden-tunnel.pid")" 2>/dev/null || true',
+    'rm -f "$HOME/.caden-tunnel.pid"',
+    // A loop from before the pidfile existed has nothing to kill it by number.
+    // Anchored on the end of the command line so it matches the loop and not
+    // the command installing it, which carries the same name inside a heredoc
+    // and would otherwise kill itself partway through.
+    "pkill -f 'sh .*caden-tunnel\\.sh$' >/dev/null 2>&1 || true",
+    'systemctl --user stop caden-tunnel.service >/dev/null 2>&1 || true',
+    `pkill -f "R [0-9]*:127.0.0.1:${server.remotePort || DEFAULT_PORT}" >/dev/null 2>&1 || true`,
+  ].join('\n');
+  await sh(stop).catch(() => {});
 
   const tried = [];
   for (const l of TUNNEL_LAUNCHERS) {
@@ -1952,7 +2095,7 @@ async function startTunnelProcess(server, sh, cmd, port, onStep) {
     if (!/yes/.test(String(ok.stdout))) { tried.push(`${l.how}: not available here`); continue; }
     onStep(`starting the tunnel with ${l.how}…`);
     try {
-      await sh(['set -eu', l.install(cmd, cmd, keep)].join('\n'));
+      await sh(['set -eu', l.install(cmd, cmd, keep, loop)].join('\n'));
       return { how: l.how, supervised: l.supervised, diagnose: l.diagnose };
     } catch (e) {
       tried.push(`${l.how}: ${String(e.message || e).split('\n')[0].slice(0, 120)}`);
@@ -2141,55 +2284,83 @@ async function applyWebGateway(onStep = () => {}) {
 /// Put a freshly provisioned server on the phone.
 ///
 /// Whether the console has a password yet, and whether the address answers.
-async function webStatus() {
+/// `probe: false` answers from the config alone -- no ssh, no network.
+///
+/// Almost everything the pane draws is already known here: the address, which
+/// machine runs the proxy, which daemon serves the console, the list of
+/// servers. Only the ticks beside them need asking. Making the whole pane wait
+/// on the asking meant it sat blank for as long as the slowest check, which
+/// reads as a pane that is broken rather than one that is still counting.
+async function webStatus({ probe = true } = {}) {
   const web = webConfig();
   const servers = (readConfig().servers || []).filter(s => s.provisioned);
   const out = { ...web, servers: servers.map(s => ({ id: s.id, name: s.name || s.sshHost || s.id })),
                 sshHosts: sshHosts().map(h => h.host), passwordSet: null,
-                cert: null, reachable: null };
+                cert: null, reachable: null, probed: probe };
+  if (!probe) {
+    // What is knowable without asking anyone. `null` where a check would go,
+    // which the pane draws as "still counting" rather than as an answer.
+    out.reach = {};
+    for (const sv of servers) {
+      out.reach[sv.id] = isLocalServer(sv) ? 'local'
+        : (sv.id === web.serverId && !web.tunnels[sv.id]) ? 'gateway'
+        : web.tunnels[sv.id] ? null : 'none';
+    }
+    return out;
+  }
   // Which servers the gateway can actually reach, and how.
   const gwSh = web.gatewayHost ? gatewayShell(web.gatewayHost) : null;
   out.reach = {};
-  for (const s of servers) {
-    if (isLocalServer(s)) { out.reach[s.id] = 'local'; continue; }
-    if (s.id === web.serverId && !web.tunnels[s.id]) { out.reach[s.id] = 'gateway'; continue; }
+  // In parallel, and so is everything below it. Each of these is an ssh round
+  // trip, and a server whose tunnel is down costs the curl's own three seconds
+  // on top -- run one after another that is a pane sitting on "Checking…" for
+  // as long as it takes to ask every question in turn. They do not depend on
+  // each other, so there was never a reason to.
+  const reachOne = async s => {
+    if (isLocalServer(s)) return 'local';
+    if (s.id === web.serverId && !web.tunnels[s.id]) return 'gateway';
     const port = web.tunnels[s.id];
-    if (!port) { out.reach[s.id] = 'none'; continue; }
-    if (!gwSh) { out.reach[s.id] = 'unknown'; continue; }
+    if (!port) return 'none';
+    if (!gwSh) return 'unknown';
     const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`)
       .catch(() => null);
-    out.reach[s.id] = probe && /"ok"\s*:\s*true/.test(probe.stdout) ? 'tunnel' : 'down';
-  }
-  // What is holding each tunnel open. `nohup` reaches the gateway exactly as
-  // well as the others until the machine restarts, so the difference has to
-  // be said rather than left to a tick that means two things.
-  out.how = { ...(web.tunnelHow || {}) };
-
+    return probe && /"ok"\s*:\s*true/.test(probe.stdout) ? 'tunnel' : 'down';
+  };
+  const reached = await Promise.all(servers.map(reachOne));
+  servers.forEach((s, i) => { out.reach[s.id] = reached[i]; });
   const server = servers.find(s => s.id === web.serverId);
-  if (server) {
-    const sh = provisionShell(server);
-    const home = server.remoteHome || REMOTE_HOME;
-    const r = await sh(`test -s ${home}/web-password && echo yes || echo no`).catch(() => null);
-    out.passwordSet = r ? /yes/.test(r.stdout) : null;
-  }
-  if (web.gatewayHost && web.hostname) {
-    const sh = gatewayShell(web.gatewayHost);
-    const r = await sh(`openssl x509 -enddate -noout -in `
-      + `/etc/letsencrypt/live/${web.hostname}/fullchain.pem 2>/dev/null || true`).catch(() => null);
-    const m = r && /notAfter=(.+)/.exec(r.stdout);
-    out.cert = m ? m[1].trim() : null;
-  }
-  if (web.hostname) {
-    // The sign-in redirect is the healthy answer: it means nginx is there and
-    // the check in front of it is working.
-    out.reachable = await new Promise(resolve => {
-      const req = https.request(`https://${web.hostname}/`, { method: 'GET', timeout: 6000 },
-        r => { resolve(r.statusCode || 0); r.destroy(); });
-      req.on('timeout', () => { req.destroy(); resolve(null); });
-      req.on('error', () => resolve(null));
-      req.end();
-    });
-  }
+  const [passwordSet, cert, reachable] = await Promise.all([
+    (async () => {
+      if (!server) return null;
+      const sh = provisionShell(server);
+      const home = server.remoteHome || REMOTE_HOME;
+      const r = await sh(`test -s ${home}/web-password && echo yes || echo no`).catch(() => null);
+      return r ? /yes/.test(r.stdout) : null;
+    })(),
+    (async () => {
+      if (!(web.gatewayHost && web.hostname)) return null;
+      const sh = gatewayShell(web.gatewayHost);
+      const r = await sh(`openssl x509 -enddate -noout -in `
+        + `/etc/letsencrypt/live/${web.hostname}/fullchain.pem 2>/dev/null || true`).catch(() => null);
+      const m = r && /notAfter=(.+)/.exec(r.stdout);
+      return m ? m[1].trim() : null;
+    })(),
+    (async () => {
+      if (!web.hostname) return null;
+      // The sign-in redirect is the healthy answer: it means nginx is there
+      // and the check in front of it is working.
+      return new Promise(resolve => {
+        const req = https.request(`https://${web.hostname}/`, { method: 'GET', timeout: 6000 },
+          r => { resolve(r.statusCode || 0); r.destroy(); });
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+        req.on('error', () => resolve(null));
+        req.end();
+      });
+    })(),
+  ]);
+  out.passwordSet = passwordSet;
+  out.cert = cert;
+  out.reachable = reachable;
   return out;
 }
 

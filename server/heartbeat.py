@@ -3281,7 +3281,19 @@ class MockEngine(BaseEngine):
         self.emit("session.init", engine="mock", model=self.session.meta.get("model"),
                   native_id=self.session.meta.get("native_id"),
                   cwd=self.session.workdir(), tools=["Bash", "Read", "Edit"])
-        self.emit("thinking", block="th1", text="Considering: %s" % clip(text, 200))
+        # Streamed rather than emitted whole when asked, so a suite can catch
+        # the reasoning block while it is still the live tail -- which is the
+        # only moment its open/closed state is decided. `CADEN_MOCK_THINK_MS`
+        # is the window it holds open for; unset, this is one event as before
+        # and costs the other suites nothing.
+        hold = float(os.environ.get("CADEN_MOCK_THINK_MS") or 0) / 1000.0
+        if hold:
+            for part in ("Considering: ", clip(text, 200)):
+                self.emit("thinking.delta", block="th1", text=part)
+                time.sleep(0.05)
+            time.sleep(hold)
+        else:
+            self.emit("thinking", block="th1", text="Considering: %s" % clip(text, 200))
         for chunk in ("Working on ", "your request", " now."):
             if self._stop:
                 break

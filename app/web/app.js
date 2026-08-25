@@ -605,6 +605,14 @@ function openPane(pane) {
   dismissOverlaySidebar();
   if (pane === 'web') {
     state.web = null;                       // so the pane paints "checking…"
+    // The settings and the server list are already on this machine; only the
+    // ticks beside them need asking. Draw what is known first, then fill the
+    // answers in -- waiting for the slowest check before drawing anything is
+    // what made the pane look broken rather than busy.
+    webStatus({ quick: true })
+      .then(w => { if (state.pane === 'web' && !state.web?.probed) {
+                     state.web = w; renderWebPane(); } })
+      .catch(() => {});
     webStatus().then(w => { state.web = w; renderWebPane(); })
                .catch(e => { state.web = { error: String(e.message || e) };
                              renderWebPane(); });
@@ -1238,13 +1246,40 @@ function renderTranscript(ctl) {
       // put back sixty times a second underneath it. The moment it counts from
       // is written into the node instead, the same way the interval above
       // ticks the number itself.
-      place('live', ['live', ran, !!compacting], () =>
+      // What the turn is actually doing, as far as this side can tell.
+      //
+      // `ran` says a tool ran earlier in this turn, not that one is running
+      // now -- so a turn stalled on the network read "Working…", which claims
+      // progress. Before anything at all has come back, the honest word is
+      // that we are waiting: on a slow link the first token can be the whole
+      // wait, and that is worth telling apart from a model that is thinking
+      // with its answer already streaming.
+      const heard = items.some(i => i.turn === tail?.turn
+        && (i.kind === 'assistant' || i.kind === 'thinking' || i.kind === 'tool'));
+      const phase = compacting ? 'Compacting the conversation…'
+        : !heard ? 'Waiting for the model…'
+        : ran ? 'Working…' : 'Thinking…';
+      place('live', ['live', ran, heard, !!compacting], () =>
         el('div', { class: 't-row reply' },
           el('div', { class: 'working-row' },
             tpl('dotLoader'),
-            el('span', {}, compacting ? 'Compacting the conversation…'
-                                      : ran ? 'Working…' : 'Thinking…'),
+            el('span', {}, phase),
             el('span', { class: 'live-elapsed' }))));
+      // A long silence is the one thing here worth acting on, and a bare
+      // number does not read as one: two seconds and two minutes look alike
+      // apart from the digits. Past a threshold the row says outright that
+      // nothing has arrived, which on a link that drops connections is
+      // usually what has happened.
+      const row = next.get('live')?.node;
+      if (row) {
+        const quiet = since && Date.now() - since > 45000;
+        row.dataset.quiet = quiet ? 'yes' : '';
+        row.title = quiet && !compacting
+          ? 'Nothing has come back since the time shown — the turn is still '
+            + 'open, so this is usually a slow first token or a connection '
+            + 'being re-established'
+          : '';
+      }
       const clock = next.get('live')?.node.querySelector('.live-elapsed');
       if (clock && clock.dataset.since !== String(since)) {
         clock.dataset.since = String(since);
@@ -1363,8 +1398,16 @@ function renderRow(row, open, liveTail = false, ctl = null) {
       // No decorative rows: skip thinking blocks that carry no text (some
       // gateways strip thinking deltas), unless it's the live tail.
       if (!item.text.trim() && !liveTail) return null;
+      // Open while it is arriving. A new fold starts closed -- `open` is the
+      // set the reader has opened by hand -- so reasoning streamed into a
+      // collapsed block: the one part of a long turn that says what it is
+      // doing was behind a chevron, and the transcript sat still for a minute
+      // with the answer already on screen and hidden. It collapses again when
+      // it finishes, which is where the header stops saying "Thinking…" and
+      // starts saying how long it took.
+      const shown = liveTail ? new Set([...open, `think:${item.id}`]) : open;
       return toolFold({
-        key: `think:${item.id}`, open, action: thinkLabel(item, liveTail),
+        key: `think:${item.id}`, open: shown, action: thinkLabel(item, liveTail),
         buildBody: () => {
           const body = el('div', { class: 'fold-body', text: item.text || '…' });
           // How much of the block is already on screen, so a later delta can
@@ -2173,7 +2216,10 @@ function buildStatusRow(ctl, entry, onToggleContext) {
     });
   }
 
-  row.append(slot, fastBtn, effortBtn, gauge);
+  // Filtered, because this is the DOM's `append` and not `el`: given null it
+  // inserts the string "null" as a text node. `fastBtn` is null on every
+  // Claude session, which is where the word turned up.
+  row.append(...[slot, fastBtn, effortBtn, gauge].filter(Boolean));
   row.classList.add('caden-status-row');
   return row;
 }
@@ -3381,7 +3427,6 @@ function renderWebPane() {
   // otherwise gone perfectly. Adding a server and publishing it are different
   // things to want.
   const reach = w.reach || {};
-  const held = w.how || {};
   const rows = el('div', { class: 'prov-card' });
   const listed = (w.servers || []).filter(s => reach[s.id] !== 'local');
   if (!listed.length) {
@@ -3389,24 +3434,32 @@ function renderWebPane() {
   }
   for (const s of listed) {
     const how = reach[s.id];
-    // A tunnel nothing supervises answers exactly like a supervised one until
-    // the machine restarts, so it is its own state rather than a tick.
-    const bare = how === 'tunnel' && held[s.id] === 'nohup';
-    const mark = how === 'gateway' ? 'ok'
-               : how === 'tunnel' ? (bare ? 'warn' : 'ok')
+    // Reachable or not. Which of the three things is holding the tunnel open
+    // was drawn here for a while, as a third state for the one that had no
+    // supervisor -- but that rung restarts itself now, so the distinction
+    // stopped being one the reader has to act on, and a row that is up should
+    // look like a row that is up.
+    // `null` is the first pass answering from the config alone: this server
+    // has a tunnel and whether it carries anything has not been asked yet.
+    // Drawing that as "not on the web" would offer an Add button for a server
+    // that is already on it, which is worse than saying nothing for a second.
+    const asking = how == null;
+    const mark = asking ? 'busy'
+               : how === 'gateway' || how === 'tunnel' ? 'ok'
                : how === 'down' ? 'bad' : 'none';
-    const detail = how === 'gateway' ? 'its daemon is on the proxy itself'
-      : bare ? 'reachable, but nothing on that machine will restart the tunnel '
-               + '— it has no systemd user session and no cron, so a reboot ends it'
-      : how === 'tunnel' ? `reached through the tunnel it opens${
-          held[s.id] === 'cron' ? ' — kept alive by cron' : ''}`
+    const detail = asking ? 'checking…'
+      : how === 'gateway' ? 'its daemon is on the proxy itself'
+      : how === 'tunnel' ? 'reached through the tunnel it opens'
       : how === 'down' ? 'has a tunnel, but nothing is answering on it'
       : 'not on the web — add it here';
-    const act = how === 'gateway' ? null
+    const act = (asking || how === 'gateway') ? null
       : srvBtn(how === 'none' ? 'Add' : 'Reconnect',
                () => webConnect(s.id, s.name),
                how === 'none' ? 'accent' : undefined);
     rows.append(srvLine(mark, s.name, detail, act));
+    if (state.webRowError?.id === s.id) {
+      rows.append(el('div', { class: 'srv-error' }, state.webRowError.message));
+    }
   }
   body.append(el('div', { class: 'prov-section' },
     el('div', { class: 'prov-title-row' },
@@ -3422,13 +3475,18 @@ function renderWebPane() {
 }
 
 async function webConnect(serverId, name) {
+  state.webRowError = null;
   setWebBusy(`connecting ${name}…`);
   try {
     await connectServerToWeb(serverId, text => setWebBusy(`${name}: ${text}`));
     state.web = await webStatus();
     setWebBusy(null);
   } catch (e) {
-    state.web = { ...state.web, error: String(e.message || e) };
+    // On its own row. Reported as the pane's error, one server that would not
+    // connect took the address, the gateway and every other server off screen
+    // with it -- and the pane is the place you would go to see whether the
+    // rest of it is still fine.
+    state.webRowError = { id: serverId, message: String(e.message || e) };
     setWebBusy(null);
   }
 }
