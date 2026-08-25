@@ -57,7 +57,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 PROTOCOL = 1
 
 
