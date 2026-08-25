@@ -157,6 +157,23 @@ def main():
     check("turning it off sends the opposite",
           {"fastMode": False} in flag_settings(eng))
 
+    # -- toggling it mid-session keeps the process, and the cache with it --
+    # The reason fast mode is a hot setting at all. `stale()` is what forces a
+    # respawn, and it compares the spawn signature -- argv, env, cwd. There is
+    # no fast flag to appear in any of them, so the only way a toggle could
+    # cost the process is `reconcile` failing, which is why the refusal below
+    # matters.
+    s.meta["fast"] = False
+    s.save()
+    check("a toggle does not make the process stale", eng.stale() is False)
+    was = eng.spawned
+    eng.reconcile()
+    check("so turning it off keeps the running engine", eng.spawned == was)
+    s.meta["fast"] = True
+    s.save()
+    eng.reconcile()
+    check("and turning it back on keeps it too", eng.spawned == was)
+
     # -- a refusal costs the turn nothing ----------------------------------
     # `reconcile` returning False is how an engine says "replace me", which is
     # the right answer for a model or a permission mode and the wrong one for
