@@ -110,9 +110,25 @@ Create spec:
   "context_window": 256000,              // claude: enforced via CLAUDE_CODE_MAX_CONTEXT_TOKENS
   "env": {"FOO": "bar"},
   "engine_args": ["--effort", "high"],
+  "fast": true,                          // claude only; see below
   "message": "optional first turn"
 }
 ```
+
+`fast` asks Claude Code for fast mode, which has no flag: the daemon sends
+`apply_flag_settings {"fastMode": true}` on the control channel as soon as the
+process is up, because an SDK session reports `sdk_opt_in_required` until
+something asks. Asking is not getting — it needs an Opus model and a plan that
+carries it — so the session also reports what the engine said:
+
+| Field | Meaning |
+| --- | --- |
+| `fast` | what was asked for |
+| `fast_state` | `on` / `off`, as the CLI last reported it |
+| `fast_reason` | why not, when the CLI gives one (`sdk_opt_in_required`, …) |
+
+`PATCH` takes `fast` too, and it applies at the start of the next turn like
+every other setting.
 
 ## Uploads
 

@@ -106,6 +106,10 @@ step "file permissions (a shared box cannot read the session tree)"
 python3 tests/permissions_test.py >/dev/null 2>&1
 result $? "permissions_test.py"
 
+step "fast mode (an opt-in with no flag behind it, sent at spawn)"
+python3 tests/fast_mode_test.py >/dev/null 2>&1
+result $? "fast_mode_test.py"
+
 step "provider credentials (key_ref resolved by the daemon, not by a proxy)"
 python3 tests/key_ref_test.py >/dev/null 2>&1
 result $? "key_ref_test.py"
@@ -157,6 +161,8 @@ if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
   result $? "e2e gateway (served by a proxy, with the Mac switched off)"
   node tests/e2e/viewports.mjs
   result $? "e2e viewports (every width a phone reports, and a desktop)"
+  node tests/e2e/fast.mjs
+  result $? "e2e fast (a switch only where the engine can honour it)"
 else
   echo "   skip  e2e -- npm install && npx playwright install chromium"
 fi

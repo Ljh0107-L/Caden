@@ -635,6 +635,15 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
 }
 .effort-btn:hover { background: rgb(var(--base) / 0.06); }
 .effort-btn svg { color: rgb(var(--base) / 0.6); }
+/* A switch rather than a menu, so it has to read as on from across the room:
+   the other chips in this row always show a value, and an unlit `Fast` beside
+   them would look like one more label. */
+.effort-btn[data-on] {
+  color: var(--accent-fg);
+  background: var(--accent-bg);
+}
+.effort-btn[data-on]:hover { background: var(--accent-bg-hover); }
+.effort-btn[data-on] svg { color: var(--accent-fg); }
 
 /* ---------- scrollbars ---------- */
 

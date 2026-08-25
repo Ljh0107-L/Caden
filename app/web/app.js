@@ -530,6 +530,14 @@ function lastUsage(ctl) {
 
 const engineOf = proto => proto === 'anthropic-messages' ? 'claude'
   : proto === 'mock' ? 'mock' : 'codex';
+
+/// The model a live session is on, as a row from the model list. A session
+/// stores the id it was created with, not the entry, and the chips above the
+/// composer need the protocol as well.
+const modelOfSession = session => session && {
+  proto: session.engine === 'claude' ? 'anthropic-messages' : 'openai-responses',
+  modelID: session.model,
+};
 const engineLabel = proto => proto === 'anthropic-messages' ? 'Claude Code' : 'Codex';
 const PERMISSIONS = [
   { value: 'bypassPermissions', label: 'Full access' },
@@ -550,6 +558,39 @@ const EFFORTS = [
 ];
 const effortLabel = v =>
   (EFFORTS.find(e => e.value === v) || EFFORTS[2]).label;
+
+// Claude Code's fast mode: same Opus, quicker tokens. The engine only offers
+// it on Opus 4.8 and 5 and only on a paid plan, and it is off unless the
+// session opts in over the control channel -- so anywhere else the switch
+// would be a control that does nothing, and it is better not to draw one.
+// When the engine turns it down anyway (an unpaid plan, say) it says why, and
+// `fastNote` puts that sentence on the chip rather than leaving it lit and
+// lying.
+const fastCapable = model =>
+  !!model && engineOf(model.proto) === 'claude'
+  && /opus-(4-8|5)\b/.test(model.modelID || '');
+
+const FAST_REASONS = {
+  sdk_opt_in_required: 'the engine did not accept the opt-in',
+  not_entitled: 'your plan does not include fast mode',
+  model_not_supported: 'this model has no fast mode',
+};
+const fastNote = session => {
+  if (!session || !session.fast) return 'Same Opus, faster tokens';
+  if (session.fast_state === 'on') return 'Fast mode on';
+  if (session.fast_reason) {
+    const why = session.fast_reason;
+    return `Fast mode unavailable: ${FAST_REASONS[why] || why}`;
+  }
+  // No state at all is the gap between asking and the first turn; a state of
+  // `off` with no reason is a refusal that declined to give one. A gateway
+  // that drops the setting on its way upstream looks exactly like this, and
+  // reading it as "not yet" would leave the switch lit over nothing -- which
+  // is the failure it exists to prevent.
+  return session.fast_state
+    ? 'Fast mode was asked for and did not take — the provider may not pass it on'
+    : 'Fast mode starts on the next turn';
+};
 
 // ---------------------------------------------------------------- navigation
 
@@ -1618,7 +1659,7 @@ function summaryRow(sum) {
 /// what had been typed.
 function buildPromptInput({ root, placeholder, modelLabel, engine, onPlusMenu, onModelMenu,
                             isRunning, onSend, onInterrupt, onShiftTab, effort,
-                            permission, onPasteOther = () => {}, draft = null }) {
+                            fast, permission, onPasteOther = () => {}, draft = null }) {
   root = root || tpl('promptInput');
 
   // A contenteditable rather than a textarea: the composer has to hold
@@ -1799,11 +1840,16 @@ function buildPromptInput({ root, placeholder, modelLabel, engine, onPlusMenu, o
 
   // Optional thinking-effort switch in the toolbar (draft view, where there
   // is no status row to host it).
-  for (const [chip, icon] of [[permission, 'lock-locked'], [effort, 'brain']]) {
+  // `fast` is a switch rather than a menu -- two states do not need a list --
+  // so it carries `onToggle` and lights up instead of naming its value.
+  for (const [chip, icon] of [[permission, 'lock-locked'], [effort, 'brain'],
+                              [fast, 'bolt']]) {
     if (!chip) continue;
-    const btn = el('button', { class: 'effort-btn', title: chip.title || '' },
+    const btn = el('button', { class: 'effort-btn', title: chip.title || '',
+                               'data-on': chip.on?.() || null },
       cIcon(icon, 12), el('span', { class: 'effort-label' }, chip.label()));
-    btn.addEventListener('click', () => chip.onMenu(btn));
+    btn.addEventListener('click',
+      () => chip.onMenu ? chip.onMenu(btn) : chip.onToggle());
     root.querySelector('.composer-controls-left')?.append(btn);
   }
 
@@ -2113,7 +2159,24 @@ function buildStatusRow(ctl, entry, onToggleContext) {
   paintGoal();
   ctl.listeners.add(paintGoal);
 
-  row.append(slot, effortBtn, gauge);
+  // Fast mode, beside the effort switch it reads as a sibling of. Only for
+  // the models that have it -- see `fastCapable`. The session carries what the
+  // engine said about it, so a switch the engine refused says so on hover
+  // rather than sitting lit and doing nothing.
+  const fastBtn = fastCapable(modelOfSession(ctl.session))
+    ? el('button', { class: 'effort-btn', title: fastNote(ctl.session),
+                     'data-on': ctl.session.fast || null },
+        cIcon('bolt', 12), el('span', { class: 'effort-label' }, 'Fast'))
+    : null;
+  if (fastBtn) {
+    fastBtn.addEventListener('click', async () => {
+      ctl.session = await ctl.api.patchSession(ctl.session.id,
+                                               { fast: !ctl.session.fast });
+      renderMain();
+    });
+  }
+
+  row.append(slot, fastBtn, effortBtn, gauge);
   row.classList.add('caden-status-row');
   return row;
 }
@@ -2457,6 +2520,8 @@ function renderDraft() {
   }
   const model = models().find(m => m.id === d.modelId) || models()[0];
   if (!d.effort) d.effort = 'high';
+  // A model swap can take the switch away underneath a session that had it on.
+  if (!fastCapable(model)) d.fast = false;
 
   // Cursor's own empty-state page, replayed whole; we only fill data in.
   const page = tpl('emptyState');
@@ -2477,6 +2542,7 @@ function renderDraft() {
         cwd: d.cwd, create_cwd: true,
         permission_mode: d.permissionMode,
         effort: d.effort,
+        fast: d.fast || undefined,
         context_window: model.contextWindow || undefined,
         message: text,
         images: images && images.length ? images : undefined,
@@ -2531,6 +2597,12 @@ function renderDraft() {
         action: () => { d.effort = x.value; renderMain(); },
       }))),
     },
+    fast: fastCapable(model) ? {
+      title: 'Same Opus, faster tokens',
+      label: () => 'Fast',
+      on: () => !!d.fast,
+      onToggle: () => { d.fast = !d.fast; renderMain(); },
+    } : null,
   });
 
   // The two selects above the composer: workspace and machine.

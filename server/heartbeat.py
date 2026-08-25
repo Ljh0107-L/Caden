@@ -1026,7 +1026,7 @@ class BaseEngine(object):
     def remember_signature(self, argv):
         """Record what this process was started with, in memory and on disk."""
         self._sig = self.spawn_signature(argv)
-        self._hot = self.hot_settings()
+        self._hot = self.spawn_hot_settings()
         self.session.meta["engine_sig"] = self._sig
         self.session.meta["engine_hot"] = self._hot
         self.session.save()
@@ -1039,6 +1039,11 @@ class BaseEngine(object):
         have no way to be told.
         """
         return {}
+
+    def spawn_hot_settings(self):
+        """What a freshly started process has. Usually what it was asked for,
+        because those settings are command-line flags."""
+        return self.hot_settings()
 
     def apply_hot_settings(self, want, have):
         raise EngineError("this engine cannot be reconfigured in place")
@@ -1927,7 +1932,20 @@ class ClaudeEngine(BaseEngine):
             out["effort"] = self.session.meta.get("effort") or None
         else:
             out["thinking"] = self.thinking_tokens()
+        out["fast"] = bool(self.session.meta.get("fast"))
         return out
+
+    def spawn_hot_settings(self):
+        """What the process actually has the moment it starts.
+
+        Model, permission mode and effort are command-line flags, so a fresh
+        process already has them. Fast mode is not a flag -- there is none --
+        it is a setting sent over the control channel afterwards, so a fresh
+        process always has it off no matter what the session asked for.
+        Recording the wish here instead of the fact would leave `reconcile`
+        with nothing to do and fast mode quietly never applied.
+        """
+        return dict(self.hot_settings(), fast=False)
 
     def apply_hot_settings(self, want, have):
         """Tell the running engine, over the same control channel as interrupt.
@@ -1959,6 +1977,27 @@ class ClaudeEngine(BaseEngine):
                           thinking_display="summarized")
             self.emit("log", stream="caden",
                       text="thinking budget -> %s" % (want.get("thinking") or "default"))
+        if want.get("fast") != have.get("fast"):
+            # The same request effort uses. There is no flag for this: an SDK
+            # session reports `sdk_opt_in_required` until it is asked for
+            # explicitly, which is what this is.
+            #
+            # Alone among these, a refusal is swallowed. Everything else here
+            # is something the session must have -- the caller answers a
+            # failure by replacing the process, which is right for a model or
+            # a permission mode and absurd for fast mode: an install that does
+            # not know the subtype would trade its warm process for nothing,
+            # once per turn, forever. Fast mode is an optimisation, so failing
+            # to get it costs the turn nothing. What the CLI reports about it
+            # is separate and unaffected, so the composer still shows off.
+            try:
+                self._control("apply_flag_settings",
+                              settings={"fastMode": bool(want.get("fast"))})
+                self.emit("log", stream="caden",
+                          text="fast mode -> %s" % ("on" if want.get("fast") else "off"))
+            except EngineError as exc:
+                log("info", "[%s] fast mode not available on this install: %s",
+                    self.session.id, exc)
 
     def ensure_started(self):
         with self.lock:
@@ -1971,6 +2010,16 @@ class ClaudeEngine(BaseEngine):
             # Any subsequent (re)start must resume rather than claim the id.
             self.session.meta["resumed"] = True
             self.session.save()
+        # Settings that are not command-line flags have to be sent, and a
+        # fresh process does not have them. apply_settings runs before the
+        # engine exists on a first turn and returns early, so waiting for it
+        # would leave fast mode off until the second message -- which reads
+        # as a switch that only works sometimes.
+        try:
+            self.reconcile()
+        except Exception:
+            log("info", "[%s] could not apply settings after start: %s",
+                self.session.id, traceback.format_exc().strip().split("\n")[-1])
 
     def submit(self, turn_id, text, images=None):
         self._await_goal_probe()
@@ -2024,15 +2073,37 @@ class ClaudeEngine(BaseEngine):
         elif kind == "error":
             self.emit("error", message=str(ev.get("error") or ev.get("message") or ev))
 
+    def _note_fast(self, ev):
+        """Record what the CLI says about fast mode, which is not what we asked.
+
+        Wanting it is not having it: it needs an Opus model and a plan that
+        carries it, and the CLI says which of those is missing. Storing the
+        answer is what lets the composer show the reason instead of a switch
+        that appears to do nothing.
+        """
+        state = ev.get("fast_mode_state")
+        if state is None:
+            return
+        reason = ev.get("fast_mode_disabled_reason")
+        if (self.session.meta.get("fast_state") == state
+                and self.session.meta.get("fast_reason") == reason):
+            return
+        self.session.meta["fast_state"] = state
+        self.session.meta["fast_reason"] = reason
+        self.session.save()
+
     def _on_system(self, ev):
         if ev.get("subtype") == "init":
             self.session.set_native_id(ev.get("session_id"))
+            self._note_fast(ev)
             self.emit("session.init",
                       engine="claude",
                       model=ev.get("model"),
                       native_id=ev.get("session_id"),
                       cwd=ev.get("cwd"),
                       permission_mode=ev.get("permissionMode"),
+                      fast_mode=self.session.meta.get("fast_state"),
+                      fast_mode_reason=self.session.meta.get("fast_reason"),
                       tools=ev.get("tools") or [])
         elif ev.get("subtype") == "status":
             self._on_status(ev)
@@ -2226,6 +2297,10 @@ class ClaudeEngine(BaseEngine):
                           is_error=bool(block.get("is_error")))
 
     def _on_result(self, ev):
+        # The same two fields ride the result, and that is the copy worth
+        # having: a turn can start in fast mode and end in cooldown after a
+        # rate limit, and only this says so.
+        self._note_fast(ev)
         if self._goal_probe:
             # Caden's own `/goal`, which was never a turn: it closes nothing and
             # says nothing. Its answer has already been read.
@@ -4264,6 +4339,11 @@ class Session(object):
             "tasks": self.meta.get("tasks") or [],
             "permission_mode": self.meta.get("permission_mode"),
             "effort": self.meta.get("effort"),
+            "fast": bool(self.meta.get("fast")),
+            # What the engine says, which is the half that matters: asking for
+            # fast mode is not the same as getting it.
+            "fast_state": self.meta.get("fast_state"),
+            "fast_reason": self.meta.get("fast_reason"),
             "last_summary": self.meta.get("last_summary"),
         }
         # Settings are applied when a message is sent, so a change made while
@@ -4337,6 +4417,7 @@ class SessionManager(object):
             "engine_args": spec.get("engine_args") or [],
             "permission_mode": spec.get("permission_mode") or "bypassPermissions",
             "effort": spec.get("effort"),
+            "fast": bool(spec.get("fast")),
             "context_window": spec.get("context_window") or None,
             # Adopting an engine session that already exists on this host: the
             # id is the engine's own, and `resumed` makes the first spawn
@@ -6169,7 +6250,7 @@ def h_session_patch(req, params, query):
             body["cwd"] = resolved
 
     for key in ("title", "model", "model_label", "permission_mode", "cwd",
-                "effort", "verbose_logs", "add_dirs", "engine_args", "env",
+                "effort", "fast", "verbose_logs", "add_dirs", "engine_args", "env",
                 "archived", "context_window"):
         if key in body:
             sess.meta[key] = body[key]

@@ -34,7 +34,11 @@ const up = async url => {
   try { return (await fetch(url)).ok; } catch { return false; }
 };
 
-export async function start() {
+/// `providers` replaces the model list for scenarios that need a model the
+/// mock provider cannot stand in for -- a chip drawn only for Claude's Opus,
+/// say. The default is one mock model, which is what every other file here
+/// assumes.
+export async function start({ providers = null } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'caden-e2e-'));
   const daemonHome = path.join(tmp, 'home');
   fs.mkdirSync(daemonHome, { recursive: true });
@@ -62,7 +66,7 @@ export async function start() {
       id: 'e2e-unset', name: 'Not set up', mode: 'direct',
       directURL: 'http://127.0.0.1:9', tokenFile: '', provisioned: false,
     }],
-    providers: [{
+    providers: providers || [{
       id: 'mock-prov', name: 'Mock', proto: 'mock', baseURL: '',
       models: [{ id: 'mock-model', modelID: 'mock-1', alias: 'Mock',
                  contextWindow: 200000 }],

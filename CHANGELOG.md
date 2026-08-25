@@ -219,8 +219,25 @@ forward:
   caller holding the token, which is where the app reads them. The comparison
   is constant-time, and a failed one costs 250ms.
 
-And one that was not about any of this:
+And two that were not about any of this:
 
+- **Fast mode is a switch in the composer.** Claude Code will run Opus at
+  several times the token rate, and the setting has no command-line flag
+  behind it: an SDK session reports `sdk_opt_in_required` and stays slow until
+  something asks for it over the control channel. Everything else the composer
+  sets — model, permission mode, effort — is an argument, so a fresh process
+  already has it; this one has to be sent, and sent at the spawn rather than
+  at the top of the next turn, or it takes effect from the second message on.
+  The switch is only drawn on the models that have it, because asking is not
+  getting: Sonnet reports it off and offers no reason, an ineligible plan gives
+  one, and what the engine says is what the chip shows rather than staying lit
+  over a setting that did not take. A proxy in front of the model that drops
+  the setting on its way upstream looks the same from here — off, with no
+  reason offered — and reads as a refusal rather than as "not yet", because
+  the alternative is a lit switch over nothing. A refusal costs the session
+  nothing either way: it is the one setting whose failure does not replace the
+  process, since trading a warm engine for an optimisation it cannot have
+  would repeat every turn.
 - **Tearing down one daemon home's supervision no longer takes another's with
   it.** The watchdog's crontab lines are tagged, and every home outside the
   `~/.caden-<flavor>` convention carries the *same* tag as `~/.caden` — so
