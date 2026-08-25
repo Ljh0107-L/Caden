@@ -1878,7 +1878,13 @@ async function setupTunnel(server, onStep = () => {}) {
   const started = await startTunnelProcess(server, sh, cmd, port, onStep);
 
   onStep('checking the gateway can reach it…');
-  for (let i = 0; i < 20; i++) {
+  // Long enough for a launcher that retries to get several goes. The bottom
+  // rung loops, and on a machine whose egress drops half its outbound
+  // connections a single attempt can spend the whole connect timeout getting
+  // nowhere -- so a ten-second window judged the loop before it had tried
+  // twice, and reported a failure while the thing was still working on it.
+  const tries = started.supervised === 'none' ? 120 : 20;
+  for (let i = 0; i < tries; i++) {
     await sleep(500);
     const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`);
     if (/"ok"\s*:\s*true/.test(probe.stdout)) {

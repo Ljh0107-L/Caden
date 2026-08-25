@@ -3419,6 +3419,9 @@ function renderWebPane() {
                () => webConnect(s.id, s.name),
                how === 'none' ? 'accent' : undefined);
     rows.append(srvLine(mark, s.name, detail, act));
+    if (state.webRowError?.id === s.id) {
+      rows.append(el('div', { class: 'srv-error' }, state.webRowError.message));
+    }
   }
   body.append(el('div', { class: 'prov-section' },
     el('div', { class: 'prov-title-row' },
@@ -3434,13 +3437,18 @@ function renderWebPane() {
 }
 
 async function webConnect(serverId, name) {
+  state.webRowError = null;
   setWebBusy(`connecting ${name}…`);
   try {
     await connectServerToWeb(serverId, text => setWebBusy(`${name}: ${text}`));
     state.web = await webStatus();
     setWebBusy(null);
   } catch (e) {
-    state.web = { ...state.web, error: String(e.message || e) };
+    // On its own row. Reported as the pane's error, one server that would not
+    // connect took the address, the gateway and every other server off screen
+    // with it -- and the pane is the place you would go to see whether the
+    // rest of it is still fine.
+    state.webRowError = { id: serverId, message: String(e.message || e) };
     setWebBusy(null);
   }
 }
