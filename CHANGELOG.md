@@ -97,6 +97,17 @@ forward:
   it did. The wire protocol is unchanged. A run that reads no keys at all —
   a locked keychain — leaves the ones already on the server alone instead of
   replacing them with nothing.
+- **A forward proves which daemon is on the other end of it.** Every daemon
+  answers `/v1/ping`, and answers it identically — so a daemon of this Mac's
+  own, holding the port a server's forward was configured for, was
+  indistinguishable from that forward working. `startTunnel` reported it
+  reused, never opened anything, and the app addressed the wrong machine for
+  the rest of the session while reporting the right one as connected. It
+  surfaced as a server that would not take a daemon upgrade: the revision it
+  reported belonged to somebody else. The token is what tells two daemons
+  apart, so that is what gets checked. And when the configured local port is
+  held by something that is not ours, the forward takes the next free one
+  rather than failing — or, as before, quietly using whatever answered.
 - **Renaming the gateway takes the old address down.** Changing the hostname
   and applying left the previous site enabled, still answering, still renewing
   a certificate for a name nobody uses. The old site and its web root go once

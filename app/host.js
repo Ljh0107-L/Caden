@@ -583,17 +583,50 @@ const localPortOf = s => s.localPort || s.remotePort || DEFAULT_PORT;
 /// reports a working forward as "ssh exited immediately".
 const forwardOpen = server => canConnect(localPortOf(server));
 
-/// Whether the forward actually carries traffic to the daemon.
+/// Whether the forward actually carries traffic to *this server's* daemon.
 ///
 /// An open port is not proof: a forward left over from a previous remote port
 /// still accepts locally and then resets, because ssh only discovers there is
-/// nothing to talk to once it tries to open the channel. When the daemon is
-/// supposed to be there, make the forward prove it before reusing it.
+/// nothing to talk to once it tries to open the channel.
+///
+/// Neither is a ping. Every daemon answers it, and answers it identically --
+/// so on a machine that also runs a daemon of its own, a local one holding
+/// the port looks exactly like a working forward, `startTunnel` reports the
+/// forward reused, and the app spends the rest of the session talking to the
+/// wrong machine while believing it is talking to this one. Which is what
+/// happened: This Mac's daemon on 7938 answering for a server whose forward
+/// had never been opened.
+///
+/// The token is the thing that tells them apart -- 264 bits, one per daemon
+/// -- so where there is one, identity is what gets checked rather than
+/// liveness.
 async function forwardUsable(server) {
   if (!(await canConnect(localPortOf(server)))) return false;
   if (!server.provisioned) return true;
-  const ping = await daemonGet(server, '/v1/ping', { auth: false, timeout: 5000 });
-  return !!(ping && ping.ok);
+  const token = daemonToken(server);
+  if (!token) {
+    const ping = await daemonGet(server, '/v1/ping', { auth: false, timeout: 5000 });
+    return !!(ping && ping.ok);
+  }
+  const health = await daemonGet(server, '/v1/health', { timeout: 5000 });
+  return !!(health && health.revision);
+}
+
+/// A local port this forward can have to itself.
+///
+/// The configured one is preferred and is usually free, because it matches
+/// the remote port and most people run one daemon per machine. When something
+/// else is already on it -- a daemon of this Mac's own, another server's
+/// forward -- walking forward beats failing with "address already in use",
+/// and beats far more the previous behaviour of quietly using whatever was
+/// answering.
+async function freeLocalPort(server) {
+  const want = localPortOf(server);
+  if (!(await canConnect(want))) return want;
+  for (let port = want + 1; port < want + 40; port++) {
+    if (!(await canConnect(port))) return port;
+  }
+  throw new Error(`no free local port near ${want} for the forward to ${server.name || server.sshHost}`);
 }
 
 function canConnect(port) {
@@ -605,10 +638,18 @@ function canConnect(port) {
 }
 
 async function startTunnel(server) {
-  const port = localPortOf(server);
-  if (await forwardUsable(server)) return { port, reused: true };
-  // Whatever is holding the port cannot reach the daemon; clear it out first.
+  if (await forwardUsable(server)) return { port: localPortOf(server), reused: true };
+  // Whatever is holding the port cannot reach this daemon; clear out anything
+  // of ours, then find a port that is actually free -- what is left may not be
+  // ours to move.
   await stopTunnel(server);
+  const port = await freeLocalPort(server);
+  if (port !== localPortOf(server)) {
+    const cfg = readConfig();
+    const entry = (cfg.servers || []).find(x => x.id === server.id);
+    if (entry) { entry.localPort = port; writeConfig(cfg); }
+    server.localPort = port;
+  }
 
   const args = [...sshArgs(server), '-N', '-T',
                 '-L', `127.0.0.1:${port}:127.0.0.1:${server.remotePort}`,
@@ -1812,5 +1853,6 @@ async function ensureLocalServer() {
 module.exports = {
   route, readConfig, daemonBase, daemonToken, providerKey, expandTilde,
   buildProvisionScript, webPayload, providerSecrets, provision, shutdown,
+  forwardUsable,
   ensureLocalServer,
 };

@@ -86,6 +86,10 @@ step "SSH provisioning payload (exact file bytes)"
 node tests/provision-upload_test.cjs
 result $? "provision-upload_test.cjs"
 
+step "forward identity (a port answering is not the daemon you meant)"
+node tests/forward_identity_test.cjs >/dev/null 2>&1
+result $? "forward_identity_test.cjs"
+
 step "detached engines (survive a daemon restart)"
 python3 tests/detach_test.py --home "$HOME_DIR/detach" >/dev/null 2>&1
 result $? "detach_test.py"
