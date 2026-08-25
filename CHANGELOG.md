@@ -122,6 +122,15 @@ forward:
   anywhere on this Mac. The pane is not offered to a console reached through
   the gateway, which would be offering to reconfigure the thing you arrived
   through.
+- **The composer does not default to a mode the server will refuse.** On a
+  daemon running as root the configured default is Full access, which Claude
+  Code will not run there — so every new session began with a refusal. A
+  refusal is the right answer to an explicit choice and the wrong one to a
+  default nobody made, so the default steps down to Workspace write. Choosing
+  Full access by hand still gets the explanation. Read from the daemon's own
+  health, which arrives when the server connects: the readiness report is only
+  gathered while the Servers pane is open, and the composer needs an answer
+  before that.
 - **A root daemon says so before the turn, not during it.** `bypassPermissions`
   is `--dangerously-skip-permissions` underneath, and Claude Code refuses it
   under a uid of 0 — so on a daemon provisioned as root the default permission

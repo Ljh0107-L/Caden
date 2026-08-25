@@ -953,6 +953,9 @@ async function status(server) {
     ]);
     out.daemonVersion = health?.version || null;
     out.daemonRevision = health?.revision || null;
+    // A daemon running as root cannot run Full access; the composer reads
+    // this so it does not default to a mode that will be refused.
+    out.root = !!health?.root;
     if (engines?.engines) {
       out.engines = {
         claude: engines.engines.claude || { installed: false },

@@ -54,7 +54,7 @@ const state = {
   serverStatus: new Map(),     // id -> readiness report from /host/servers/<id>/status
   serverBusy: new Map(),       // id -> what a running action is doing
   sshHosts: [],                // candidates parsed out of ~/.ssh/config
-  draft: { cwd: '', modelId: null, permissionMode: '' },
+  draft: { cwd: '', modelId: null, permissionMode: '', permissionModeChosen: false },
   editing: false,          // an inline editor owns the keyboard right now
   sidebarStale: false,     // a repaint was skipped while it did
   web: null,               // the gateway's settings and state, once fetched
@@ -2438,7 +2438,13 @@ function renderDraft() {
   const [serverId, entry] = chosen;
   const d = state.draft;
   if (!d.modelId) d.modelId = models()[0]?.id;
-  if (!d.permissionMode) d.permissionMode = state.config.defaults.permissionMode || 'bypassPermissions';
+  // Re-derived until somebody picks one: `facts` arrives a round trip after
+  // the first paint, so a mode settled on the first render would be settled
+  // before the answer got here.
+  if (!d.permissionModeChosen || d.serverId !== serverId) {
+    d.permissionMode = defaultPermissionFor(entry);
+    d.permissionModeChosen = false;
+  }
   if (!d.cwd || d.serverId !== serverId) {
     d.serverId = serverId;
     const recent = (entry.sessions || [])
@@ -2497,6 +2503,7 @@ function renderDraft() {
     onSend: (text, images) => startSession(text, images),
     onShiftTab: () => {
       d.permissionMode = d.permissionMode === 'plan' ? 'bypassPermissions' : 'plan';
+      d.permissionModeChosen = true;
       renderMain();
     },
     // Attachments only: the workspace chip above the composer already owns the
@@ -2508,7 +2515,8 @@ function renderDraft() {
       label: () => permLabel(d.permissionMode),
       onMenu: anchor => openMenu(anchor, PERMISSIONS.map(pm => ({
         label: pm.label, checked: pm.value === d.permissionMode,
-        action: () => { d.permissionMode = pm.value; renderMain(); },
+        action: () => { d.permissionMode = pm.value;
+                        d.permissionModeChosen = true; renderMain(); },
       }))),
     },
     onModelMenu: anchor => openMenu(anchor,
@@ -2786,6 +2794,23 @@ const setBusy = (id, text) => {
   renderServersPane();
 };
 
+/// The configured default, unless the server it would run on cannot take it.
+///
+/// Claude Code refuses Full access under a uid of 0, so on a daemon running
+/// as root the configured default is a refusal on every new session. A
+/// refusal is the right answer to an explicit choice and the wrong one to a
+/// default nobody made, so the default steps down. Choosing Full access by
+/// hand still gets the explanation.
+///
+/// From `facts`, which is the daemon's own /v1/health and is fetched when the
+/// server connects -- the readiness report is only gathered when the Servers
+/// pane is open, and the composer needs an answer before that.
+function defaultPermissionFor(entry) {
+  const want = state.config.defaults.permissionMode || 'bypassPermissions';
+  if (want !== 'bypassPermissions') return want;
+  return entry?.facts?.root ? 'acceptEdits' : want;
+}
+
 /// The same report, assembled from the daemon instead of from a host.
 ///
 /// /host/servers/<id>/status is the Mac answering questions it is uniquely
@@ -2805,6 +2830,9 @@ async function statusFromDaemon(entry) {
   return {
     daemon: true,
     token: true,
+    // Claude Code will not run Full access here, so the composer must not
+    // offer it as the default it never asked anyone about.
+    root: !!health?.root,
     daemonVersion: health?.version || null,
     daemonRevision: health?.revision || null,
     engines: {
