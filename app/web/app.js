@@ -3372,13 +3372,16 @@ function renderWebPane() {
         el('span', { class: 'prov-url' }, w.hostname ? `https://${w.hostname}/` : '')),
       acts), state_));
 
-  // -- which servers the phone can actually reach ----------------------
+  // -- which servers the phone can reach -------------------------------
   //
-  // A server is reachable because its daemon is on the gateway, or because it
-  // has dialled a tunnel there. Provisioning a server sets its tunnel up on
-  // its own; this is for the ones that were already there when the gateway
-  // was, and for repairing one that has stopped.
+  // Every server this Mac knows is listed; being on the web is a decision
+  // made here, one server at a time. Provisioning used to do it as a parting
+  // errand, which meant setting up a machine reached out to a third host and
+  // a gateway that was down turned into a warning on an operation that had
+  // otherwise gone perfectly. Adding a server and publishing it are different
+  // things to want.
   const reach = w.reach || {};
+  const held = w.how || {};
   const rows = el('div', { class: 'prov-card' });
   const listed = (w.servers || []).filter(s => reach[s.id] !== 'local');
   if (!listed.length) {
@@ -3386,14 +3389,21 @@ function renderWebPane() {
   }
   for (const s of listed) {
     const how = reach[s.id];
-    const mark = how === 'gateway' || how === 'tunnel' ? 'ok'
+    // A tunnel nothing supervises answers exactly like a supervised one until
+    // the machine restarts, so it is its own state rather than a tick.
+    const bare = how === 'tunnel' && held[s.id] === 'nohup';
+    const mark = how === 'gateway' ? 'ok'
+               : how === 'tunnel' ? (bare ? 'warn' : 'ok')
                : how === 'down' ? 'bad' : 'none';
     const detail = how === 'gateway' ? 'its daemon is on the proxy itself'
-      : how === 'tunnel' ? 'reached through the tunnel it opens'
+      : bare ? 'reachable, but nothing on that machine will restart the tunnel '
+               + '— it has no systemd user session and no cron, so a reboot ends it'
+      : how === 'tunnel' ? `reached through the tunnel it opens${
+          held[s.id] === 'cron' ? ' — kept alive by cron' : ''}`
       : how === 'down' ? 'has a tunnel, but nothing is answering on it'
-      : 'not reachable from the proxy yet';
+      : 'not on the web — add it here';
     const act = how === 'gateway' ? null
-      : srvBtn(how === 'none' ? 'Connect' : 'Reconnect',
+      : srvBtn(how === 'none' ? 'Add' : 'Reconnect',
                () => webConnect(s.id, s.name),
                how === 'none' ? 'accent' : undefined);
     rows.append(srvLine(mark, s.name, detail, act));
@@ -3401,8 +3411,9 @@ function renderWebPane() {
   body.append(el('div', { class: 'prov-section' },
     el('div', { class: 'prov-title-row' },
       el('div', { class: 'prov-id' },
-        el('span', { class: 'prov-name' }, 'Servers'),
-        el('span', { class: 'prov-url' }, 'each one dials the proxy; the proxy never dials back'))),
+        el('span', { class: 'prov-name' }, 'Servers on the web'),
+        el('span', { class: 'prov-url' },
+           'each one dials the proxy; the proxy never dials back'))),
     rows));
 
   paintPane('Web',

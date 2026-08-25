@@ -90,6 +90,10 @@ step "removing a server (its tunnel and its port go with it)"
 node tests/web_removal_test.cjs >/dev/null 2>&1
 result $? "web_removal_test.cjs"
 
+step "tunnel launchers (whatever the machine has, and saying when it has none)"
+node tests/tunnel_launcher_test.cjs >/dev/null 2>&1
+result $? "tunnel_launcher_test.cjs"
+
 step "forward identity (a port answering is not the daemon you meant)"
 node tests/forward_identity_test.cjs >/dev/null 2>&1
 result $? "forward_identity_test.cjs"

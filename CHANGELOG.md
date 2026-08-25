@@ -3,6 +3,37 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 until 1.0 the minor number carries breaking changes.
 
+## 0.2.1
+
+Two things a devbox found.
+
+- **Whatever a machine has, the tunnel gets held open by it.** Caden wrote a
+  systemd user unit, called `systemctl --user restart`, and took the failure
+  as the end of the story. A container-shaped devbox has no user bus at all —
+  `systemctl --user` answers "Failed to connect to bus: No medium found" — and
+  some of those have no `crontab` either, so on those hosts the tunnel
+  silently did not exist while provisioning reported success and the console
+  showed a 502 with nothing anywhere saying why. It is a ladder now: systemd,
+  then a cron `@reboot` line with a watchdog beside it, then the process
+  started bare. A rung that cannot apply is skipped; one that applies and
+  fails falls through to the next. `supervise.sh` has always done exactly this
+  for the daemon, down to giving up gracefully when neither exists — the
+  tunnel simply never learned it.
+- **A tunnel nothing will restart says so.** The last rung reaches the gateway
+  exactly as well as the other two until the machine reboots, which makes a
+  tick the wrong thing to draw: the pane says the tunnel is up and that
+  nothing on that machine will bring it back. And when no rung takes at all,
+  that is an error naming every one that was tried, in the pane, rather than a
+  silence to be discovered later as a 502.
+- **Setting a server up is not publishing it.** Provisioning ended by wiring
+  the new server into the web gateway, so adding a machine reached out to a
+  third host, and a gateway that was down turned into a warning on an
+  operation that had otherwise gone perfectly. Adding a server and putting it
+  on the web are different things to want, and they are two decisions now: the
+  Servers pane gets a machine talking to this Mac, and the Web pane is where
+  you pick which of them the phone can reach. `scripts/provision.sh` stops at
+  the same place, so both ways round still agree on what "provisioned" means.
+
 ## 0.2.0
 
 Caden on a phone.

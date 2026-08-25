@@ -370,16 +370,31 @@ async function revokeTunnel(server, onStep = () => {}) {
     ].join('\n')).catch(() => {});
   }
 
+  // Every mechanism, not the one we think is in use: which rung took is
+  // recorded, but a server that has been re-connected a few times can carry
+  // leftovers from the others, and each of these is a no-op when it is not
+  // there.
   onStep('stopping the tunnel on the server…');
-  await provisionShell(server)(
-    'systemctl --user disable --now caden-tunnel.service >/dev/null 2>&1 || true; '
-    + 'rm -f ~/.config/systemd/user/caden-tunnel.service ~/.ssh/caden-tunnel ~/.ssh/caden-tunnel.pub; '
-    + 'systemctl --user daemon-reload >/dev/null 2>&1 || true',
-    { timeout: 20000 }).catch(() => {});
+  const port = web.tunnels[server.id];
+  await provisionShell(server)([
+    'systemctl --user disable --now caden-tunnel.service >/dev/null 2>&1 || true',
+    'rm -f ~/.config/systemd/user/caden-tunnel.service',
+    'systemctl --user daemon-reload >/dev/null 2>&1 || true',
+    '(crontab -l 2>/dev/null | grep -v caden-tunnel.sh || true) > ~/.caden-cron.tmp 2>/dev/null || true',
+    // An empty crontab is worth removing rather than installing; the same
+    // trap `supervise.sh` fell into, and for the same reason.
+    'if [ -s ~/.caden-cron.tmp ]; then crontab ~/.caden-cron.tmp; '
+    + 'else crontab -r >/dev/null 2>&1 || true; fi',
+    'rm -f ~/.caden-cron.tmp ~/.caden-tunnel.sh ~/.caden-tunnel.log',
+    port ? `pkill -f "R ${port}:127.0.0.1:" >/dev/null 2>&1 || true` : 'true',
+    'rm -f ~/.ssh/caden-tunnel ~/.ssh/caden-tunnel.pub',
+  ].join('\n'), { timeout: 25000 }).catch(() => {});
 
   const tunnels = { ...webConfig().tunnels };
+  const tunnelHow = { ...(webConfig().tunnelHow || {}) };
   delete tunnels[server.id];
-  saveWebConfig({ tunnels });
+  delete tunnelHow[server.id];
+  saveWebConfig({ tunnels, tunnelHow });
 }
 
 /// Removing a server has to reach further than this Mac.
@@ -633,16 +648,12 @@ async function provision(server, { restart = false } = {}, onStep = () => {}) {
     writeConfig(cfg);
   }
 
-  // A server that has just been set up should show up on the phone without a
-  // second errand. Everything this needs -- ssh to the machine, ssh to the
-  // gateway -- this process already has, and doing it here is the whole
-  // difference between "add a server" and "add a server, then go and wire it
-  // up somewhere else".
-  //
-  // Best effort, and it says so when it fails. The daemon is installed and
-  // working either way, and turning a successful provision into an error
-  // because a proxy elsewhere could not be reached is the wrong trade.
-  await attachToWebGateway(entry || server, onStep);
+  // Provisioning stops at the machine. Putting a server on the web is a
+  // separate decision made in the Web pane, because it is a separate thing to
+  // want: a server can be one this Mac talks to over ssh and nothing more.
+  // Wiring it up here meant every provision reached out to a third host, and
+  // a gateway that could not be reached turned into a warning on an operation
+  // that had otherwise gone perfectly.
   return { ...result, remotePort: entry ? entry.remotePort : server.remotePort };
 }
 
@@ -1572,8 +1583,9 @@ function webConfig() {
   // types a new one -- and the difference is what tells apply there is an old
   // site to take down.
   return { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
-           // serverId -> the loopback port its tunnel binds on the gateway.
-           tunnels: {}, ...(cfg.web || {}) };
+           // serverId -> the loopback port its tunnel binds on the gateway,
+           // and serverId -> what is holding that tunnel open there.
+           tunnels: {}, tunnelHow: {}, ...(cfg.web || {}) };
 }
 
 /// A gateway port for this server's tunnel, stable once chosen: the unit on
@@ -1587,6 +1599,17 @@ function tunnelPortFor(serverId) {
   while (taken.has(port)) port++;
   saveWebConfig({ tunnels: { ...web.tunnels, [serverId]: port } });
   return port;
+}
+
+/// How a server's tunnel is held open, once we know. Kept beside the port
+/// rather than in it: `tunnels` is read as `serverId -> port` in four places,
+/// and the pane needs the mechanism to say whether it survives a reboot.
+function rememberTunnel(serverId, port, how) {
+  const web = webConfig();
+  saveWebConfig({
+    tunnels: { ...web.tunnels, [serverId]: port },
+    tunnelHow: { ...(web.tunnelHow || {}), [serverId]: how },
+  });
 }
 
 function saveWebConfig(patch) {
@@ -1774,49 +1797,161 @@ async function setupTunnel(server, onStep = () => {}) {
     'chmod 600 ~/.ssh/authorized_keys.tmp && mv -f ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys',
   ].join('\n'));
 
-  onStep('installing the tunnel service…');
   const remotePort = server.remotePort || DEFAULT_PORT;
-  const unit = `[Unit]
-Description=Caden tunnel to the web gateway
-After=network-online.target
-
-[Service]
-ExecStart=/usr/bin/ssh -N -T -i %h/.ssh/caden-tunnel \\
-    -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \\
-    -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new \\
-    -o IdentitiesOnly=yes -p ${gw.port} \\
-    -R ${port}:127.0.0.1:${remotePort} ${gw.user}@${gw.host}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-`;
-  const marker = `__CADEN_${require('crypto').randomBytes(9).toString('hex')}__`;
-  await sh([
-    'set -eu',
-    'mkdir -p ~/.config/systemd/user',
-    `cat > ~/.config/systemd/user/caden-tunnel.service <<'${marker}'`,
-    unit.replace(/\n$/, ''),
-    marker,
-    'systemctl --user daemon-reload',
-    'systemctl --user enable caden-tunnel.service >/dev/null 2>&1 || true',
-    'systemctl --user restart caden-tunnel.service',
-    // Best effort, and it is refused on hosts where the user has no polkit
-    // rights -- there the tunnel starts on first login, like the daemon it
-    // serves already does.
-    'loginctl enable-linger "$(whoami)" >/dev/null 2>&1 || true',
-  ].join('\n'));
+  // The command itself, identical whichever thing ends up holding it open.
+  // `ExitOnForwardFailure` is what makes a launcher's success mean something:
+  // without it ssh stays connected after the remote bind is refused, and every
+  // rung below would report a tunnel that forwards nothing.
+  const cmd = `ssh -N -T -i "$HOME/.ssh/caden-tunnel" `
+    + '-o ExitOnForwardFailure=yes -o ServerAliveInterval=30 '
+    + '-o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new '
+    + `-o IdentitiesOnly=yes -p ${gw.port} `
+    + `-R ${port}:127.0.0.1:${remotePort} ${gw.user}@${gw.host}`;
+  const started = await startTunnelProcess(server, sh, cmd, port, onStep);
 
   onStep('checking the gateway can reach it…');
   for (let i = 0; i < 20; i++) {
     await sleep(500);
     const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`);
-    if (/"ok"\s*:\s*true/.test(probe.stdout)) return { port };
+    if (/"ok"\s*:\s*true/.test(probe.stdout)) {
+      rememberTunnel(server.id, port, started.how);
+      return { port, how: started.how, supervised: started.supervised };
+    }
   }
-  const why = await sh('systemctl --user status caden-tunnel.service --no-pager -n 6 2>&1 | tail -6');
-  throw new Error(`the tunnel did not come up on ${port}: ${String(why.stdout).trim().slice(0, 300)}`);
+  // Started, but the gateway cannot see it: the launcher took the command and
+  // ssh went away again. Its own diagnosis is the useful half.
+  const why = await sh(started.diagnose || 'true').catch(() => ({ stdout: '' }));
+  throw new Error(
+    `${server.name || 'the server'} started the tunnel with ${started.how} but `
+    + `nothing answered on ${port} at the gateway`
+    + (String(why.stdout).trim() ? `: ${String(why.stdout).trim().slice(0, 300)}` : ''));
 }
+
+/// Every way we know to hold a long-running command open on a server, best
+/// first. "Best" is how much it survives: a reboot, a logout, or only until
+/// something kills it.
+///
+/// This is a ladder rather than one mechanism because the mechanism is not
+/// ours to choose. A systemd user unit is the right answer and the one most
+/// hosts take; a container-shaped devbox has no user bus at all
+/// (`systemctl --user` answers "Failed to connect to bus"), and some of those
+/// have no `crontab` either. Caden used to write the unit, call
+/// `systemctl --user restart`, and take the failure as the end of the story --
+/// so on those hosts the tunnel silently did not exist while provisioning
+/// reported success, and the console showed a 502 with nothing anywhere
+/// saying why.
+///
+/// `supervise.sh` has always done this for the daemon, down to giving up
+/// gracefully when neither systemd nor cron is there. The tunnel simply never
+/// learned the same lesson.
+const TUNNEL_LAUNCHERS = [
+  {
+    how: 'systemd',
+    supervised: 'reboot',
+    // A user bus, or there is nothing to talk to. `is-system-running` answers
+    // `offline` and exits non-zero where there is none, which is exactly the
+    // case this rung has to decline rather than fail on.
+    detect: 'systemctl --user show-environment >/dev/null 2>&1',
+    install: (cmd, unitCmd) => [
+      'mkdir -p ~/.config/systemd/user',
+      `cat > ~/.config/systemd/user/caden-tunnel.service <<'CADEN_UNIT'`,
+      '[Unit]',
+      'Description=Caden tunnel to the web gateway',
+      'After=network-online.target',
+      '',
+      '[Service]',
+      `ExecStart=/bin/sh -c ${shq(unitCmd)}`,
+      'Restart=always',
+      'RestartSec=5',
+      '',
+      '[Install]',
+      'WantedBy=default.target',
+      'CADEN_UNIT',
+      'systemctl --user daemon-reload',
+      'systemctl --user enable caden-tunnel.service >/dev/null 2>&1 || true',
+      'systemctl --user restart caden-tunnel.service',
+      // Refused where the user has no polkit rights; there the tunnel comes
+      // back on first login, like the daemon it serves already does.
+      'loginctl enable-linger "$(whoami)" >/dev/null 2>&1 || true',
+    ].join('\n'),
+    diagnose: 'systemctl --user status caden-tunnel.service --no-pager -n 6 2>&1 | tail -6',
+  },
+  {
+    how: 'cron',
+    supervised: 'reboot',
+    detect: 'command -v crontab >/dev/null 2>&1',
+    // `@reboot` brings it back, and the minute line is the watchdog: the
+    // keepalive script is a no-op while the tunnel is alive, so running it
+    // every minute costs nothing and covers a tunnel that died in between.
+    install: (cmd, unitCmd, keep) => [
+      `cat > ~/.caden-tunnel.sh <<'CADEN_KEEP'`,
+      keep,
+      'CADEN_KEEP',
+      'chmod 700 ~/.caden-tunnel.sh',
+      // Our two lines, replaced rather than accumulated.
+      '(crontab -l 2>/dev/null | grep -v caden-tunnel.sh || true) > ~/.caden-cron.tmp',
+      `printf '@reboot %s\\n' "$HOME/.caden-tunnel.sh" >> ~/.caden-cron.tmp`,
+      `printf '* * * * * %s\\n' "$HOME/.caden-tunnel.sh" >> ~/.caden-cron.tmp`,
+      'crontab ~/.caden-cron.tmp && rm -f ~/.caden-cron.tmp',
+      '~/.caden-tunnel.sh',
+    ].join('\n'),
+    diagnose: 'tail -6 ~/.caden-tunnel.log 2>/dev/null',
+  },
+  {
+    how: 'nohup',
+    // Honest about what it is: the process outlives the ssh session that
+    // started it and nothing more. Worth having as the last rung, because a
+    // tunnel that works until the next reboot is worth a great deal more than
+    // no tunnel -- but the pane has to say so rather than draw a tick.
+    supervised: 'none',
+    detect: 'true',
+    install: (cmd, unitCmd, keep) => [
+      `cat > ~/.caden-tunnel.sh <<'CADEN_KEEP'`,
+      keep,
+      'CADEN_KEEP',
+      'chmod 700 ~/.caden-tunnel.sh',
+      '~/.caden-tunnel.sh',
+    ].join('\n'),
+    diagnose: 'tail -6 ~/.caden-tunnel.log 2>/dev/null',
+  },
+];
+
+/// Try each launcher in turn until one of them starts the tunnel.
+///
+/// Detection and starting are separate questions: a rung that cannot apply
+/// here is skipped quietly, while one that applies and then fails is worth
+/// saying out loud, because that is a host where the expected thing broke.
+async function startTunnelProcess(server, sh, cmd, port, onStep) {
+  // Restarts the tunnel unless it is already running, so it is safe as both
+  // the starter and the every-minute watchdog. `pgrep -f` on the exact remote
+  // port is what tells this tunnel from any other ssh on the box.
+  const keep = [
+    '#!/bin/sh',
+    '# Written by Caden. Starts the web-gateway tunnel unless it is up.',
+    `pgrep -f "R ${port}:127.0.0.1:" >/dev/null 2>&1 && exit 0`,
+    `exec setsid nohup ${cmd} >> "$HOME/.caden-tunnel.log" 2>&1 &`,
+  ].join('\n');
+
+  const tried = [];
+  for (const l of TUNNEL_LAUNCHERS) {
+    const ok = await sh(`${l.detect} && echo yes || echo no`).catch(() => ({ stdout: 'no' }));
+    if (!/yes/.test(String(ok.stdout))) { tried.push(`${l.how}: not available here`); continue; }
+    onStep(`starting the tunnel with ${l.how}…`);
+    try {
+      await sh(['set -eu', l.install(cmd, cmd, keep)].join('\n'));
+      return { how: l.how, supervised: l.supervised, diagnose: l.diagnose };
+    } catch (e) {
+      tried.push(`${l.how}: ${String(e.message || e).split('\n')[0].slice(0, 120)}`);
+      onStep(`${l.how} did not take, trying the next way…`);
+    }
+  }
+  throw new Error(
+    `no way to keep a tunnel open on ${server.name || 'this server'} — `
+    + `tried ${TUNNEL_LAUNCHERS.map(l => l.how).join(', ')}. ${tried.join('; ')}`);
+}
+
+/// Shell-quote a string for use inside single quotes.
+const shq = v => `'${String(v).replace(/'/g, `'\\''`)}'`;
 
 /// Set the gateway up, or bring it in line with the settings. Idempotent:
 /// this is also how you apply a changed hostname or a new server.
@@ -1991,29 +2126,6 @@ async function applyWebGateway(onStep = () => {}) {
 
 /// Put a freshly provisioned server on the phone.
 ///
-/// Called from provisioning rather than left as a second errand, because
-/// everything it needs -- ssh to the machine, ssh to the gateway -- is
-/// already here. Also called by scripts/provision.sh, so that a server set up
-/// from a terminal ends up in the same state as one set up from the app;
-/// "provisioned" meaning two different things is how the two drift.
-///
-/// Best effort, and it says what did not happen. The daemon is installed and
-/// working whether or not a proxy elsewhere could be reached.
-async function attachToWebGateway(server, onStep = () => {}) {
-  const web = webConfig();
-  if (!web.hostname || !web.gatewayHost) return;
-  try {
-    if (server && server.id !== web.serverId && !isLocalServer(server)) {
-      onStep('connecting it to the web gateway…');
-      await setupTunnel(server, onStep);
-    }
-    onStep('bringing the web gateway in line…');
-    await applyWebGateway(onStep);
-  } catch (e) {
-    onStep(`the daemon is up; the web gateway was not updated: ${String(e.message || e)}`);
-  }
-}
-
 /// Whether the console has a password yet, and whether the address answers.
 async function webStatus() {
   const web = webConfig();
@@ -2034,6 +2146,10 @@ async function webStatus() {
       .catch(() => null);
     out.reach[s.id] = probe && /"ok"\s*:\s*true/.test(probe.stdout) ? 'tunnel' : 'down';
   }
+  // What is holding each tunnel open. `nohup` reaches the gateway exactly as
+  // well as the others until the machine restarts, so the difference has to
+  // be said rather than left to a tick that means two things.
+  out.how = { ...(web.tunnelHow || {}) };
 
   const server = servers.find(s => s.id === web.serverId);
   if (server) {
@@ -2123,6 +2239,10 @@ async function ensureLocalServer() {
 module.exports = {
   route, readConfig, daemonBase, daemonToken, providerKey, expandTilde,
   buildProvisionScript, webPayload, providerSecrets, provision, shutdown,
-  forwardUsable, attachToWebGateway, removeServer,
+  forwardUsable, removeServer,
   ensureLocalServer,
+  // Reached only by the suites: the launcher ladder is worth testing against
+  // fake machines, and copying it into the test would make the copy the thing
+  // that goes stale.
+  __testing__: { startTunnelProcess, TUNNEL_LAUNCHERS },
 };

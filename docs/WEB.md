@@ -33,15 +33,25 @@ The proxy has a route per server, and each route needs a way to reach that
 server's daemon. One of them is easy: the daemon on the gateway itself is
 already on its loopback. The others dial out.
 
-**Provisioning does it.** Set a server up while a gateway is configured and
-Caden also gives it a key, authorises that key on the gateway for forwarding
-and nothing else, installs a service that holds the tunnel open, and brings
-the proxy's configuration in line. Nothing to do afterwards; the server is on
-the phone by the time the provision finishes.
+**The Web pane does it, one server at a time.** It lists every server this Mac
+knows, says whether the proxy can reach each one and how, and Add gives that
+server a key, authorises the key on the gateway for forwarding and nothing
+else, starts something to hold the tunnel open, and brings the proxy's
+configuration in line. The same button repairs one that has stopped.
 
-The Web pane lists what the proxy can reach and why, and has a button for the
-servers that were already there when the gateway was — and for repairing one
-that has stopped answering.
+Provisioning deliberately does not do this. Setting a machine up and putting
+it on the web are different things to want — a server can be one this Mac
+talks to over ssh and nothing more — and wiring it up as a parting errand
+meant adding a machine reached out to a third host, where a gateway that was
+down turned into a warning on an operation that had gone perfectly.
+
+**What holds the tunnel open depends on the machine**, so Caden tries in
+order: a systemd user unit, then a cron `@reboot` line with a watchdog beside
+it, then the process started bare. The last of those reaches the gateway
+exactly as well as the other two until the machine reboots, and the pane says
+so rather than drawing a tick that would mean two different things. A host
+where no rung takes — no user bus, no cron, nothing — gets an error naming
+each one that was tried.
 
 The direction matters and is worth saying again: the server dials the gateway.
 The gateway holds no key for it, never connects to it, and the server needs no
@@ -129,7 +139,9 @@ process being asked to check it.
 scripts/web-gateway.cjs caden.example.net
 ```
 
-It prints the same nginx block, a systemd unit per tunnelled server, and the
+It prints the same nginx block, a systemd unit per tunnelled server (the first
+rung; a host without a user bus is the app's business, not this script's), and
+the
 `host/config` the console reads, with the tokens filled in. It applies
 nothing; read it, then paste it.
 
