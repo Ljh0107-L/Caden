@@ -165,6 +165,26 @@ const load = () => {
   check('and the reason survives into the step stream',
         /EPIPE/.test(r.stderr), JSON.stringify(r.stderr.trim().slice(0, 60)));
 
+  // 8. A run ends when the command ends, not when its timeout expires.
+  //
+  //    The EPIPE handler above was added by replacing this block, and the
+  //    replacement dropped `child.on('close', finish)` -- so every run
+  //    resolved on its timeout instead. Nothing failed, everything just took
+  //    the longest it was allowed to: a status check with its answer in half
+  //    a second sat for 25s, and a finished provision held "uploading daemon
+  //    files…" on screen for the full 240s. Both read as a hang.
+  //
+  //    The EPIPE check above cannot catch this -- it resolves through the
+  //    stdin handler and so passes either way. This is the one that would
+  //    have.
+  const t0 = Date.now();
+  const quick = await host.__testing__.run('sh', ['-c', 'echo hi'], { timeout: 25000 });
+  const took = Date.now() - t0;
+  check('a run resolves when the command exits, not on its timeout',
+        took < 2000, `${took}ms of an allowed 25000`);
+  check('and carries what the command said', quick.stdout.trim() === 'hi'
+        && quick.code === 0, JSON.stringify(quick.stdout));
+
   console.log(failed ? '\ntunnel launcher: FAILED' : '\ntunnel launcher: OK');
   process.exit(failed ? 1 : 0);
 })();

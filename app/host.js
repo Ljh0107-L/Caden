@@ -199,6 +199,12 @@ function run(cmd, args, { input, timeout = 60000 } = {}) {
     child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
     child.on('error', e => { stderr += String(e.message); finish(-1); });
+    // The ordinary way a run ends. Dropped once while the handler below was
+    // being added, which left every `run` resolving on its timeout instead:
+    // a status check that had its answer in half a second sat there for the
+    // full 25s, and a provision that had finished held the step on screen for
+    // the whole 240s it was allowed. Both read as a hang, and both were.
+    child.on('close', finish);
     // `child.on('error')` is the process's, not the pipe's. When the far end
     // goes away mid-write -- an ssh that timed out, a proxy that dropped the
     // connection, a remote shell that exited early -- `stdin` emits EPIPE, and
