@@ -28,6 +28,10 @@ const SUPPORT = flavor.support;
 const CONFIG_PATH = process.env.CADEN_CONFIG || path.join(SUPPORT, 'config.json');
 const CONTROL_DIR = flavor.controlDir;
 const DAEMON_DIR = path.join(__dirname, '..', 'server');
+const WEB_DIR = path.join(__dirname, 'web');
+/// Everything else under web/ is source text and rides the same heredoc the
+/// daemon does. These cannot: a woff2 through a heredoc is not a woff2.
+const WEB_BINARY = /\.(woff2?|png|jpe?g|gif|ico)$/i;
 const KEYCHAIN_SERVICE = flavor.keychainService;
 const REMOTE_HOME = flavor.remoteHome;
 
@@ -218,6 +222,14 @@ function ssh(server, command, opts = {}) {
 
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
+/// A daemon on this Mac's own loopback. The one server a gateway cannot use,
+/// because a gateway is what you set up so the Mac can be closed.
+function isLocalServer(s) {
+  if (s.sshHost) return false;
+  try { return LOOPBACK.has(new URL(s.directURL || '').hostname); }
+  catch { return false; }
+}
+
 /// A shell on the machine the daemon runs on, which is what provisioning
 /// needs: it copies files there and runs bootstrap. An ssh server gets ssh; a
 /// `direct` server pointed at loopback is this machine, so it gets a local
@@ -335,14 +347,73 @@ function addServer(alias) {
   return entry;
 }
 
-function removeServer(id) {
+/// Take away a server's way in to the gateway.
+///
+/// The gateway end first, and deliberately: it is the end that grants access,
+/// and it works whether or not the machine being removed still answers. The
+/// service on the machine is stopped afterwards as a courtesy -- with the
+/// key gone it can no longer connect anyway, and a machine being removed is
+/// often a machine that has gone.
+async function revokeTunnel(server, onStep = () => {}) {
+  const web = webConfig();
+  if (!web.tunnels[server.id]) return;
+
+  if (web.gatewayHost) {
+    onStep('withdrawing its key from the gateway…');
+    const tag = `caden-tunnel:${server.id}`;
+    await gatewayShell(web.gatewayHost)([
+      'set -eu',
+      'test -f ~/.ssh/authorized_keys || exit 0',
+      `grep -v ' ${tag}$' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true`,
+      'chmod 600 ~/.ssh/authorized_keys.tmp',
+      'mv -f ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys',
+    ].join('\n')).catch(() => {});
+  }
+
+  onStep('stopping the tunnel on the server…');
+  await provisionShell(server)(
+    'systemctl --user disable --now caden-tunnel.service >/dev/null 2>&1 || true; '
+    + 'rm -f ~/.config/systemd/user/caden-tunnel.service ~/.ssh/caden-tunnel ~/.ssh/caden-tunnel.pub; '
+    + 'systemctl --user daemon-reload >/dev/null 2>&1 || true',
+    { timeout: 20000 }).catch(() => {});
+
+  const tunnels = { ...webConfig().tunnels };
+  delete tunnels[server.id];
+  saveWebConfig({ tunnels });
+}
+
+/// Removing a server has to reach further than this Mac.
+///
+/// Dropping the entry left the gateway still routing to it, the console still
+/// listing it, and -- the part that matters -- a key of its own still
+/// authorised to open a tunnel in. "I removed that server" has to mean the
+/// server can no longer get in.
+async function removeServer(id, onStep = () => {}) {
+  const gone = findServer(id);
+  const web = webConfig();
+  if (gone) {
+    await revokeTunnel(gone, onStep).catch(() => {});
+    stopTunnel(gone).catch(() => {});
+  }
+
   const cfg = readConfig();
-  const gone = (cfg.servers || []).find(s => s.id === id);
   cfg.servers = (cfg.servers || []).filter(s => s.id !== id);
   writeConfig(cfg);
-  if (gone) stopTunnel(gone).catch(() => {});
   execFile('security', ['delete-generic-password', '-s', KEYCHAIN_SERVICE,
                         '-a', `server.${id}`], () => {});
+
+  if (!web.hostname || !web.gatewayHost) return;
+  if (web.serverId === id) {
+    // The console came from the one being removed, so there is nothing to
+    // rewrite the configuration around. Left as it is rather than half torn
+    // down: the address keeps working until another server is chosen.
+    saveWebConfig({ serverId: '' });
+    onStep('this was the server the console came from — pick another in the Web pane');
+    return;
+  }
+  onStep('bringing the web gateway in line…');
+  await applyWebGateway(onStep).catch(e =>
+    onStep(`the server is gone; the web gateway was not updated: ${String(e.message || e)}`));
 }
 
 const findServer = id => (readConfig().servers || []).find(s => s.id === id);
@@ -356,7 +427,28 @@ const findServer = id => (readConfig().servers || []).find(s => s.id === id);
 /// already running, which is what you want when setting a server up but means
 /// a freshly uploaded heartbeat.py would not take effect. Upgrading has to ask for
 /// the restart explicitly.
-function buildProvisionScript(home, files, port, restart) {
+/// The console's own files, for a daemon that will serve them itself.
+///
+/// Dotfiles are skipped rather than filtered by name: the one that keeps
+/// turning up is .DS_Store, and a bundle is not the place to discover the
+/// next one.
+function webPayload(dir = WEB_DIR, out = []) {
+  if (!fs.existsSync(dir)) return out;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) { webPayload(full, out); continue; }
+    out.push({
+      // Posix separators: this string becomes a path on the server.
+      name: path.relative(WEB_DIR, full).split(path.sep).join('/'),
+      binary: WEB_BINARY.test(entry.name),
+      body: fs.readFileSync(full),
+    });
+  }
+  return out;
+}
+
+function buildProvisionScript(home, files, port, restart, web = [], secrets = null) {
   const remoteHome = shellPath(home);
   // A random heredoc marker prevents a source line from terminating the file
   // early while keeping the payload independent of base64/tar availability on
@@ -375,11 +467,94 @@ function buildProvisionScript(home, files, port, restart) {
       marker,
       `chmod 700 ${remoteHome}/${name}.tmp && mv -f ${remoteHome}/${name}.tmp ${remoteHome}/${name}`,
     ]),
+    ...secretsScript(remoteHome, secrets, marker),
+    ...webScript(remoteHome, web, marker),
     `sh ${remoteHome}/bootstrap.sh --home ${remoteHome} --port ${Number(port) || DEFAULT_PORT} --supervise`
       + (restart ? ' --restart' : ''),
     '',
   ].join('\n');
   return script;
+}
+
+/// The model credentials this Mac holds, keyed by provider id.
+///
+/// A console served straight from a daemon has nothing in front of it that
+/// can turn a `key_ref` into a key -- a reverse proxy adds headers, it does
+/// not rewrite JSON bodies -- so the daemon resolves the ref itself, out of
+/// the copy this puts there.
+///
+/// Returns null rather than an empty object when the config lists providers
+/// and not one key came back. That is what a locked or unavailable keychain
+/// looks like, and writing `{}` for it would wipe working credentials off the
+/// server on the next routine upgrade.
+function providerSecrets() {
+  const providers = readConfig().providers || [];
+  const out = {};
+  for (const p of providers) {
+    const key = providerKey(p.id);
+    if (key) out[p.id] = key;
+  }
+  if (providers.length && !Object.keys(out).length) return null;
+  return out;
+}
+
+/// Writing it: 0600, and created that way rather than narrowed afterwards.
+/// `cat >` makes the file under the login's umask, which is 022 on most
+/// hosts, so without the subshell the keys are briefly world-readable at
+/// their final name.
+function secretsScript(remoteHome, secrets, marker) {
+  if (!secrets) return [];
+  const dest = `${remoteHome}/providers.json`;
+  return [
+    `(umask 077; cat > ${dest}.tmp <<'${marker}'`,
+    JSON.stringify(secrets, null, 2),
+    marker,
+    ')',
+    `chmod 600 ${dest}.tmp && mv -f ${dest}.tmp ${dest}`,
+  ];
+}
+
+/// The console half of the payload.
+///
+/// Text goes the way the daemon sources go. The two fonts have to be base64,
+/// and the comment on buildProvisionScript's heredoc explains why that is not
+/// the default: the target may be a container with no base64 to decode them
+/// with. So they are guarded rather than assumed -- a console in the fallback
+/// mono beats no console, and both beat a provisioning run that fails on a
+/// minimal host over a typeface.
+function webScript(remoteHome, web, marker) {
+  if (!web.length) return [];
+  const dirs = [...new Set(web.map(f => path.posix.dirname(f.name)))]
+    .map(d => (d === '.' ? `${remoteHome}/web` : `${remoteHome}/web/${d}`));
+  const lines = [
+    `rm -rf ${remoteHome}/web.new`,
+    ...dirs.map(d => `mkdir -p ${d.replace(`${remoteHome}/web`, `${remoteHome}/web.new`)}`),
+  ];
+  let guarded = false;
+  for (const f of web) {
+    const dest = `${remoteHome}/web.new/${f.name}`;
+    if (f.binary) {
+      if (!guarded) {
+        lines.push('if command -v base64 >/dev/null 2>&1; then');
+        guarded = true;
+      }
+      lines.push(`base64 -d > ${dest} <<'${marker}'`,
+                 f.body.toString('base64').replace(/(.{76})/g, '$1\n'),
+                 marker);
+      continue;
+    }
+    if (guarded) { lines.push('fi'); guarded = false; }
+    const text = f.body.toString('utf8');
+    lines.push(`cat > ${dest} <<'${marker}'`,
+               text.endsWith('\n') ? text.slice(0, -1) : text,
+               marker);
+  }
+  if (guarded) lines.push('fi');
+  // Swapped in whole, so a run that dies partway leaves the console that was
+  // working there rather than half of two of them.
+  lines.push(`rm -rf ${remoteHome}/web && mv ${remoteHome}/web.new ${remoteHome}/web`,
+             `chmod 700 ${remoteHome}/web`);
+  return lines;
 }
 
 async function provision(server, { restart = false } = {}, onStep = () => {}) {
@@ -407,7 +582,12 @@ async function provision(server, { restart = false } = {}, onStep = () => {}) {
     files.push({ name, body: fs.readFileSync(src, 'utf8') });
   }
 
-  const script = buildProvisionScript(home, files, server.remotePort, restart);
+  const secrets = providerSecrets();
+  if (secrets === null) {
+    onStep('no provider keys could be read — leaving the ones on the server alone');
+  }
+  const script = buildProvisionScript(home, files, server.remotePort, restart,
+                                      webPayload(), secrets);
 
   onStep('connecting over ssh…');
   onStep('uploading daemon files…');
@@ -452,6 +632,17 @@ async function provision(server, { restart = false } = {}, onStep = () => {}) {
     }
     writeConfig(cfg);
   }
+
+  // A server that has just been set up should show up on the phone without a
+  // second errand. Everything this needs -- ssh to the machine, ssh to the
+  // gateway -- this process already has, and doing it here is the whole
+  // difference between "add a server" and "add a server, then go and wire it
+  // up somewhere else".
+  //
+  // Best effort, and it says so when it fails. The daemon is installed and
+  // working either way, and turning a successful provision into an error
+  // because a proxy elsewhere could not be reached is the wrong trade.
+  await attachToWebGateway(entry || server, onStep);
   return { ...result, remotePort: entry ? entry.remotePort : server.remotePort };
 }
 
@@ -470,17 +661,50 @@ const localPortOf = s => s.localPort || s.remotePort || DEFAULT_PORT;
 /// reports a working forward as "ssh exited immediately".
 const forwardOpen = server => canConnect(localPortOf(server));
 
-/// Whether the forward actually carries traffic to the daemon.
+/// Whether the forward actually carries traffic to *this server's* daemon.
 ///
 /// An open port is not proof: a forward left over from a previous remote port
 /// still accepts locally and then resets, because ssh only discovers there is
-/// nothing to talk to once it tries to open the channel. When the daemon is
-/// supposed to be there, make the forward prove it before reusing it.
+/// nothing to talk to once it tries to open the channel.
+///
+/// Neither is a ping. Every daemon answers it, and answers it identically --
+/// so on a machine that also runs a daemon of its own, a local one holding
+/// the port looks exactly like a working forward, `startTunnel` reports the
+/// forward reused, and the app spends the rest of the session talking to the
+/// wrong machine while believing it is talking to this one. Which is what
+/// happened: This Mac's daemon on 7938 answering for a server whose forward
+/// had never been opened.
+///
+/// The token is the thing that tells them apart -- 264 bits, one per daemon
+/// -- so where there is one, identity is what gets checked rather than
+/// liveness.
 async function forwardUsable(server) {
   if (!(await canConnect(localPortOf(server)))) return false;
   if (!server.provisioned) return true;
-  const ping = await daemonGet(server, '/v1/ping', { auth: false, timeout: 5000 });
-  return !!(ping && ping.ok);
+  const token = daemonToken(server);
+  if (!token) {
+    const ping = await daemonGet(server, '/v1/ping', { auth: false, timeout: 5000 });
+    return !!(ping && ping.ok);
+  }
+  const health = await daemonGet(server, '/v1/health', { timeout: 5000 });
+  return !!(health && health.revision);
+}
+
+/// A local port this forward can have to itself.
+///
+/// The configured one is preferred and is usually free, because it matches
+/// the remote port and most people run one daemon per machine. When something
+/// else is already on it -- a daemon of this Mac's own, another server's
+/// forward -- walking forward beats failing with "address already in use",
+/// and beats far more the previous behaviour of quietly using whatever was
+/// answering.
+async function freeLocalPort(server) {
+  const want = localPortOf(server);
+  if (!(await canConnect(want))) return want;
+  for (let port = want + 1; port < want + 40; port++) {
+    if (!(await canConnect(port))) return port;
+  }
+  throw new Error(`no free local port near ${want} for the forward to ${server.name || server.sshHost}`);
 }
 
 function canConnect(port) {
@@ -492,10 +716,18 @@ function canConnect(port) {
 }
 
 async function startTunnel(server) {
-  const port = localPortOf(server);
-  if (await forwardUsable(server)) return { port, reused: true };
-  // Whatever is holding the port cannot reach the daemon; clear it out first.
+  if (await forwardUsable(server)) return { port: localPortOf(server), reused: true };
+  // Whatever is holding the port cannot reach this daemon; clear out anything
+  // of ours, then find a port that is actually free -- what is left may not be
+  // ours to move.
   await stopTunnel(server);
+  const port = await freeLocalPort(server);
+  if (port !== localPortOf(server)) {
+    const cfg = readConfig();
+    const entry = (cfg.servers || []).find(x => x.id === server.id);
+    if (entry) { entry.localPort = port; writeConfig(cfg); }
+    server.localPort = port;
+  }
 
   const args = [...sshArgs(server), '-N', '-T',
                 '-L', `127.0.0.1:${port}:127.0.0.1:${server.remotePort}`,
@@ -824,16 +1056,25 @@ async function status(server) {
 
   const ping = await daemonGet(server, '/v1/ping', { auth: false, timeout: 4000 });
   out.daemon = !!(ping && ping.ok);
-  out.daemonVersion = ping?.version || null;
-  out.daemonRevision = ping?.revision || null;
+  out.daemonVersion = null;
+  out.daemonRevision = null;
   out.bundledRevision = bundledRevision;
-  // A daemon with no revision at all predates the field, so it is stale by
-  // definition -- that is exactly the build this check exists to catch.
-  out.daemonStale = !!(out.daemon && bundledRevision
-                       && out.daemonRevision !== bundledRevision);
 
   if (out.daemon && out.token) {
-    const engines = await daemonGet(server, '/v1/engines?latest=1');
+    // Which build is over there comes from the authenticated side. An
+    // unauthenticated ping answers `ok` and nothing else, so a daemon one
+    // proxy misconfiguration away from the internet does not hand a scanner
+    // its version and source revision; /v1/health carries both for a caller
+    // that can prove it belongs here.
+    const [health, engines] = await Promise.all([
+      daemonGet(server, '/v1/health'),
+      daemonGet(server, '/v1/engines?latest=1'),
+    ]);
+    out.daemonVersion = health?.version || null;
+    out.daemonRevision = health?.revision || null;
+    // A daemon running as root cannot run Full access; the composer reads
+    // this so it does not default to a mode that will be refused.
+    out.root = !!health?.root;
     if (engines?.engines) {
       out.engines = {
         claude: engines.engines.claude || { installed: false },
@@ -849,6 +1090,12 @@ async function status(server) {
       }
     }
   }
+  // A daemon that answered but reports no revision predates the field, so it
+  // is stale by definition -- that is exactly the build this check exists to
+  // catch. Without a token there is nothing to compare and nothing is
+  // claimed: "I could not ask" is not the same as "it is out of date".
+  out.daemonStale = !!(out.daemon && out.token && bundledRevision
+                       && out.daemonRevision !== bundledRevision);
   out.ready = !!(out.daemon && out.token
                  && (out.engines?.claude?.installed || out.engines?.codex?.installed));
   return out;
@@ -1042,6 +1289,21 @@ async function route(req, res, url) {
         workdir: cfg.defaultWorkdir || '~',
         permissionMode: cfg.defaultPermissionMode || 'bypassPermissions',
       },
+      // What this host can do on the renderer's behalf. Everything here needs
+      // something only a Mac running the app has -- the filesystem, ssh, the
+      // keychain, a native dialog -- so a console served from a daemon and
+      // reached through a reverse proxy declares none of it, and the renderer
+      // hides the controls rather than offering buttons that 404.
+      //
+      // Absent means none: a hand-written config for that arrangement should
+      // not have to know the list in order to be safe.
+      capabilities: {
+        servers: true,        // add and remove servers, read ~/.ssh/config
+        provisioning: true,   // install the daemon over ssh
+        tunnels: true,        // open and close the port-forwards
+        hostInstall: true,    // push an engine up using this Mac as transport
+        filePicker: true,     // the native open panel, and attach-by-path
+      },
     });
     return true;
   }
@@ -1095,6 +1357,93 @@ async function route(req, res, url) {
     return true;
   }
 
+  if (p === '/host/web/status') {
+    try { json(res, 200, await webStatus()); }
+    catch (e) { json(res, 500, { error: String(e.message || e) }); }
+    return true;
+  }
+
+  if (p === '/host/web/settings' && req.method === 'POST') {
+    const body = await readBody(req);
+    const clean = {};
+    for (const k of ['hostname', 'gatewayHost', 'serverId']) {
+      if (typeof body[k] === 'string') clean[k] = body[k].trim();
+    }
+    return json(res, 200, saveWebConfig(clean)), true;
+  }
+
+  if (p === '/host/web/apply' && req.method === 'POST') {
+    // Same streaming shape as provisioning: most of the time is spent inside
+    // one ssh command, and a blank response for a minute reads as a hang.
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+    });
+    const send = e => res.write(`${JSON.stringify(e)}\n`);
+    try {
+      const result = await applyWebGateway(text => send({ type: 'step', text }));
+      send({ type: 'done', ok: true, result });
+    } catch (e) {
+      send({ type: 'done', ok: false, error: String(e.message || e) });
+    }
+    res.end();
+    return true;
+  }
+
+  if (p === '/host/web/tunnel' && req.method === 'POST') {
+    const body = await readBody(req);
+    const server = (readConfig().servers || []).find(x => x.id === body.serverId);
+    if (!server) return json(res, 404, { error: 'no such server' }), true;
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+    });
+    const send = e => res.write(`${JSON.stringify(e)}\n`);
+    try {
+      const out = await setupTunnel(server, text => send({ type: 'step', text }));
+      send({ type: 'step', text: 'bringing the web gateway in line…' });
+      await applyWebGateway(text => send({ type: 'step', text }));
+      send({ type: 'done', ok: true, result: out });
+    } catch (e) {
+      send({ type: 'done', ok: false, error: String(e.message || e) });
+    }
+    res.end();
+    return true;
+  }
+
+  if (p === '/host/web/password' && req.method === 'POST') {
+    const body = await readBody(req);
+    const pw = String(body.password || '');
+    if (pw.length < 8) return json(res, 400, { error: 'that password is too short to be worth storing' }), true;
+    const web = webConfig();
+    const server = (readConfig().servers || []).find(x => x.id === web.serverId);
+    if (!server) return json(res, 400, { error: 'choose which server serves the console first' }), true;
+    try {
+      const home = server.remoteHome || REMOTE_HOME;
+      // Through stdin, so it is not in the process list on the way past or in
+      // a shell history afterwards.
+      await provisionShell(server)(
+        `CADEN_HOME=${home} python3 ${home}/heartbeat.py --set-web-password`,
+        { input: `${pw}\n` });
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 502, { error: String(e.message || e) }); }
+    return true;
+  }
+
+  if (p === '/host/web/logout-all' && req.method === 'POST') {
+    const web = webConfig();
+    const server = (readConfig().servers || []).find(x => x.id === web.serverId);
+    if (!server) return json(res, 400, { error: 'no console server chosen' }), true;
+    try {
+      const home = server.remoteHome || REMOTE_HOME;
+      await provisionShell(server)(
+        `curl -sS -X POST -H "Authorization: Bearer $(cat ${home}/token)" `
+        + `http://127.0.0.1:${server.remotePort || DEFAULT_PORT}/v1/web/logout-all`);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 502, { error: String(e.message || e) }); }
+    return true;
+  }
+
   if (p === '/host/files/pick' && req.method === 'POST') {
     try { json(res, 200, { files: await pickFiles() }); }
     catch (e) { json(res, 501, { error: String(e.message || e) }); }
@@ -1122,8 +1471,11 @@ async function route(req, res, url) {
     const action = seg[3];
 
     if (!action && req.method === 'DELETE') {
-      removeServer(server.id);
-      return json(res, 200, { ok: true }), true;
+      // Reaching two other machines, so it can take a moment. The renderer
+      // already awaits it.
+      try { await removeServer(server.id); json(res, 200, { ok: true }); }
+      catch (e) { json(res, 500, { error: String(e.message || e) }); }
+      return true;
     }
     if (action === 'status') {
       return json(res, 200, await status(server)), true;
@@ -1176,6 +1528,539 @@ async function route(req, res, url) {
   }
 
   return false;
+}
+
+// --------------------------------------------------------------------------
+// the web gateway
+//
+// A reverse proxy in front of one or more daemons, so a browser can reach a
+// session with this Mac switched off. Two ssh identities, because they are
+// two jobs: the gateway's nginx lives in /etc, which wants root, and the
+// daemon deliberately does not run as root -- an agent that runs arbitrary
+// commands should not be running them as one.
+//
+// nginx proxies `/` to a daemon rather than serving app/web off the gateway's
+// disk. That daemon already has the console (provisioning put it there), so
+// there is nothing to copy, nothing to keep in step, and no way for the
+// gateway's copy to drift from the protocol the daemon speaks.
+// --------------------------------------------------------------------------
+
+// One directory per hostname, not one shared one. The two installs are meant
+// to share nothing, and they can perfectly well share a gateway -- but they
+// each write a server list here, and a single path means whichever applied
+// last decides what the other's console sees.
+const WEB_ROOT_BASE = '/srv/caden-web';
+const webRoot = hostname => `${WEB_ROOT_BASE}/${hostname}`;
+
+/// Where the gateway is, as a machine somewhere else would have to say it.
+///
+/// `gatewayHost` is an alias in this Mac's ssh config, which means nothing on
+/// any other machine -- and the unit that dials the tunnel runs on the other
+/// machine. `ssh -G` resolves the alias the way ssh itself would.
+async function gatewayTarget(gatewayHost) {
+  const out = await run('ssh', ['-G', gatewayHost], { timeout: 15000 });
+  const read = key => (new RegExp(`^${key} (.+)$`, 'm').exec(out.stdout) || [])[1];
+  const host = read('hostname');
+  if (!host) throw new Error(`could not resolve the ssh alias ${gatewayHost}`);
+  return { host, user: read('user') || 'root', port: Number(read('port')) || 22 };
+}
+
+function webConfig() {
+  const cfg = readConfig();
+  // `appliedHostname` is what is actually configured on the gateway right
+  // now, which is not the same as what the settings say the moment somebody
+  // types a new one -- and the difference is what tells apply there is an old
+  // site to take down.
+  return { hostname: '', gatewayHost: '', serverId: '', appliedHostname: '',
+           // serverId -> the loopback port its tunnel binds on the gateway.
+           tunnels: {}, ...(cfg.web || {}) };
+}
+
+/// A gateway port for this server's tunnel, stable once chosen: the unit on
+/// the server and the nginx block on the gateway have to agree on it, and
+/// they are written at different times.
+function tunnelPortFor(serverId) {
+  const web = webConfig();
+  if (web.tunnels[serverId]) return web.tunnels[serverId];
+  const taken = new Set(Object.values(web.tunnels));
+  let port = 7901;
+  while (taken.has(port)) port++;
+  saveWebConfig({ tunnels: { ...web.tunnels, [serverId]: port } });
+  return port;
+}
+
+function saveWebConfig(patch) {
+  const cfg = readConfig();
+  cfg.web = { ...webConfig(), ...patch };
+  writeConfig(cfg);
+  return cfg.web;
+}
+
+/// A shell on the gateway. Not provisionShell: that one is about the machine
+/// a daemon runs on, and this is about the machine nginx runs on, which is
+/// reached as somebody who can write /etc.
+function gatewayShell(gatewayHost) {
+  if (!gatewayHost) throw new Error('no gateway host chosen');
+  return (command, opts) => ssh({ sshHost: gatewayHost }, command, opts);
+}
+
+/// One `location` per daemon, with that daemon's token added on the way past.
+/// The renderer already addresses servers as `/proxy/<id>/...`; this is the
+/// same swap app/server.js does for it locally, written as configuration.
+function webProxyBlocks(servers, ports) {
+  return servers.map(s => {
+    const port = ports.get(s.id);
+    return [
+      `    # ${(s.name || s.sshHost || s.id).replace(/[\r\n]/g, ' ')}`,
+      `    location /proxy/${s.id}/ {`,
+      `        proxy_pass http://127.0.0.1:${port}/;`,
+      `        proxy_set_header Authorization "Bearer ${daemonToken(s)}";`,
+      '        proxy_http_version 1.1;',
+      '        proxy_set_header Connection "";',
+      '        # An event stream that nginx buffers does not fail, it hangs --',
+      '        # and looks exactly like a daemon that died.',
+      '        proxy_buffering off;',
+      '        proxy_read_timeout 3600s;',
+      '        client_max_body_size 64m;',
+      '    }',
+    ].join('\n');
+  }).join('\n\n');
+}
+
+function webSiteConfig({ hostname, consolePort, servers, ports, consoleToken }) {
+  return `# Written by Caden. Edits here are replaced the next time the Web
+# pane applies its settings.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name ${hostname};
+
+    # Named rather than left to certbot. This file is rewritten on every
+    # apply, so anything certbot inserted into the previous one is gone --
+    # which is exactly how the first version of this took the site down: a
+    # server block with no listener, accepted by nginx -t, answering nothing.
+    ssl_certificate     /etc/letsencrypt/live/${hostname}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${hostname}/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    limit_req zone=caden burst=50 nodelay;
+    limit_req_status 429;
+
+    # Checked before anything is served, including the routes that proxy to
+    # other machines -- those never reach the daemon that owns the session, so
+    # a check living only in a daemon would not cover them.
+    auth_request /_caden_verify;
+    error_page 401 = @caden_login;
+
+    location = /_caden_verify {
+        internal;
+        proxy_pass http://127.0.0.1:${consolePort}/v1/web/verify;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+    location @caden_login { return 302 /login?next=$request_uri; }
+
+    # Signing in cannot require being signed in.
+    location = /login {
+        auth_request off;
+        proxy_pass http://127.0.0.1:${consolePort}/login;
+        proxy_set_header Host $host;
+    }
+    location = /v1/web/login {
+        auth_request off;
+        proxy_pass http://127.0.0.1:${consolePort}/v1/web/login;
+        proxy_set_header Host $host;
+    }
+    location = /v1/web/logout {
+        auth_request off;
+        proxy_pass http://127.0.0.1:${consolePort}/v1/web/logout;
+        proxy_set_header Host $host;
+    }
+
+    # The server list. A file, because nothing on this side generates one.
+    location = /host/config {
+        root ${webRoot(hostname)};
+        default_type application/json;
+        add_header Cache-Control "no-cache" always;
+    }
+    # Everything else under /host/ is the desktop app's control plane and does
+    # not exist here. Saying 404 beats letting the console below answer with
+    # index.html, which the renderer then fails to parse as JSON.
+    location /host/ { return 404; }
+
+${webProxyBlocks(servers, ports)}
+
+    # The console itself, from the daemon that already has it -- so there is
+    # no second copy on this machine to fall out of step.
+    location / {
+        proxy_pass http://127.0.0.1:${consolePort}/;
+        proxy_set_header Authorization "Bearer ${consoleToken}";
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+    }
+}
+
+# Plain HTTP exists only to send people to the other one, and to carry the
+# ACME challenge when the certificate is renewed.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${hostname};
+    location /.well-known/acme-challenge/ { root ${webRoot(hostname)}; }
+    location / { return 301 https://$host$request_uri; }
+}
+`;
+}
+
+/// What the console reads instead of asking a host process, because behind a
+/// proxy there is no host process. No capabilities: nothing here can add a
+/// server, run ssh or raise a file dialog.
+function webHostConfig(servers) {
+  const cfg = readConfig();
+  return JSON.stringify({
+    servers: servers.map(s => ({ id: s.id, name: s.name || s.sshHost || s.id,
+                                 mode: 'direct', provisioned: true })),
+    models: cfg.models || [],
+    providers: (cfg.providers || []).map(({ apiKey, ...rest }) => ({ ...rest, hasKey: true })),
+    defaults: {
+      workdir: cfg.defaultWorkdir || '~',
+      permissionMode: cfg.defaultPermissionMode || 'bypassPermissions',
+    },
+    capabilities: {},
+  }, null, 2);
+}
+
+/// Give a server a tunnel to the gateway, so the proxy can reach its daemon.
+///
+/// The direction is the whole point: the server dials out. The gateway never
+/// connects to it, needs no key for it, and the server needs no public
+/// address and no hole in a firewall. `ssh -R` binds the far end on 127.0.0.1,
+/// so nothing but nginx can reach what comes out of it.
+///
+/// Idempotent -- it is also how a tunnel gets repaired after the gateway
+/// moves or the port changes.
+async function setupTunnel(server, onStep = () => {}) {
+  const { gatewayHost } = webConfig();
+  if (!gatewayHost) throw new Error('set the gateway up first');
+  const port = tunnelPortFor(server.id);
+  const gw = await gatewayTarget(gatewayHost);
+  const sh = provisionShell(server);
+  const gwSh = gatewayShell(gatewayHost);
+
+  // A key of its own, not the one the person uses. Revoking a tunnel should
+  // not be a decision about anything else, and the entry it goes into on the
+  // gateway is deliberately allowed to do nothing but forward.
+  onStep('making a key for the tunnel…');
+  const key = await sh(
+    'set -eu; mkdir -p ~/.ssh; chmod 700 ~/.ssh; '
+    + '[ -f ~/.ssh/caden-tunnel ] || ssh-keygen -q -t ed25519 -N "" '
+    + '-C "caden-tunnel" -f ~/.ssh/caden-tunnel; cat ~/.ssh/caden-tunnel.pub');
+  const pub = String(key.stdout).trim().split('\n').pop();
+  if (!/^ssh-/.test(pub)) throw new Error(`could not read a public key from ${server.name}`);
+
+  onStep('authorising it on the gateway, for forwarding only…');
+  const tag = `caden-tunnel:${server.id}`;
+  // restrict turns everything off; port-forwarding turns back on the one
+  // thing this key is for. No shell, no agent, no pty.
+  const line = `restrict,port-forwarding ${pub.split(/\s+/).slice(0, 2).join(' ')} ${tag}`;
+  await gwSh([
+    'set -eu',
+    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys',
+    // Replace this server's entry rather than accumulating one per run.
+    `grep -v ' ${tag}$' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp || true`,
+    `printf '%s\\n' ${JSON.stringify(line)} >> ~/.ssh/authorized_keys.tmp`,
+    'chmod 600 ~/.ssh/authorized_keys.tmp && mv -f ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys',
+  ].join('\n'));
+
+  onStep('installing the tunnel service…');
+  const remotePort = server.remotePort || DEFAULT_PORT;
+  const unit = `[Unit]
+Description=Caden tunnel to the web gateway
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -T -i %h/.ssh/caden-tunnel \\
+    -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \\
+    -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new \\
+    -o IdentitiesOnly=yes -p ${gw.port} \\
+    -R ${port}:127.0.0.1:${remotePort} ${gw.user}@${gw.host}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
+  const marker = `__CADEN_${require('crypto').randomBytes(9).toString('hex')}__`;
+  await sh([
+    'set -eu',
+    'mkdir -p ~/.config/systemd/user',
+    `cat > ~/.config/systemd/user/caden-tunnel.service <<'${marker}'`,
+    unit.replace(/\n$/, ''),
+    marker,
+    'systemctl --user daemon-reload',
+    'systemctl --user enable caden-tunnel.service >/dev/null 2>&1 || true',
+    'systemctl --user restart caden-tunnel.service',
+    // Best effort, and it is refused on hosts where the user has no polkit
+    // rights -- there the tunnel starts on first login, like the daemon it
+    // serves already does.
+    'loginctl enable-linger "$(whoami)" >/dev/null 2>&1 || true',
+  ].join('\n'));
+
+  onStep('checking the gateway can reach it…');
+  for (let i = 0; i < 20; i++) {
+    await sleep(500);
+    const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`);
+    if (/"ok"\s*:\s*true/.test(probe.stdout)) return { port };
+  }
+  const why = await sh('systemctl --user status caden-tunnel.service --no-pager -n 6 2>&1 | tail -6');
+  throw new Error(`the tunnel did not come up on ${port}: ${String(why.stdout).trim().slice(0, 300)}`);
+}
+
+/// Set the gateway up, or bring it in line with the settings. Idempotent:
+/// this is also how you apply a changed hostname or a new server.
+///
+/// Everything runs as one script over one ssh connection, the way
+/// provisioning does, so a half-applied state is a script that stopped rather
+/// than five commands that partly went through.
+async function applyWebGateway(onStep = () => {}) {
+  const { hostname, gatewayHost, serverId } = webConfig();
+  if (!hostname) throw new Error('choose a hostname first');
+  if (!gatewayHost) throw new Error('choose which machine runs the proxy');
+  const server = (readConfig().servers || []).find(x => x.id === serverId);
+  if (!server) throw new Error('choose which server serves the console');
+  if (!daemonToken(server)) {
+    throw new Error(`no daemon token for ${server.name || serverId} — provision it first`);
+  }
+
+  // Every server the proxy can actually reach: the one on the gateway, which
+  // is on its own loopback, plus any that have dialled a tunnel to it. A
+  // server with neither is left out rather than given a route to nothing --
+  // a row that reads as broken is a worse answer than a row that is absent.
+  const web = webConfig();
+  const wired = [];
+  const ports = new Map();
+  for (const s of (readConfig().servers || [])) {
+    if (!s.provisioned || !daemonToken(s)) continue;
+    if (web.tunnels[s.id]) { ports.set(s.id, web.tunnels[s.id]); wired.push(s); }
+    else if (s.id === serverId) {
+      ports.set(s.id, s.remotePort || DEFAULT_PORT); wired.push(s);
+    }
+  }
+  const consolePort = ports.get(server.id);
+  if (!consolePort) throw new Error(`${server.name || serverId} has no route from the gateway`);
+  const sh = gatewayShell(gatewayHost);
+  const marker = `__CADEN_${require('crypto').randomBytes(9).toString('hex')}__`;
+  const file = (path_, body, mode) => [
+    `cat > ${path_} <<'${marker}'`, body.replace(/\n$/, ''), marker,
+    mode ? `chmod ${mode} ${path_}` : '',
+  ].filter(Boolean).join('\n');
+
+  onStep('checking the gateway…');
+  const pre = await sh('command -v nginx >/dev/null && echo nginx; '
+                     + 'command -v certbot >/dev/null && echo certbot; '
+                     + 'id -u');
+  if (!/nginx/.test(pre.stdout)) throw new Error(`${gatewayHost} has no nginx`);
+  if ((pre.stdout.match(/^0$/m) || []).length === 0) {
+    throw new Error(`${gatewayHost} does not connect as root, and /etc/nginx needs it`);
+  }
+  const haveCertbot = /certbot/.test(pre.stdout);
+
+  // Resolved from the gateway, and compared with the address the gateway
+  // answers on. Getting the A record wrong is the likeliest thing to go wrong
+  // here, and the way it surfaces otherwise is a certbot failure -- which
+  // costs one of Let's Encrypt's five certificates a week for this name, so
+  // it is worth a question first rather than an attempt.
+  const certPath = `/etc/letsencrypt/live/${hostname}/fullchain.pem`;
+  const haveCert = /yes/.test((await sh(`test -f ${certPath} && echo yes || echo no`)).stdout);
+  if (!haveCert) {
+    onStep(`checking that ${hostname} points here…`);
+    const dns = await sh(`getent hosts ${hostname} | awk '{print $1}' | sort -u | tr '\\n' ' '; `
+                       + "echo '|'; curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true");
+    const [resolvedRaw, mineRaw] = String(dns.stdout).split('|');
+    const resolved = (resolvedRaw || '').trim().split(/\s+/).filter(Boolean);
+    const mine = (mineRaw || '').trim();
+    if (!resolved.length) {
+      throw new Error(`${hostname} does not resolve. Add an A record for it `
+                    + `pointing at ${mine || 'this machine'}, wait for it to `
+                    + 'take, and try again.');
+    }
+    if (mine && !resolved.includes(mine)) {
+      throw new Error(`${hostname} resolves to ${resolved.join(', ')}, but this `
+                    + `machine answers on ${mine}. Point the A record at `
+                    + `${mine}, or choose the machine it already points at.`);
+    }
+  }
+
+  // A plain HTTP site first, so certbot has something to attach to and its
+  // challenge is not behind the sign-in that does not exist yet.
+  onStep('writing a temporary site so a certificate can be issued…');
+  await sh([
+    'set -eu',
+    `mkdir -p ${webRoot(hostname)}/host`,
+    file(`/etc/nginx/sites-available/${hostname}`,
+         `server {\n    listen 80;\n    listen [::]:80;\n    server_name ${hostname};\n`
+         + `    root ${webRoot(hostname)};\n}\n`),
+    `ln -sf /etc/nginx/sites-available/${hostname} /etc/nginx/sites-enabled/${hostname}`,
+    'nginx -t >/dev/null',
+    'systemctl reload nginx',
+  ].join('\n'));
+
+  if (!haveCert) {
+    if (!haveCertbot) throw new Error(`${gatewayHost} has no certbot, and there is no certificate for ${hostname}`);
+    onStep(`asking Let's Encrypt for a certificate for ${hostname}…`);
+    const out = await sh(`certbot --nginx -d ${hostname} --non-interactive --agree-tos `
+                       + '--register-unsafely-without-email --redirect 2>&1 | tail -4');
+    const now = await sh(`test -f ${certPath} && echo yes || echo no`);
+    if (!/yes/.test(now.stdout)) {
+      throw new Error(`certbot did not produce a certificate: ${out.stdout.trim().slice(0, 300)}`);
+    }
+  } else {
+    onStep('certificate already there');
+  }
+
+  onStep('writing the proxy configuration…');
+  onStep(wired.length === 1 ? 'one server' : `${wired.length} servers`);
+  const site = webSiteConfig({ hostname, consolePort, servers: wired, ports,
+                              consoleToken: daemonToken(server) });
+  await sh([
+    'set -eu',
+    file('/etc/nginx/conf.d/caden-ratelimit.conf',
+         '# Two a second sustained is far above anything real use produces --\n'
+       + '# an event stream is one connection, not a poll -- and the burst in\n'
+       + '# the site below covers a cold page load. What it caps is guessing.\n'
+       + 'limit_req_zone $binary_remote_addr zone=caden:1m rate=120r/m;\n'),
+    `mkdir -p ${webRoot(hostname)}/host`,
+    file(`${webRoot(hostname)}/host/config.tmp`, webHostConfig(wired)),
+    `mv -f ${webRoot(hostname)}/host/config.tmp ${webRoot(hostname)}/host/config`,
+    // Written beside the live one and moved into place only once nginx has
+    // agreed to it, so a rejected config cannot take the site down.
+    file(`/etc/nginx/sites-available/${hostname}.new`, site),
+    `cp /etc/nginx/sites-available/${hostname} /etc/nginx/sites-available/${hostname}.prev || true`,
+    `mv -f /etc/nginx/sites-available/${hostname}.new /etc/nginx/sites-available/${hostname}`,
+    `if ! nginx -t 2>/tmp/caden-nginx.err; then `
+      + `mv -f /etc/nginx/sites-available/${hostname}.prev /etc/nginx/sites-available/${hostname}; `
+      + 'cat /tmp/caden-nginx.err >&2; exit 1; fi',
+    `rm -f /etc/nginx/sites-available/${hostname}.prev`,
+    'systemctl reload nginx',
+  ].join('\n')).catch(e => {
+    throw new Error(`nginx refused the configuration and it was rolled back: ${String(e.message || e).slice(0, 300)}`);
+  });
+
+  // A renamed gateway leaves its old site enabled, still answering, still
+  // renewing a certificate for a name nobody uses. Taken down only after the
+  // new one is up and nginx has accepted it.
+  const { appliedHostname } = webConfig();
+  if (appliedHostname && appliedHostname !== hostname) {
+    onStep(`taking down the old address, ${appliedHostname}…`);
+    await sh([
+      `rm -f /etc/nginx/sites-enabled/${appliedHostname}`,
+      `rm -f /etc/nginx/sites-available/${appliedHostname}`,
+      `rm -rf ${webRoot(appliedHostname)}`,
+      'nginx -t >/dev/null && systemctl reload nginx',
+    ].join('\n')).catch(() => {});
+    // The certificate is left alone. Deleting one is not something to do
+    // without being asked, and an unused one costs nothing but a renewal.
+    onStep(`the certificate for ${appliedHostname} is still there; `
+         + `certbot delete --cert-name ${appliedHostname} removes it`);
+  }
+  saveWebConfig({ appliedHostname: hostname });
+
+  onStep('installing the brute-force ban…');
+  await sh([
+    'set -eu',
+    'if command -v fail2ban-client >/dev/null 2>&1; then',
+    file('/etc/fail2ban/filter.d/caden-login.conf',
+         '[Definition]\nfailregex = ^<HOST> .* "POST /v1/web/login HTTP/[0-9.]+" 401\nignoreregex =\n'),
+    // backend=polling is not optional on Debian: the default reads the
+    // journal, and nginx logs to files, so the jail would watch nothing while
+    // reporting itself enabled.
+    file('/etc/fail2ban/jail.d/caden.conf',
+         '[caden-auth]\nenabled  = true\nfilter   = caden-login\n'
+       + 'port     = http,https\nbackend  = polling\n'
+       + 'logpath  = /var/log/nginx/access.log\n'
+       + 'maxretry = 5\nfindtime = 600\nbantime  = 3600\n'),
+    'systemctl restart fail2ban || true',
+    'else echo "no fail2ban on this host; skipped" >&2; fi',
+  ].join('\n'));
+
+  onStep('done');
+  return { hostname, url: `https://${hostname}/` };
+}
+
+/// Put a freshly provisioned server on the phone.
+///
+/// Called from provisioning rather than left as a second errand, because
+/// everything it needs -- ssh to the machine, ssh to the gateway -- is
+/// already here. Also called by scripts/provision.sh, so that a server set up
+/// from a terminal ends up in the same state as one set up from the app;
+/// "provisioned" meaning two different things is how the two drift.
+///
+/// Best effort, and it says what did not happen. The daemon is installed and
+/// working whether or not a proxy elsewhere could be reached.
+async function attachToWebGateway(server, onStep = () => {}) {
+  const web = webConfig();
+  if (!web.hostname || !web.gatewayHost) return;
+  try {
+    if (server && server.id !== web.serverId && !isLocalServer(server)) {
+      onStep('connecting it to the web gateway…');
+      await setupTunnel(server, onStep);
+    }
+    onStep('bringing the web gateway in line…');
+    await applyWebGateway(onStep);
+  } catch (e) {
+    onStep(`the daemon is up; the web gateway was not updated: ${String(e.message || e)}`);
+  }
+}
+
+/// Whether the console has a password yet, and whether the address answers.
+async function webStatus() {
+  const web = webConfig();
+  const servers = (readConfig().servers || []).filter(s => s.provisioned);
+  const out = { ...web, servers: servers.map(s => ({ id: s.id, name: s.name || s.sshHost || s.id })),
+                sshHosts: sshHosts().map(h => h.host), passwordSet: null,
+                cert: null, reachable: null };
+  // Which servers the gateway can actually reach, and how.
+  const gwSh = web.gatewayHost ? gatewayShell(web.gatewayHost) : null;
+  out.reach = {};
+  for (const s of servers) {
+    if (isLocalServer(s)) { out.reach[s.id] = 'local'; continue; }
+    if (s.id === web.serverId && !web.tunnels[s.id]) { out.reach[s.id] = 'gateway'; continue; }
+    const port = web.tunnels[s.id];
+    if (!port) { out.reach[s.id] = 'none'; continue; }
+    if (!gwSh) { out.reach[s.id] = 'unknown'; continue; }
+    const probe = await gwSh(`curl -fsS --max-time 3 http://127.0.0.1:${port}/v1/ping || true`)
+      .catch(() => null);
+    out.reach[s.id] = probe && /"ok"\s*:\s*true/.test(probe.stdout) ? 'tunnel' : 'down';
+  }
+
+  const server = servers.find(s => s.id === web.serverId);
+  if (server) {
+    const sh = provisionShell(server);
+    const home = server.remoteHome || REMOTE_HOME;
+    const r = await sh(`test -s ${home}/web-password && echo yes || echo no`).catch(() => null);
+    out.passwordSet = r ? /yes/.test(r.stdout) : null;
+  }
+  if (web.gatewayHost && web.hostname) {
+    const sh = gatewayShell(web.gatewayHost);
+    const r = await sh(`openssl x509 -enddate -noout -in `
+      + `/etc/letsencrypt/live/${web.hostname}/fullchain.pem 2>/dev/null || true`).catch(() => null);
+    const m = r && /notAfter=(.+)/.exec(r.stdout);
+    out.cert = m ? m[1].trim() : null;
+  }
+  if (web.hostname) {
+    // The sign-in redirect is the healthy answer: it means nginx is there and
+    // the check in front of it is working.
+    out.reachable = await new Promise(resolve => {
+      const req = https.request(`https://${web.hostname}/`, { method: 'GET', timeout: 6000 },
+        r => { resolve(r.statusCode || 0); r.destroy(); });
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+      req.on('error', () => resolve(null));
+      req.end();
+    });
+  }
+  return out;
 }
 
 /// Called on quit: the forwards are this app's doing, so they go with it.
@@ -1237,5 +2122,7 @@ async function ensureLocalServer() {
 
 module.exports = {
   route, readConfig, daemonBase, daemonToken, providerKey, expandTilde,
-  buildProvisionScript, provision, shutdown, ensureLocalServer,
+  buildProvisionScript, webPayload, providerSecrets, provision, shutdown,
+  forwardUsable, attachToWebGateway, removeServer,
+  ensureLocalServer,
 };

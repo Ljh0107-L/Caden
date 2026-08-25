@@ -7,7 +7,9 @@
 
 import { hostConfig, DaemonAPI, sshHosts, addServer, removeServer, installViaHost,
          serverStatus, provision, startTunnel, stopTunnel,
-         pickFiles, attachFile, attachBytes } from './api.js';
+         pickFiles, attachFile, attachBytes,
+         webStatus, saveWebSettings, applyWeb, setWebPassword,
+         logoutBrowsers, connectServerToWeb } from './api.js';
 import { Transcript, groupRows, toolVerb, toolBucket, visibleFrom } from './transcript.js';
 import { renderMarkdown } from './markdown.js';
 import { renderDiff, diffFromToolInput } from './diff.js';
@@ -23,6 +25,20 @@ import { cacheLoad, cacheSave, cacheClear } from './cache.js';
 /// ring (2048) so the fetch costs no file I/O server-side either.
 const TAIL_EVENTS = 300;
 
+// Whether the sidebar is a column beside the canvas or an overlay on top of
+// it. Same 760px as the media query in styles.css -- the two have to agree,
+// and matchMedia is the only way to ask the stylesheet's question in JS.
+const NARROW = window.matchMedia('(max-width: 760px)');
+
+/// Crossing the breakpoint changes what the sidebar *is*, so it also changes
+/// what "open" should mean: a window dragged wide should show the list back,
+/// and one dragged narrow should not have it covering the canvas.
+NARROW.addEventListener('change', ev => {
+  state.sidebarOpen = !ev.matches;
+  renderSidebar();
+  renderMain();
+});
+
 const state = {
   config: { servers: [], models: [], defaults: {} },
   servers: new Map(),          // id -> {profile, api, status, facts, sessions, error}
@@ -30,7 +46,7 @@ const state = {
   selectedServerId: null,
   selectedSessionId: null,
   pane: null,                  // 'models' | {sessionDetail: id}
-  sidebarOpen: true,
+  sidebarOpen: !NARROW.matches,   // a phone opens on the content, not the list
   // Archived starts folded: it is where sessions go to stop taking up room.
   foldedRepos: new Set(['Archived']),
   // The whole repository list folds too, from its group heading.
@@ -38,10 +54,21 @@ const state = {
   serverStatus: new Map(),     // id -> readiness report from /host/servers/<id>/status
   serverBusy: new Map(),       // id -> what a running action is doing
   sshHosts: [],                // candidates parsed out of ~/.ssh/config
-  draft: { cwd: '', modelId: null, permissionMode: '' },
+  draft: { cwd: '', modelId: null, permissionMode: '', permissionModeChosen: false },
   editing: false,          // an inline editor owns the keyboard right now
   sidebarStale: false,     // a repaint was skipped while it did
+  web: null,               // the gateway's settings and state, once fetched
+  webBusy: null,           // what applying it is doing right now
 };
+
+/// What the thing serving this page can do on our behalf.
+///
+/// The Mac app's host server can reach ssh, the filesystem and the keychain,
+/// so it offers to add servers, provision them and open forwards. A console
+/// served by a daemon behind a reverse proxy can do none of that, and says so
+/// by declaring nothing. Absent means none, deliberately: a hand-written
+/// config for that arrangement should not have to know the list to be safe.
+const can = name => !!(state.config.capabilities || {})[name];
 
 const $sidebar = document.getElementById('sidebar');
 const $main = document.getElementById('main');
@@ -503,6 +530,14 @@ function lastUsage(ctl) {
 
 const engineOf = proto => proto === 'anthropic-messages' ? 'claude'
   : proto === 'mock' ? 'mock' : 'codex';
+
+/// The model a live session is on, as a row from the model list. A session
+/// stores the id it was created with, not the entry, and the chips above the
+/// composer need the protocol as well.
+const modelOfSession = session => session && {
+  proto: session.engine === 'claude' ? 'anthropic-messages' : 'openai-responses',
+  modelID: session.model,
+};
 const engineLabel = proto => proto === 'anthropic-messages' ? 'Claude Code' : 'Codex';
 const PERMISSIONS = [
   { value: 'bypassPermissions', label: 'Full access' },
@@ -524,20 +559,59 @@ const EFFORTS = [
 const effortLabel = v =>
   (EFFORTS.find(e => e.value === v) || EFFORTS[2]).label;
 
+// Codex's `priority` service tier, which Codex itself calls Fast: 1.5x speed
+// for increased usage. A tier on the turn rather than a mode on the process,
+// so switching it costs neither the engine nor its cache.
+//
+// Claude Code has a fast mode too and Caden does not offer it. It is not a
+// parameter — it asks Anthropic to route Opus to faster hardware — so behind
+// a gateway the CLI reports it on while nothing upstream is any quicker,
+// which is a switch that lies. The tier is a request field and travels.
+//
+// Which Codex models have it is the daemon's to say, from the catalog the CLI
+// ships; the renderer would only have a copy going stale. So the switch is
+// drawn for Codex, and a model without the tier comes back
+// `model_not_supported` after the first turn.
+const fastCapable = model => !!model && engineOf(model.proto) === 'codex';
+
+const FAST_REASONS = {
+  model_not_supported: 'this model has no fast tier',
+};
+const fastNote = session => {
+  if (!session || !session.fast) return 'Codex fast tier — 1.5x speed, more usage';
+  if (session.fast_state === 'on') return 'Fast tier on';
+  if (session.fast_reason) {
+    const why = session.fast_reason;
+    return `Fast tier unavailable: ${FAST_REASONS[why] || why}`;
+  }
+  // Nothing recorded yet is the gap between asking and the first turn, which
+  // is when the tier is chosen -- there is no state to report before then.
+  return 'Fast tier starts on the next turn';
+};
+
 // ---------------------------------------------------------------- navigation
 
 function select(sessionId, serverId) {
   state.pane = null;
   state.selectedSessionId = sessionId;
   if (serverId) state.selectedServerId = serverId;
+  dismissOverlaySidebar();
   renderSidebar();
   renderMain();
 }
 
 function openPane(pane) {
   state.pane = pane;
+  dismissOverlaySidebar();
+  if (pane === 'web') {
+    state.web = null;                       // so the pane paints "checking…"
+    webStatus().then(w => { state.web = w; renderWebPane(); })
+               .catch(e => { state.web = { error: String(e.message || e) };
+                             renderWebPane(); });
+  }
   if (pane === 'servers') {
-    sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
+    if (can('servers'))
+      sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
     for (const p of state.config.servers) checkServer(p.id);
   }
   renderSidebar();
@@ -549,11 +623,36 @@ function openPane(pane) {
 // Built from DOM templates extracted from the running Cursor Agents window:
 // Cursor's own markup, Cursor's own stylesheet, our data and handlers.
 
+/// Below the breakpoint the sidebar covers the canvas, so tapping the canvas
+/// has to put it away again. A real element rather than a pseudo-element on
+/// the body, so the dismissing click has something unambiguous to land on;
+/// `display: none` outside the media query keeps it out of the desktop's row.
+function syncScrim() {
+  const want = state.sidebarOpen && NARROW.matches;
+  const existing = document.getElementById('sidebar-scrim');
+  if (!want) { existing?.remove(); return; }
+  if (existing) return;
+  $sidebar.after(el('div', {
+    class: 'sidebar-scrim', id: 'sidebar-scrim',
+    onclick: () => { if (dismissOverlaySidebar()) { renderSidebar(); renderMain(); } },
+  }));
+}
+
+/// Picking a session or a pane replaces whatever the overlay was covering, so
+/// leaving it up would hide the thing that was just asked for. No-op on a
+/// desktop, where the sidebar is a column and nothing is being covered.
+function dismissOverlaySidebar() {
+  if (!NARROW.matches || !state.sidebarOpen) return false;
+  state.sidebarOpen = false;
+  return true;
+}
+
 function renderSidebar() {
   // Deferred, not dropped: whatever changed is still there when the edit ends.
   if (state.editing) { state.sidebarStale = true; return; }
   $sidebar.classList.toggle('hidden', !state.sidebarOpen);
   document.body.classList.toggle('sidebar-hidden', !state.sidebarOpen);
+  syncScrim();
   if (!state.sidebarOpen) { $sidebar.replaceChildren(); return; }
 
   const nav = el('nav', { class: cls('sidebarClasses') });
@@ -595,8 +694,18 @@ function renderSidebar() {
   fillRow(rows[2], { label: 'Models', icon: 'robot',
                      active: state.pane === 'models',
                      onClick: () => openPane('models') });
+  // Setting a gateway up is ssh and root on somebody else's machine, so it
+  // belongs to the Mac. Served from a daemon there is nothing to configure
+  // and the row would only lead somewhere that says so.
+  if (can('servers')) {
+    fillRow(rows[3], { label: 'Web', icon: 'server',
+                       active: state.pane === 'web',
+                       onClick: () => openPane('web') });
+  } else {
+    rows[3]?.remove();
+  }
   // Only the first row carries a shortcut badge.
-  for (const r of [rows[1], rows[2]])
+  for (const r of [rows[1], rows[2], rows[3]])
     r?.querySelectorAll('.nav-row-end').forEach(n => n.replaceChildren());
 
   const content = el('div', { class: cls('contentCls'), id: 'server-list' });
@@ -859,6 +968,7 @@ function renderMain() {
     c.rowNodes = null;
   }
 
+  if (state.pane === 'web') { renderWebPane(); return; }
   if (state.pane === 'models') { renderModelsPane(); return; }
   if (state.pane === 'servers') { renderServersPane(); return; }
   if (state.pane?.sessionDetail) {
@@ -1546,7 +1656,7 @@ function summaryRow(sum) {
 /// what had been typed.
 function buildPromptInput({ root, placeholder, modelLabel, engine, onPlusMenu, onModelMenu,
                             isRunning, onSend, onInterrupt, onShiftTab, effort,
-                            permission, onPasteOther = () => {}, draft = null }) {
+                            fast, permission, onPasteOther = () => {}, draft = null }) {
   root = root || tpl('promptInput');
 
   // A contenteditable rather than a textarea: the composer has to hold
@@ -1727,11 +1837,16 @@ function buildPromptInput({ root, placeholder, modelLabel, engine, onPlusMenu, o
 
   // Optional thinking-effort switch in the toolbar (draft view, where there
   // is no status row to host it).
-  for (const [chip, icon] of [[permission, 'lock-locked'], [effort, 'brain']]) {
+  // `fast` is a switch rather than a menu -- two states do not need a list --
+  // so it carries `onToggle` and lights up instead of naming its value.
+  for (const [chip, icon] of [[permission, 'lock-locked'], [effort, 'brain'],
+                              [fast, 'bolt']]) {
     if (!chip) continue;
-    const btn = el('button', { class: 'effort-btn', title: chip.title || '' },
+    const btn = el('button', { class: 'effort-btn', title: chip.title || '',
+                               'data-on': chip.on?.() || null },
       cIcon(icon, 12), el('span', { class: 'effort-label' }, chip.label()));
-    btn.addEventListener('click', () => chip.onMenu(btn));
+    btn.addEventListener('click',
+      () => chip.onMenu ? chip.onMenu(btn) : chip.onToggle());
     root.querySelector('.composer-controls-left')?.append(btn);
   }
 
@@ -2041,7 +2156,24 @@ function buildStatusRow(ctl, entry, onToggleContext) {
   paintGoal();
   ctl.listeners.add(paintGoal);
 
-  row.append(slot, effortBtn, gauge);
+  // The fast tier, beside the effort switch it reads as a sibling of -- and
+  // is one: both are fields on the turn. The session carries which tier the
+  // last turn actually asked for, so a model without one says so on hover
+  // rather than sitting lit and doing nothing.
+  const fastBtn = fastCapable(modelOfSession(ctl.session))
+    ? el('button', { class: 'effort-btn', title: fastNote(ctl.session),
+                     'data-on': ctl.session.fast || null },
+        cIcon('bolt', 12), el('span', { class: 'effort-label' }, 'Fast'))
+    : null;
+  if (fastBtn) {
+    fastBtn.addEventListener('click', async () => {
+      ctl.session = await ctl.api.patchSession(ctl.session.id,
+                                               { fast: !ctl.session.fast });
+      renderMain();
+    });
+  }
+
+  row.append(slot, fastBtn, effortBtn, gauge);
   row.classList.add('caden-status-row');
   return row;
 }
@@ -2054,6 +2186,11 @@ function buildStatusRow(ctl, entry, onToggleContext) {
 /// up carrying is a path the agent can open, not a blob the model has to be
 /// handed.
 async function attachFiles(entry, prompt, plus) {
+  // No native panel here: raise the browser's own, and send bytes rather than
+  // paths. Same destination -- the daemon's upload endpoint is what the Mac
+  // route ends up calling too -- so what lands in the message is identical.
+  if (!can('filePicker')) return attachFromBrowser(entry, prompt, plus);
+
   let files;
   try {
     files = await pickFiles();
@@ -2076,6 +2213,47 @@ async function attachFiles(entry, prompt, plus) {
   }
   if (plus) { plus.disabled = false; plus.title = was || ''; }
   prompt.focus();
+}
+
+/// The + button where there is no native panel to raise.
+///
+/// A browser gives bytes and a name, never a path, which is the same hand the
+/// paste path is dealt -- so this walks the same road, straight at the
+/// daemon. The input is created per click and dropped afterwards: a hidden
+/// one parked in the DOM keeps its last selection, and picking the same file
+/// twice in a row then fires no change event at all.
+function attachFromBrowser(entry, prompt, plus) {
+  return new Promise(resolve => {
+    const input = el('input', { type: 'file', multiple: true,
+                                style: 'display:none' });
+    input.addEventListener('change', async () => {
+      const files = [...input.files];
+      input.remove();
+      if (!files.length) return resolve();
+      const was = plus?.title;
+      if (plus) { plus.disabled = true; plus.title = 'Attaching…'; }
+      for (const file of files) {
+        prompt.insert(`[uploading ${file.name}…]`);
+        try {
+          const got = await entry.api.attachLocalFile(file);
+          if (got.kind === 'image') {
+            prompt.replace(`[uploading ${file.name}…]`, '');
+            prompt.attach(got);
+          } else {
+            prompt.replace(`[uploading ${file.name}…]`, got.path);
+          }
+        } catch (e) {
+          prompt.replace(`[uploading ${file.name}…]`,
+                         `[could not attach ${file.name}: ${e.message || e}]`);
+        }
+      }
+      if (plus) { plus.disabled = false; plus.title = was || ''; }
+      prompt.focus();
+      resolve();
+    }, { once: true });
+    document.body.append(input);
+    input.click();
+  });
 }
 
 /// A non-image pasted straight out of Finder: the renderer can read its bytes
@@ -2320,7 +2498,13 @@ function renderDraft() {
   const [serverId, entry] = chosen;
   const d = state.draft;
   if (!d.modelId) d.modelId = models()[0]?.id;
-  if (!d.permissionMode) d.permissionMode = state.config.defaults.permissionMode || 'bypassPermissions';
+  // Re-derived until somebody picks one: `facts` arrives a round trip after
+  // the first paint, so a mode settled on the first render would be settled
+  // before the answer got here.
+  if (!d.permissionModeChosen || d.serverId !== serverId) {
+    d.permissionMode = defaultPermissionFor(entry);
+    d.permissionModeChosen = false;
+  }
   if (!d.cwd || d.serverId !== serverId) {
     d.serverId = serverId;
     const recent = (entry.sessions || [])
@@ -2333,6 +2517,8 @@ function renderDraft() {
   }
   const model = models().find(m => m.id === d.modelId) || models()[0];
   if (!d.effort) d.effort = 'high';
+  // A model swap can take the switch away underneath a session that had it on.
+  if (!fastCapable(model)) d.fast = false;
 
   // Cursor's own empty-state page, replayed whole; we only fill data in.
   const page = tpl('emptyState');
@@ -2353,6 +2539,7 @@ function renderDraft() {
         cwd: d.cwd, create_cwd: true,
         permission_mode: d.permissionMode,
         effort: d.effort,
+        fast: d.fast || undefined,
         context_window: model.contextWindow || undefined,
         message: text,
         images: images && images.length ? images : undefined,
@@ -2379,6 +2566,7 @@ function renderDraft() {
     onSend: (text, images) => startSession(text, images),
     onShiftTab: () => {
       d.permissionMode = d.permissionMode === 'plan' ? 'bypassPermissions' : 'plan';
+      d.permissionModeChosen = true;
       renderMain();
     },
     // Attachments only: the workspace chip above the composer already owns the
@@ -2390,7 +2578,8 @@ function renderDraft() {
       label: () => permLabel(d.permissionMode),
       onMenu: anchor => openMenu(anchor, PERMISSIONS.map(pm => ({
         label: pm.label, checked: pm.value === d.permissionMode,
-        action: () => { d.permissionMode = pm.value; renderMain(); },
+        action: () => { d.permissionMode = pm.value;
+                        d.permissionModeChosen = true; renderMain(); },
       }))),
     },
     onModelMenu: anchor => openMenu(anchor,
@@ -2405,6 +2594,12 @@ function renderDraft() {
         action: () => { d.effort = x.value; renderMain(); },
       }))),
     },
+    fast: fastCapable(model) ? {
+      title: 'Codex fast tier — 1.5x speed, more usage',
+      label: () => 'Fast',
+      on: () => !!d.fast,
+      onToggle: () => { d.fast = !d.fast; renderMain(); },
+    } : null,
   });
 
   // The two selects above the composer: workspace and machine.
@@ -2668,9 +2863,65 @@ const setBusy = (id, text) => {
   renderServersPane();
 };
 
+/// The configured default, unless the server it would run on cannot take it.
+///
+/// Claude Code refuses Full access under a uid of 0, so on a daemon running
+/// as root the configured default is a refusal on every new session. A
+/// refusal is the right answer to an explicit choice and the wrong one to a
+/// default nobody made, so the default steps down. Choosing Full access by
+/// hand still gets the explanation.
+///
+/// From `facts`, which is the daemon's own /v1/health and is fetched when the
+/// server connects -- the readiness report is only gathered when the Servers
+/// pane is open, and the composer needs an answer before that.
+function defaultPermissionFor(entry) {
+  const want = state.config.defaults.permissionMode || 'bypassPermissions';
+  if (want !== 'bypassPermissions') return want;
+  return entry?.facts?.root ? 'acceptEdits' : want;
+}
+
+/// The same report, assembled from the daemon instead of from a host.
+///
+/// /host/servers/<id>/status is the Mac answering questions it is uniquely
+/// able to answer -- is the forward up, does the keychain have a token. None
+/// of that exists behind a proxy, but most of what the pane shows does: the
+/// daemon knows its own version and which engines it has, and the fact that it
+/// answered at all is the liveness the host was reporting second-hand.
+///
+/// A forward is not a thing here, so `tunnel` is absent rather than false, and
+/// nothing offers to close one. The token is the proxy's business and it
+/// clearly worked, or none of this would have come back.
+async function statusFromDaemon(entry) {
+  const [health, engines] = await Promise.all([
+    entry.api.health(),
+    entry.api.engines({ latest: true }).catch(() => null),
+  ]);
+  return {
+    daemon: true,
+    token: true,
+    // Claude Code will not run Full access here, so the composer must not
+    // offer it as the default it never asked anyone about.
+    root: !!health?.root,
+    daemonVersion: health?.version || null,
+    daemonRevision: health?.revision || null,
+    engines: {
+      claude: engines?.engines?.claude || { installed: false },
+      codex: engines?.engines?.codex || { installed: false },
+    },
+    arch: engines?.arch,
+    libc: engines?.libc,
+    ready: !!(engines?.engines?.claude?.installed
+              || engines?.engines?.codex?.installed),
+  };
+}
+
 async function checkServer(id, { attempt = 0 } = {}) {
-  try { state.serverStatus.set(id, await serverStatus(id)); }
-  catch (e) { state.serverStatus.set(id, { error: String(e.message || e) }); }
+  const entry = state.servers.get(id);
+  try {
+    state.serverStatus.set(id, can('servers') || !entry
+      ? await serverStatus(id)
+      : await statusFromDaemon(entry));
+  } catch (e) { state.serverStatus.set(id, { error: String(e.message || e) }); }
   renderServersPane();
 
   // The upstream version check runs in the background on the server and its
@@ -2791,8 +3042,8 @@ const srvLine = (mark, label, detail, action) =>
     el('span', { class: 'srv-detail' }, detail || ''),
     action || null);
 
-const srvBtn = (label, onclick) => {
-  const b = el('button', { class: 'srv-btn' }, label);
+const srvBtn = (label, onclick, extra) => {
+  const b = el('button', { class: `srv-btn${extra ? ' ' + extra : ''}` }, label);
   b.onclick = onclick;
   return b;
 };
@@ -2810,10 +3061,15 @@ function serverSection(profile) {
 
   if (!busy) {
     const needsWork = !st || !st.daemon || !st.token || (tunnelMode && !st.tunnel);
-    if (needsWork) acts.append(srvBtn('Set up', () => setUpServer(profile)));
-    else if (tunnelMode) acts.append(srvBtn('Close forward', async () => {
-      await stopTunnel(profile.id); await checkServer(profile.id);
-    }));
+    // Both of these are ssh from this Mac. Without it the row still reports
+    // what it found -- which is the useful half -- but offers nothing it
+    // cannot do.
+    if (needsWork && can('provisioning'))
+      acts.append(srvBtn('Set up', () => setUpServer(profile)));
+    else if (tunnelMode && !needsWork && can('tunnels'))
+      acts.append(srvBtn('Close forward', async () => {
+        await stopTunnel(profile.id); await checkServer(profile.id);
+      }));
     const more = el('button', { class: 'prov-act', title: 'Server options' }, cIcon('sliders', 13));
     more.onclick = e => openMenu(e.currentTarget, [
       { label: 'Check again', action: () => checkServer(profile.id) },
@@ -2822,20 +3078,25 @@ function serverSection(profile) {
           if (entry) await connectServer(entry);
           await checkServer(profile.id);
         } },
-      { label: 'Upgrade the daemon', action: () => setUpServer(profile, { restart: true }) },
+      ...(can('provisioning')
+        ? [{ label: 'Upgrade the daemon',
+             action: () => setUpServer(profile, { restart: true }) }]
+        : []),
       // The row's button disappears once an engine is current; reinstalling is
       // still worth reaching for -- a broken install, or taking over a copy
       // that lives outside Caden.
       { label: 'Reinstall Claude Code', action: () => installEngineOn(profile, 'claude') },
       { label: 'Reinstall Codex', action: () => installEngineOn(profile, 'codex') },
-      '-',
-      { label: 'Remove server', action: async () => {
-          await removeServer(profile.id);
-          state.serverStatus.delete(profile.id);
-          await reloadServers();
-          state.sshHosts = await sshHosts();
-          renderServersPane();
-        } },
+      ...(can('servers')
+        ? ['-',
+           { label: 'Remove server', action: async () => {
+               await removeServer(profile.id);
+               state.serverStatus.delete(profile.id);
+               await reloadServers();
+               state.sshHosts = await sshHosts();
+               renderServersPane();
+             } }]
+        : []),
     ]);
     acts.append(more);
   }
@@ -2975,15 +3236,227 @@ function renderServersPane() {
     el('div', { class: 'pane-intro' },
       el('div', { class: 'pane-intro-title' }, 'Servers'),
       el('div', { class: 'pane-intro-sub' },
-        'A server runs the agents. Add one, install the daemon over ssh, and '
-        + 'Caden reaches it through a local forward.')));
+        // Two different truths. Told from the desktop app this pane is where
+        // servers get added and set up; served from a daemon behind a proxy
+        // none of that is on offer, and describing it anyway sends someone
+        // hunting for a button that was deliberately not drawn.
+        can('servers')
+          ? 'A server runs the agents. Add one, install the daemon over ssh, and '
+            + 'Caden reaches it through a local forward.'
+          : 'A server runs the agents. This console reaches them through the '
+            + 'proxy that served it; adding and setting up servers is done '
+            + 'from the desktop app.')));
 
   for (const profile of state.config.servers) body.append(serverSection(profile));
-  body.append(sshHostSection());
+  if (can('servers')) body.append(sshHostSection());
 
   paintPane('Servers',
     el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
       body));
+}
+
+// ---------------------------------------------------------------- web pane
+//
+// The gateway is a reverse proxy in front of a daemon, and setting one up is
+// four fiddly things -- a certificate, a password, an nginx block carrying a
+// 44-character token, a ban rule -- of which exactly one is interesting. The
+// pane does them; what it asks for is the three facts only a person knows.
+
+function webField(label, value, hint, onPick) {
+  const btn = el('button', { class: 'srv-btn', type: 'button' },
+                 value || 'choose…');
+  btn.addEventListener('click', e => onPick(e.currentTarget));
+  return srvLine(value ? 'ok' : 'none', label, hint || '', btn);
+}
+
+async function webSet(patch) {
+  state.web = { ...state.web, ...await saveWebSettings(patch) };
+  renderWebPane();
+  webStatus().then(w => { state.web = w; renderWebPane(); }).catch(() => {});
+}
+
+function renderWebPane() {
+  if (state.pane !== 'web') return;
+  const w = state.web;
+  const body = el('div', { class: 'models-pane' },
+    el('div', { class: 'pane-intro' },
+      el('div', { class: 'pane-intro-title' }, 'Web'),
+      el('div', { class: 'pane-intro-sub' },
+        'Reach a server from a phone, with this Mac switched off. A proxy in '
+        + 'front of the daemon holds the certificate and asks for the '
+        + 'password.')));
+
+  if (!w) {
+    body.append(el('div', { class: 'prov-card' }, srvLine('busy', 'Checking…', '')));
+    return paintPane('Web',
+      el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
+         body));
+  }
+  if (w.error) {
+    body.append(el('div', { class: 'prov-card' }, el('div', { class: 'srv-error' }, w.error)));
+    return paintPane('Web',
+      el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
+         body));
+  }
+
+  // -- the three facts only a person knows -----------------------------
+  const setup = el('div', { class: 'prov-card' });
+  const hostInput = el('input', { class: 'inline-edit mono', spellcheck: 'false',
+                                  placeholder: 'caden.example.net',
+                                  style: 'min-width:180px' });
+  hostInput.value = w.hostname || '';
+  const commit = () => {
+    if ((hostInput.value || '').trim() !== (w.hostname || ''))
+      webSet({ hostname: hostInput.value });
+  };
+  hostInput.addEventListener('blur', commit);
+  hostInput.addEventListener('keydown', e => { if (e.key === 'Enter') hostInput.blur(); });
+  setup.append(srvLine(w.hostname ? 'ok' : 'none', 'Address',
+                       'an A record for it, pointing at the proxy', hostInput));
+
+  setup.append(webField('Proxy runs on', w.gatewayHost,
+    'ssh as somebody who can write /etc/nginx', anchor =>
+      openMenu(anchor, (w.sshHosts || []).map(h => ({
+        label: h, checked: h === w.gatewayHost,
+        action: () => webSet({ gatewayHost: h }),
+      })))));
+
+  const chosen = (w.servers || []).find(s => s.id === w.serverId);
+  setup.append(webField('Console from', chosen && chosen.name,
+    'the daemon whose copy of the console is served', anchor =>
+      openMenu(anchor, (w.servers || []).map(s => ({
+        label: s.name, checked: s.id === w.serverId,
+        action: () => webSet({ serverId: s.id }),
+      })))));
+  body.append(el('div', { class: 'prov-section' },
+    el('div', { class: 'prov-title-row' },
+      el('div', { class: 'prov-id' },
+        el('span', { class: 'prov-name' }, 'Settings'))), setup));
+
+  // -- what is true right now ------------------------------------------
+  const state_ = el('div', { class: 'prov-card' });
+  const busy = state.webBusy;
+  if (busy) {
+    state_.append(srvLine('busy', busy, ''));
+  } else {
+    state_.append(srvLine(w.cert ? 'ok' : 'bad', 'Certificate',
+      w.cert ? `expires ${w.cert}` : 'none yet — applying will ask for one'));
+    state_.append(srvLine(w.passwordSet ? 'ok' : 'bad', 'Password',
+      w.passwordSet ? 'set on the console daemon'
+                    : 'not set — nobody can sign in until it is',
+      srvBtn(w.passwordSet ? 'Change' : 'Set', () => webAskPassword())));
+    const reach = w.reachable;
+    state_.append(srvLine(reach === 302 || reach === 200 ? 'ok' : reach ? 'warn' : 'bad',
+      'Address',
+      reach === 302 ? 'answering, and asking to sign in'
+        : reach === 200 ? 'answering'
+        : reach ? `answering with ${reach}`
+        : w.hostname ? 'no answer' : 'no address yet'));
+    if (w.error) state_.append(el('div', { class: 'srv-error' }, w.error));
+  }
+  const acts = el('div', { class: 'prov-acts' });
+  if (!busy) {
+    acts.append(srvBtn(w.cert ? 'Apply' : 'Set up', () => webApply(), 'accent'));
+    if (w.passwordSet) {
+      acts.append(srvBtn('Sign out all browsers', async () => {
+        try { await logoutBrowsers(); setWebBusy('signed everyone out'); }
+        catch (e) { setWebBusy(String(e.message || e)); }
+        setTimeout(() => setWebBusy(null), 2500);
+      }));
+    }
+  }
+  body.append(el('div', { class: 'prov-section' },
+    el('div', { class: 'prov-title-row' },
+      el('div', { class: 'prov-id' },
+        el('span', { class: 'prov-name' }, 'Gateway'),
+        el('span', { class: 'prov-url' }, w.hostname ? `https://${w.hostname}/` : '')),
+      acts), state_));
+
+  // -- which servers the phone can actually reach ----------------------
+  //
+  // A server is reachable because its daemon is on the gateway, or because it
+  // has dialled a tunnel there. Provisioning a server sets its tunnel up on
+  // its own; this is for the ones that were already there when the gateway
+  // was, and for repairing one that has stopped.
+  const reach = w.reach || {};
+  const rows = el('div', { class: 'prov-card' });
+  const listed = (w.servers || []).filter(s => reach[s.id] !== 'local');
+  if (!listed.length) {
+    rows.append(srvLine('busy', 'No servers yet', 'provision one and it appears here'));
+  }
+  for (const s of listed) {
+    const how = reach[s.id];
+    const mark = how === 'gateway' || how === 'tunnel' ? 'ok'
+               : how === 'down' ? 'bad' : 'none';
+    const detail = how === 'gateway' ? 'its daemon is on the proxy itself'
+      : how === 'tunnel' ? 'reached through the tunnel it opens'
+      : how === 'down' ? 'has a tunnel, but nothing is answering on it'
+      : 'not reachable from the proxy yet';
+    const act = how === 'gateway' ? null
+      : srvBtn(how === 'none' ? 'Connect' : 'Reconnect',
+               () => webConnect(s.id, s.name),
+               how === 'none' ? 'accent' : undefined);
+    rows.append(srvLine(mark, s.name, detail, act));
+  }
+  body.append(el('div', { class: 'prov-section' },
+    el('div', { class: 'prov-title-row' },
+      el('div', { class: 'prov-id' },
+        el('span', { class: 'prov-name' }, 'Servers'),
+        el('span', { class: 'prov-url' }, 'each one dials the proxy; the proxy never dials back'))),
+    rows));
+
+  paintPane('Web',
+    el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
+       body));
+}
+
+async function webConnect(serverId, name) {
+  setWebBusy(`connecting ${name}…`);
+  try {
+    await connectServerToWeb(serverId, text => setWebBusy(`${name}: ${text}`));
+    state.web = await webStatus();
+    setWebBusy(null);
+  } catch (e) {
+    state.web = { ...state.web, error: String(e.message || e) };
+    setWebBusy(null);
+  }
+}
+
+function setWebBusy(text) { state.webBusy = text; renderWebPane(); }
+
+async function webApply() {
+  setWebBusy('starting…');
+  try {
+    await applyWeb(text => setWebBusy(text));
+    state.web = await webStatus();
+    setWebBusy(null);
+  } catch (e) {
+    state.web = { ...state.web, error: String(e.message || e) };
+    setWebBusy(null);
+  }
+}
+
+/// Asked for in the pane rather than typed at a terminal, and sent straight
+/// through -- it is never held in the config or the keychain, because the
+/// only thing that needs it is the daemon it is being set on.
+function webAskPassword() {
+  const row = el('div', { class: 'prov-card' });
+  const input = el('input', { class: 'inline-edit', type: 'password',
+                              placeholder: 'at least 8 characters',
+                              style: 'min-width:200px' });
+  const save = srvBtn('Save', async () => {
+    try {
+      await setWebPassword(input.value);
+      setWebBusy('password set — every browser signed out');
+      state.web = await webStatus();
+    } catch (e) { setWebBusy(String(e.message || e)); }
+    setTimeout(() => setWebBusy(null), 2500);
+  });
+  row.append(srvLine('none', 'New password',
+                     'changing it signs out every browser', el('div', {}, input, save)));
+  const scroll = $main.querySelector('.pane-scroll .models-pane');
+  if (scroll) scroll.append(row);
+  input.focus();
 }
 
 function renderModelsPane() {

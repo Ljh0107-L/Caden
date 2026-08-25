@@ -182,6 +182,25 @@ reads; anything else — an archive, a video, a 40 MB png — is pushed to the
 server and the message carries the path the agent can open. Attachments are
 capped at 50 MB.
 
+## From a phone
+
+The renderer is a plain web page and the daemon can serve it, so a phone
+reaches a session with the laptop shut — which is the point of the work living
+on the server in the first place. Below 760px the sidebar becomes an overlay
+over the transcript, picking a session puts it away, and the controls a desktop
+only reveals on hover are simply always there.
+
+Reaching it takes a reverse proxy in front of the daemon, because the daemon
+binds loopback and should stay that way. One command writes the configuration:
+
+```
+scripts/web-gateway.cjs caden.example.net
+```
+
+[docs/WEB.md](docs/WEB.md) has the whole arrangement — what runs where, the
+nginx setting that will otherwise hang your event stream, what the console
+stops offering when its host cannot do it, and where your API keys end up.
+
 ## Layout
 
 ```
@@ -206,6 +225,7 @@ docs/ARCHITECTURE.md   how the pieces fit, and the event vocabulary
 docs/API.md            the daemon's HTTP surface
 docs/DESIGN.md         the visual system
 docs/DEVELOPING.md     working on Caden while using Caden: the two installs
+docs/WEB.md            reaching a daemon from a phone, with the Mac switched off
 ```
 
 ## Development
@@ -278,7 +298,9 @@ cp node_modules/@fontsource/jetbrains-mono/LICENSE app/web/fonts/LICENSE
   daemon, the same way it injects the daemon token. Keys are passed to the
   engine as process environment and never written into a session's own
   engine config (the session's `meta.json` does carry them, server-side, so a
-  session can resume after a daemon restart).
+  session can resume after a daemon restart — that file is 0600 and the
+  session tree around it 0700, so on a shared box it is not readable by
+  another account).
 - `POST /v1/exec` and the agents themselves run commands on the server. That is
   the product, not a bug — treat a Caden server as a machine you have handed the
   agent. Default permission mode is full access; the composer can drop a session

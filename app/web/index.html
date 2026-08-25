@@ -4,6 +4,9 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- Without this a phone lays the page out at 980px and scales it down, so
+       the narrow-screen rules in styles.css never match. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Caden</title>
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:;">

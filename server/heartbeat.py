@@ -34,6 +34,8 @@ Layout under $CADEN_HOME (default ~/.caden):
 import base64
 import errno
 import hashlib
+import hmac
+import secrets
 import itertools
 import json
 import os
@@ -55,7 +57,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PROTOCOL = 1
 
 
@@ -98,7 +100,18 @@ DIR_ENGINES = home("engines")
 DIR_SESSIONS = home("sessions")
 DIR_UPLOADS = home("uploads")
 DIR_TMP = home("tmp")
+# The console's own files, when this daemon has a copy. Not created by
+# `ensure_dirs`: an absent directory is how a daemon says it has no console to
+# serve, and an empty one would answer 404 to every asset instead.
+DIR_WEB = home("web")
 PATH_TOKEN = home("token")
+# Model credentials, keyed by provider id, as the Mac last synced them. See
+# resolve_key_ref.
+PATH_PROVIDERS = home("providers.json")
+# The console's own password, and the browser sessions it has handed out. Both
+# 0600; see web_password_set and web_session_new.
+PATH_WEB_PASSWORD = home("web-password")
+PATH_WEB_SESSIONS = home("web-sessions.json")
 PATH_LOG = home("heartbeat.log")
 PATH_PID = home("heartbeat.pid")
 # The port is recorded next to the pid because it is not always the one that
@@ -109,17 +122,31 @@ PATH_PORT = home("heartbeat.port")
 
 
 def ensure_dirs():
-    for d in (CADEN_HOME, DIR_BIN, DIR_RUNTIME, DIR_ENGINES, DIR_SESSIONS,
-              DIR_UPLOADS, DIR_TMP):
+    for d in (CADEN_HOME, DIR_BIN, DIR_RUNTIME, DIR_ENGINES):
         mkdirp(d)
+    # Transcripts, workspaces and anything uploaded belong to whoever started
+    # the daemon, not to every account on the box.
+    for d in (DIR_SESSIONS, DIR_UPLOADS, DIR_TMP):
+        mkdirp(d, 0o700)
 
 
-def mkdirp(path):
+def mkdirp(path, mode=None):
+    """Create `path` if it is missing, and tighten it if `mode` says so.
+
+    The chmod runs whether or not this call created the directory: the session
+    tree shipped as 0755 for the first release, and the daemons already out
+    there only get fixed if a later boot narrows what it finds.
+    """
     try:
         os.makedirs(path)
     except OSError as exc:
         if exc.errno != errno.EEXIST:
             raise
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError as exc:
+            log("warn", "could not chmod %s: %s", path, exc)
     return path
 
 
@@ -169,8 +196,12 @@ def read_text(path, default=""):
 _tmp_seq = itertools.count()
 
 
-def atomic_write(path, data):
+def atomic_write(path, data, mode=None):
     """Replace `path` in one step.
+
+    `mode` is applied to the scratch file before the rename, so the contents
+    are never briefly readable at the final name under whatever the umask
+    happens to be.
 
     The scratch name is unique per call, not per process.  Keyed on the pid
     alone, two threads writing the same file shared one `.tmp.<pid>`: they
@@ -188,6 +219,8 @@ def atomic_write(path, data):
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.rename(tmp, path)
     except Exception:
         try:
@@ -299,6 +332,18 @@ def run_capture(argv, cwd=None, env=None, timeout=120, stdin_data=None):
         out, err = proc.communicate()
         return 124, out.decode("utf-8", "replace"), "timed out after %ss" % timeout
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+WEB_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".woff2": "font/woff2",
+    ".ico": "image/x-icon",
+}
 
 
 def token_load_or_create():
@@ -981,7 +1026,7 @@ class BaseEngine(object):
     def remember_signature(self, argv):
         """Record what this process was started with, in memory and on disk."""
         self._sig = self.spawn_signature(argv)
-        self._hot = self.hot_settings()
+        self._hot = self.spawn_hot_settings()
         self.session.meta["engine_sig"] = self._sig
         self.session.meta["engine_hot"] = self._hot
         self.session.save()
@@ -994,6 +1039,11 @@ class BaseEngine(object):
         have no way to be told.
         """
         return {}
+
+    def spawn_hot_settings(self):
+        """What a freshly started process has. Usually what it was asked for,
+        because those settings are command-line flags."""
+        return self.hot_settings()
 
     def apply_hot_settings(self, want, have):
         raise EngineError("this engine cannot be reconfigured in place")
@@ -1895,6 +1945,8 @@ class ClaudeEngine(BaseEngine):
             self.emit("log", stream="caden",
                       text="model -> %s" % (want.get("model") or "default"))
         if want.get("permission_mode") != have.get("permission_mode"):
+            require_usable_permission_mode(self.session.meta.get("engine"),
+                                           want.get("permission_mode"))
             self._control("set_permission_mode", mode=want["permission_mode"])
             self.emit("log", stream="caden",
                       text="permission mode -> %s" % want["permission_mode"])
@@ -2279,6 +2331,100 @@ class CodexEngine(BaseEngine):
     def catalog_path(self):
         return self.session.path("engine", "model_catalog.json")
 
+    def _catalog_json(self):
+        """`codex debug models`, read once per process.
+
+        Two callers want it now -- the window patch below and the service tier
+        -- and it is a subprocess with a 30s timeout, so the second one reads
+        what the first got. The text is cached rather than the parsed object:
+        `write_model_catalog` edits every entry it is handed, and a shared
+        parse would hand the tier lookup a catalog with the windows already
+        rewritten.
+        """
+        if self._catalog_raw is not None:
+            return self._catalog_raw or None
+        binary = TOOLCHAIN.binary_for("codex")
+        if not binary:
+            return None
+        code, out, err = run_capture([binary, "debug", "models"],
+                                     env=self.build_env(), timeout=30)
+        if code != 0 or not out.strip():
+            # An install too old to render one.  The session still runs; it
+            # just keeps Codex's own window.
+            log("info", "[%s] model catalog unavailable (%s); leaving codex to "
+                "its own window", self.session.id, (err or "exit %s" % code)[:200])
+            self._catalog_raw = ""
+            return None
+        self._catalog_raw = out
+        return out
+
+    # Codex's own name for the `priority` tier is "Fast", and its catalog
+    # describes it as 1.5x speed for increased usage.
+    FAST_TIER = "priority"
+
+    # `codex debug models`, read at most once per engine. "" means it was asked
+    # for and there was no answer, which is not the same as not having asked.
+    # A class attribute rather than an `__init__` line because engines get
+    # built with `object.__new__` in places -- see `tests/engine_wiring_test.py`
+    # -- and a catalog read is not a reason for those to have to know about it.
+    _catalog_raw = None
+
+    def fast_tier(self):
+        """The service tier this turn should ask for, and why when there is none.
+
+        Returns `(tier, reason)`. `tier` is None when the turn should not carry
+        one; `reason` is None when that is simply because nobody asked.
+
+        Unlike Claude Code's fast mode this is a per-turn parameter, so there
+        is nothing to opt in to and nothing to reconcile -- it rides on
+        `turn/start` beside `effort`, and toggling it costs neither the process
+        nor the cache.
+
+        Which models have it is Codex's catalog to say, not Caden's: the list
+        moves with every CLI release, so a copy here would be wrong by the next
+        one. A model the catalog has never heard of -- the ordinary case behind
+        a gateway -- is the one case Caden decides, and it decides yes: the
+        entry `write_model_catalog` clones for it is the catalog's first, which
+        carries the tier. Asking for a tier the upstream will not honour costs
+        the turn nothing; the alternative is refusing a switch for every model
+        that is not on OpenAI's own list.
+        """
+        if not self.session.meta.get("fast"):
+            return None, None
+        model = self.session.meta.get("model")
+        raw = self._catalog_json()
+        if not raw:
+            # No catalog to consult. Send it: an install too old to list its
+            # models is also too old to be trusted to have dropped the tier.
+            return self.FAST_TIER, None
+        try:
+            models = json.loads(raw)["models"]
+        except (ValueError, KeyError, TypeError):
+            return self.FAST_TIER, None
+        entry = next((m for m in models if m.get("slug") == model), None)
+        if entry is None:
+            return self.FAST_TIER, None
+        tiers = [t.get("id") for t in (entry.get("service_tiers") or [])]
+        if self.FAST_TIER in tiers:
+            return self.FAST_TIER, None
+        return None, "model_not_supported"
+
+    def _note_fast(self, tier, why):
+        """Record what the turn actually asked for, which is not what was asked of it.
+
+        The composer draws the switch from `fast` and explains it from these:
+        wanting a tier and getting one are different, and a switch that lights
+        up over a model with no fast tier is exactly the thing this is here to
+        prevent.
+        """
+        state = "on" if tier else "off"
+        if (self.session.meta.get("fast_state") == state
+                and self.session.meta.get("fast_reason") == why):
+            return
+        self.session.meta["fast_state"] = state
+        self.session.meta["fast_reason"] = why
+        self.session.save()
+
     def write_model_catalog(self):
         """Give Codex a model catalog that says what the session declared.
 
@@ -2308,19 +2454,11 @@ class CodexEngine(BaseEngine):
         window = self.session.meta.get("context_window")
         if not window:
             return None
-        binary = TOOLCHAIN.binary_for("codex")
-        if not binary:
-            return None
-        code, out, err = run_capture([binary, "debug", "models"],
-                                     env=self.build_env(), timeout=30)
-        if code != 0 or not out.strip():
-            # An install too old to render one.  The session still runs; it
-            # just keeps Codex's own window.
-            log("info", "[%s] model catalog unavailable (%s); leaving codex to "
-                "its own window", self.session.id, (err or "exit %s" % code)[:200])
+        raw = self._catalog_json()
+        if raw is None:
             return None
         try:
-            catalog = json.loads(out)
+            catalog = json.loads(raw)
             models = catalog["models"]
             if not models:
                 raise ValueError("empty catalog")
@@ -2598,6 +2736,12 @@ class CodexEngine(BaseEngine):
                       self.session.meta.get("effort") or "")
         if effort:
             params["effort"] = effort
+        # Fast mode, which is a service tier here rather than a mode: one field
+        # on the turn, no process to replace and no control channel to wait on.
+        tier, why = self.fast_tier()
+        if tier:
+            params["serviceTier"] = tier
+        self._note_fast(tier, why)
         # Reasoning arrives encrypted and unreadable unless a summary is asked
         # for -- the field was simply never sent, so every Codex turn thought
         # in silence.
@@ -3264,6 +3408,197 @@ ENGINE_IDLE_SECONDS = 2 * 3600
 ENGINE_SWEEP_SECONDS = 300
 
 
+# --------------------------------------------------------------------------
+# the console's own login
+#
+# The daemon's bearer token is the right credential for a program and the
+# wrong one for a person: a browser cannot put a header on the navigation that
+# loads the page. What a reverse proxy could do instead was ask for HTTP basic
+# auth, and that worked, but the dialog is the browser's rather than Caden's,
+# it appears before anything has rendered, and Safari re-prompts on its own
+# schedule -- which, if it lands while an event stream is open, ends the
+# stream. So: a password here, a session cookie, and a page that looks like
+# the application it belongs to.
+#
+# nginx checks it through auth_request, not the daemon, because a gateway
+# fronts several daemons and only the proxy sees all of them. `/proxy/<id>/`
+# for some other machine never reaches this process, so a check that lived
+# only here would not cover it.
+# --------------------------------------------------------------------------
+
+WEB_COOKIE = "caden_web"
+WEB_SESSION_DAYS = 30
+# pbkdf2 rather than scrypt, which is the better function and is not always
+# there: hashlib.scrypt needs a Python built against OpenSSL 1.1+, and this
+# file's floor is 3.6 on whatever a minimal container happens to ship.
+# pbkdf2_hmac has been in the standard library since 3.4 with no such
+# condition, and an unconditional weaker function beats a stronger one that
+# raises AttributeError on somebody's server.
+#
+# 600k iterations is ~140ms here and ~400ms on a small VPS. Paid once a month
+# by the person logging in; paid on every guess by anyone else.
+PBKDF2_ITERS = 600000
+
+
+def web_password_set(password):
+    """Store a verifier for `password`. Never stores the password."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt,
+                                 PBKDF2_ITERS, dklen=32)
+    # The parameters travel with the hash so raising them later does not
+    # invalidate what is already stored.
+    atomic_write(PATH_WEB_PASSWORD,
+                 "pbkdf2_sha256$%d$%s$%s\n" % (
+                     PBKDF2_ITERS,
+                     base64.b64encode(salt).decode(),
+                     base64.b64encode(digest).decode()),
+                 mode=0o600)
+
+
+def web_password_check(password):
+    """True if `password` matches the stored verifier.
+
+    False when none is set: a console with no password is not one that lets
+    everybody in, it is one that cannot be signed into at all.
+    """
+    raw = read_text(PATH_WEB_PASSWORD).strip()
+    if not raw:
+        return False
+    try:
+        kind, iters, salt, want = raw.split("$")
+        if kind != "pbkdf2_sha256":
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                  base64.b64decode(salt), int(iters), dklen=32)
+    except Exception:
+        return False
+    return hmac.compare_digest(got, base64.b64decode(want))
+
+
+def web_sessions_load():
+    try:
+        with open(PATH_WEB_SESSIONS) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def web_sessions_save(sessions):
+    atomic_write(PATH_WEB_SESSIONS, json_dumps(sessions), mode=0o600)
+
+
+def _session_key(token):
+    """What goes on disk. A stolen file should not be a stolen session."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def web_session_new():
+    token = secrets.token_urlsafe(32)
+    sessions = web_sessions_load()
+    cutoff = now_ms()
+    # Expired ones go while we are here; nothing else ever prunes this file.
+    sessions = dict((k, v) for k, v in sessions.items() if v > cutoff)
+    sessions[_session_key(token)] = cutoff + WEB_SESSION_DAYS * 86400 * 1000
+    web_sessions_save(sessions)
+    return token
+
+
+def web_session_valid(token):
+    if not token:
+        return False
+    return web_sessions_load().get(_session_key(token), 0) > now_ms()
+
+
+def web_session_drop(token):
+    sessions = web_sessions_load()
+    if sessions.pop(_session_key(token or ""), None) is not None:
+        web_sessions_save(sessions)
+
+
+def web_sessions_drop_all():
+    web_sessions_save({})
+
+
+def provider_keys():
+    """Credentials this daemon has been given, keyed by provider id.
+
+    Read per call rather than held from boot: the Mac rewrites this file when
+    the provider list changes, and a cached copy would go on using a key that
+    was rotated away.
+    """
+    try:
+        with open(PATH_PROVIDERS) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_key_ref(spec):
+    """Swap a `key_ref` for the key it names.
+
+    The renderer never holds a model key. It sends the provider's id, and
+    whatever sits in front of the daemon puts the value in: on the Mac that is
+    app/server.js reading the login keychain (app/secret-inject.js).
+
+    A reverse proxy cannot -- it can add a header, not rewrite a JSON body --
+    so for a console served straight from this daemon the swap happens here
+    instead, out of the copy provisioning left behind.
+
+    A ref with nothing behind it is still stripped, so the request goes on to
+    fail at `require_credential` with its own clear message about a missing
+    key rather than looking like a malformed body.
+    """
+    if not isinstance(spec, dict):
+        return spec
+    ref = spec.pop("key_ref", None)
+    if not ref:
+        return spec
+    key = provider_keys().get(ref)
+    if key:
+        provider = dict(spec.get("provider") or {})
+        provider["api_key"] = key
+        spec["provider"] = provider
+    return spec
+
+
+# Claude Code refuses --dangerously-skip-permissions, which is what
+# bypassPermissions asks for, when it is running as root. That is a sensible
+# guardrail -- the agent runs arbitrary commands, and doing so as root on a
+# box reachable from a browser is not a thing to make easy -- so Caden does
+# not work around it. It says so before the turn instead.
+#
+# Only that one mode. acceptEdits, plan and dontAsk all start fine as root.
+ROOT_FORBIDS = ("bypassPermissions",)
+
+
+def running_as_root():
+    try:
+        return os.geteuid() == 0
+    except AttributeError:      # not POSIX; the question does not arise
+        return False
+
+
+def require_usable_permission_mode(engine, mode):
+    """Reject a mode this daemon cannot actually run in.
+
+    Without this the session is created, the turn starts, and the engine dies
+    on its first line with a message about a flag Caden never showed anyone --
+    which reads as "Caden is broken" rather than "this daemon is root".
+    """
+    if engine != "claude" or not running_as_root():
+        return
+    if (mode or "bypassPermissions") not in ROOT_FORBIDS:
+        return
+    raise ValueError(
+        "this daemon runs as root, and Claude Code refuses Full access there "
+        "(it is --dangerously-skip-permissions underneath). Pick Workspace "
+        "write or Read only for this session, or -- better -- provision the "
+        "daemon as an ordinary user: an agent that runs commands should not "
+        "be running them as root.")
+
+
 def require_credential(engine, provider):
     """Reject a session that has no credential of its own.
 
@@ -3380,8 +3715,18 @@ class Session(object):
         self.engine = None
         self._draining = False
         self.verbose_logs = bool(meta.get("verbose_logs"))
+        # The session's own directory too, and on load as well as on create:
+        # a home provisioned before sessions went 0700 still has 0755 ones in
+        # it, and this is the pass that narrows them. The meta file is named
+        # outright rather than left to heal on the next save, so an archived
+        # session nothing will write again is narrowed too.
+        mkdirp(self.path(), 0o700)
         for sub in ("logs", "engine", "tmp", "images"):
-            mkdirp(self.path(sub))
+            mkdirp(self.path(sub), 0o700)
+        try:
+            os.chmod(self.path("meta.json"), 0o600)
+        except OSError:
+            pass    # on create there is nothing to chmod yet; save() sets it
         # Any pid recorded here belongs to a process this daemon did not
         # spawn -- take it over if it is still ours, and only stop it when it
         # is not. A turn in flight then survives the daemon being replaced,
@@ -3447,7 +3792,9 @@ class Session(object):
         self.meta["updated_at"] = now_ms()
         snapshot = dict(self.meta)
         public = dict((k, v) for k, v in snapshot.items() if not k.startswith("_"))
-        atomic_write(self.path("meta.json"), json_dumps(public))
+        # The provider credential the session runs under is in here, so this
+        # is the one session file that must not be readable by other accounts.
+        atomic_write(self.path("meta.json"), json_dumps(public), mode=0o600)
 
     def append_stderr(self, line):
         try:
@@ -4014,6 +4361,11 @@ class Session(object):
             "tasks": self.meta.get("tasks") or [],
             "permission_mode": self.meta.get("permission_mode"),
             "effort": self.meta.get("effort"),
+            "fast": bool(self.meta.get("fast")),
+            # What the engine says, which is the half that matters: asking for
+            # fast mode is not the same as getting it.
+            "fast_state": self.meta.get("fast_state"),
+            "fast_reason": self.meta.get("fast_reason"),
             "last_summary": self.meta.get("last_summary"),
         }
         # Settings are applied when a message is sent, so a change made while
@@ -4058,6 +4410,7 @@ class SessionManager(object):
         if engine not in ENGINES:
             raise ValueError("unsupported engine %r" % engine)
         require_credential(engine, provider)
+        require_usable_permission_mode(engine, spec.get("permission_mode"))
         sid = new_id("s")
         cwd = spec.get("cwd") or ""
         if cwd:
@@ -4086,6 +4439,7 @@ class SessionManager(object):
             "engine_args": spec.get("engine_args") or [],
             "permission_mode": spec.get("permission_mode") or "bypassPermissions",
             "effort": spec.get("effort"),
+            "fast": bool(spec.get("fast")),
             "context_window": spec.get("context_window") or None,
             # Adopting an engine session that already exists on this host: the
             # id is the engine's own, and `resumed` makes the first spawn
@@ -4102,7 +4456,7 @@ class SessionManager(object):
             "turns": 0,
             "totals": {},
         }
-        mkdirp(os.path.join(DIR_SESSIONS, sid))
+        mkdirp(os.path.join(DIR_SESSIONS, sid), 0o700)
         sess = Session(self, meta)
         with self.lock:
             self.sessions[sid] = sess
@@ -4340,6 +4694,9 @@ def host_facts():
         "python": sys.version.split()[0],
         "caden_home": CADEN_HOME,
         "user": os.environ.get("USER") or os.environ.get("LOGNAME") or "",
+        # The Servers pane reads this: a daemon that cannot run the default
+        # permission mode should not be reporting itself simply ready.
+        "root": running_as_root(),
         "home": os.path.expanduser("~"),
         "engines": tc,
         "cpu_count": os.cpu_count() or 1,
@@ -5269,17 +5626,50 @@ class Handler(BaseHTTPRequestHandler):
         if LOG_LEVEL == "debug":
             log("debug", "%s %s", self.address_string(), fmt % args)
 
-    def _auth(self):
+    def _token_ok(self):
+        """Does this request carry the token? No side effects -- see `_auth`.
+
+        `compare_digest` rather than `!=`. The token is 264 bits and a timing
+        attack on it over a network is not a real threat, but the one-line
+        version of "not a real threat" is cheaper than the argument.
+        """
         expected = self.server.token
         if not expected:
-            return
+            return True
         given = self.headers.get("Authorization") or ""
         if given.startswith("Bearer "):
             given = given[7:]
         else:
             given = self.headers.get("X-Caden-Token") or ""
-        if given.strip() != expected:
-            raise HttpError(401, "bad or missing token")
+        return hmac.compare_digest(given.strip(), expected)
+
+    def _auth(self):
+        if self._token_ok():
+            return
+        # A throttle, not a defence -- guessing the token is not the threat
+        # model. It is here so that a proxy misconfigured in front of this
+        # daemon does not also become a free high-rate oracle. Deliberately
+        # short: the handler thread is held for the duration and there are a
+        # limited number of them.
+        time.sleep(0.25)
+        raise HttpError(401, "bad or missing token")
+
+    def _ping_body(self):
+        """Liveness for anyone; what is running here only for the token holder.
+
+        `ok` is all the liveness checks read -- app/host.js pings a forward
+        without authenticating to decide whether it is still usable, and has
+        to keep working when the token is missing or wrong. The version and
+        the source revision are a different matter: on a port that is one
+        proxy misconfiguration away from the internet, `heartbeat 0.1.0 rev
+        abc123` is the first line of a scanner's report. Anyone holding the
+        token can read the same two fields off /v1/health.
+        """
+        body = {"ok": True, "service": "heartbeat"}
+        if self._token_ok():
+            body.update({"version": VERSION, "protocol": PROTOCOL,
+                         "revision": REVISION})
+        return body
 
     def _body(self):
         try:
@@ -5307,6 +5697,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(payload)
+
+    def _cookie(self, name):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
+
+    def _set_cookie(self, token, days):
+        """Secure everywhere but a loopback host.
+
+        The carve-out is for reading the page over an ssh forward while
+        working on it, where there is no TLS to be had. Anywhere else a
+        cookie without Secure is one that a downgrade can read.
+        """
+        host = (self.headers.get("Host") or "").split(":")[0]
+        local = host in ("localhost", "127.0.0.1", "::1", "")
+        bits = ["%s=%s" % (WEB_COOKIE, token), "Path=/", "HttpOnly",
+                "SameSite=Lax", "Max-Age=%d" % (days * 86400)]
+        if not local:
+            bits.append("Secure")
+        self.send_header("Set-Cookie", "; ".join(bits))
 
     def _send_text(self, text, status=200, ctype="text/plain; charset=utf-8"):
         payload = text.encode("utf-8")
@@ -5343,13 +5755,24 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path).rstrip("/") or "/"
         query = parse_qs(parsed.query)
         try:
-            if path in ("/v1/ping", "/"):
-                return self._send_json({"ok": True, "service": "heartbeat",
-                                        "version": VERSION, "protocol": PROTOCOL,
-                                        "revision": REVISION})
+            # `/` was an alias for ping, and stays one on a daemon with no
+            # console to serve. Where there is one it is the console's, which
+            # means it goes through `_auth` below like the rest of the tree
+            # rather than answering a stranger with a login-shaped page.
+            if path == "/v1/ping" or (path == "/" and not os.path.isdir(DIR_WEB)):
+                return self._send_json(self._ping_body())
+            # The login itself cannot require being logged in. These three are
+            # the entire unauthenticated surface, and each is small on
+            # purpose: a form, its verifier, and the answer nginx asks for
+            # before it serves anything else.
+            if path in WEB_OPEN_PATHS.get(method, ()):
+                fn = WEB_OPEN_PATHS[method][path]
+                return fn(self, {}, query)
             self._auth()
             handler = self.server.router.match(method, path)
             if handler is None:
+                if method == "GET" and self._serve_web(path):
+                    return
                 raise HttpError(404, "no route for %s %s" % (method, path))
             fn, params = handler
             return fn(self, params, query)
@@ -5366,6 +5789,67 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": message, "status": status}, status=status)
         except Exception:
             pass
+
+    # -- the console ----------------------------------------------------
+    def _serve_web(self, path):
+        """Serve the renderer out of `~/.caden/web`, if provisioning put it there.
+
+        Returns False when there is nothing to serve, so the caller can raise
+        the 404 the API would have raised anyway -- a daemon from before the
+        console shipped is not a daemon with a broken console.
+
+        Behind `_auth` like every other route, because both ways a browser
+        actually gets here supply the token on every request, subresources
+        included: a reverse proxy adding the header, or the Mac app's own host
+        server. Leaving it open would buy nothing -- these files are public on
+        GitHub -- but it would mean a daemon whose proxy is misconfigured
+        answers a stranger with a recognisable console instead of a 401.
+        """
+        if not os.path.isdir(DIR_WEB):
+            return False
+        root = os.path.realpath(DIR_WEB)
+        rel = "index.html" if path == "/" else path.lstrip("/")
+        # realpath, not normpath: `..` is only half of it, and a symlink
+        # inside the tree pointing out of it is the other half.
+        target = os.path.realpath(os.path.join(root, rel))
+        if target != root and not target.startswith(root + os.sep):
+            raise HttpError(403, "outside the web root")
+        if not os.path.isfile(target):
+            return False
+        try:
+            st = os.stat(target)
+            with open(target, "rb") as fh:
+                body = fh.read()
+        except OSError:
+            return False
+
+        # The whole point of this path is a phone on a mobile connection, and
+        # the renderer plus its fonts is 340K. `no-store` -- what the Mac's
+        # host server sends, where the files are a local read -- would fetch
+        # all of it on every open. The tag is mtime and size rather than a
+        # digest of the bytes: provisioning rewrites these files wholesale, so
+        # a changed mtime is exactly the signal, and hashing 340K per request
+        # to learn the same thing is waste.
+        etag = '"%x-%x"' % (int(st.st_mtime), st.st_size)
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+
+        ctype = WEB_TYPES.get(os.path.splitext(target)[1].lower(),
+                              "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        # Revalidate every time, never reuse blindly: an upgraded daemon and a
+        # cached renderer from the build before it disagree about the protocol.
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
 
     # -- SSE ------------------------------------------------------------
     def stream_events(self, bus, after, follow=True, idle_timeout=None,
@@ -5679,7 +6163,7 @@ def h_sessions_list(req, params, query):
 
 
 def h_session_create(req, params, query):
-    body = req._json_body()
+    body = resolve_key_ref(req._json_body())
     try:
         sess = SESSIONS.create(body)
     except ValueError as exc:
@@ -5756,7 +6240,7 @@ def h_session_patch(req, params, query):
     sess = SESSIONS.get(params["sid"])
     if not sess:
         raise HttpError(404, "no such session")
-    body = req._json_body()
+    body = resolve_key_ref(req._json_body())
 
     # Everything is validated before any of it is applied, so a rejected patch
     # leaves the session exactly as it was.
@@ -5788,7 +6272,7 @@ def h_session_patch(req, params, query):
             body["cwd"] = resolved
 
     for key in ("title", "model", "model_label", "permission_mode", "cwd",
-                "effort", "verbose_logs", "add_dirs", "engine_args", "env",
+                "effort", "fast", "verbose_logs", "add_dirs", "engine_args", "env",
                 "archived", "context_window"):
         if key in body:
             sess.meta[key] = body[key]
@@ -5979,6 +6463,138 @@ def h_shutdown(req, params, query):
     threading.Thread(target=req.server.request_shutdown).start()
 
 
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caden</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg:#fbfbfa; --card:#fff; --line:#e6e4e1; --text:#1c1b19; --dim:#78746e;
+    --accent:#1c1b19; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#191817; --card:#211f1e; --line:#333130; --text:#eceae7;
+            --dim:#8f8a84; --accent:#eceae7; --bad:#f2b8b5; } }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100dvh; display:flex; align-items:center;
+    justify-content:center; padding:24px; background:var(--bg); color:var(--text);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; }
+  form { width:100%; max-width:320px; background:var(--card);
+    border:1px solid var(--line); border-radius:14px; padding:28px 24px; }
+  h1 { margin:0 0 4px; font-size:19px; letter-spacing:-0.2px; }
+  p  { margin:0 0 20px; color:var(--dim); font-size:13px; }
+  label { display:block; font-size:12px; color:var(--dim); margin-bottom:6px; }
+  input { width:100%; padding:11px 12px; border:1px solid var(--line);
+    border-radius:9px; background:var(--bg); color:var(--text);
+    /* 16px or iOS zooms in on focus and does not zoom back out. */
+    font-size:16px; }
+  input:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  button { width:100%; margin-top:14px; padding:11px; border:0; border-radius:9px;
+    background:var(--accent); color:var(--card); font-size:15px; font-weight:560;
+    cursor:pointer; }
+  .err { margin-top:12px; font-size:13px; color:var(--bad); min-height:19px; }
+</style></head><body>
+<form method="post" action="/v1/web/login">
+  <h1>Caden</h1>
+  <p>This console runs your agents. Sign in to reach them.</p>
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password"
+         autofocus required>
+  <input name="next" type="hidden" value="__NEXT__">
+  <button type="submit">Sign in</button>
+  <div class="err">__ERROR__</div>
+</form></body></html>
+"""
+
+
+def _login_html(error="", nxt="/"):
+    # The only two substitutions, and both are escaped: `next` arrives from a
+    # query string, which is to say from anywhere.
+    safe = nxt.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+    return LOGIN_PAGE.replace("__ERROR__", error).replace("__NEXT__", safe)
+
+
+def h_web_login_page(req, params, query):
+    nxt = q1(query, "next", "/") or "/"
+    # Only paths on this host. An open redirect on a login page is how a
+    # convincing phishing link gets built out of a domain you trust.
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        nxt = "/"
+    req.send_response(200)
+    req.send_header("Content-Type", "text/html; charset=utf-8")
+    req.send_header("Cache-Control", "no-store")
+    body = _login_html(nxt=nxt).encode("utf-8")
+    req.send_header("Content-Length", str(len(body)))
+    req.end_headers()
+    req.wfile.write(body)
+
+
+def h_web_login(req, params, query):
+    raw = req._body().decode("utf-8", "replace")
+    fields = dict((k, v[0]) for k, v in parse_qs(raw).items())
+    if not fields and raw.strip().startswith("{"):
+        try:
+            fields = json.loads(raw)
+        except ValueError:
+            fields = {}
+    nxt = fields.get("next") or "/"
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        nxt = "/"
+
+    if not web_password_check(fields.get("password") or ""):
+        # The same pause the token path takes. Not a defence -- scrypt is the
+        # defence -- but it keeps a misconfigured proxy from also being a
+        # fast oracle, and it is what fail2ban counts.
+        time.sleep(0.25)
+        log("warn", "web login failed from %s", req.address_string())
+        body = _login_html("That password did not work.", nxt).encode("utf-8")
+        req.send_response(401)
+        req.send_header("Content-Type", "text/html; charset=utf-8")
+        req.send_header("Cache-Control", "no-store")
+        req.send_header("Content-Length", str(len(body)))
+        req.end_headers()
+        return req.wfile.write(body)
+
+    token = web_session_new()
+    req.send_response(303)
+    req._set_cookie(token, WEB_SESSION_DAYS)
+    req.send_header("Location", nxt)
+    req.send_header("Content-Length", "0")
+    req.end_headers()
+
+
+def h_web_verify(req, params, query):
+    """What nginx asks before serving anything. Body irrelevant; status is all."""
+    if web_session_valid(req._cookie(WEB_COOKIE)):
+        req.send_response(200)
+    else:
+        req.send_response(401)
+    req.send_header("Content-Length", "0")
+    req.end_headers()
+
+
+def h_web_logout(req, params, query):
+    web_session_drop(req._cookie(WEB_COOKIE))
+    req.send_response(303)
+    req._set_cookie("", 0)
+    req.send_header("Location", "/login")
+    req.send_header("Content-Length", "0")
+    req.end_headers()
+
+
+def h_web_logout_all(req, params, query):
+    """Every browser, everywhere -- the answer to a lost phone."""
+    web_sessions_drop_all()
+    req._send_json({"ok": True})
+
+
+# Reachable without a session, because requiring one would be circular.
+WEB_OPEN_PATHS = {
+    "GET": {"/login": h_web_login_page, "/v1/web/verify": h_web_verify},
+    "POST": {"/v1/web/login": h_web_login},
+}
+
+
 def build_router():
     r = Router()
     r.add("GET", "/v1/health", h_health)
@@ -6006,6 +6622,8 @@ def build_router():
     r.add("POST", "/v1/uploads", h_upload_begin)
     r.add("PUT", "/v1/uploads/<uid>", h_upload_chunk)
     r.add("POST", "/v1/uploads/<uid>/complete", h_upload_complete)
+    r.add("POST", "/v1/web/logout", h_web_logout)
+    r.add("POST", "/v1/web/logout-all", h_web_logout_all)
     r.add("POST", "/v1/shutdown", h_shutdown)
     return r
 
@@ -6350,6 +6968,8 @@ def main(argv):
             action = "status"
         elif a == "--print-token":
             action = "token"
+        elif a == "--set-web-password":
+            action = "web-password"
         elif a == "--selftest":
             action = "selftest"
         elif a in ("--version", "-V"):
@@ -6369,6 +6989,20 @@ def main(argv):
         return cmd_status(port)
     if action == "stop":
         return cmd_stop()
+    if action == "web-password":
+        # From stdin, never a flag: an argument is in the process list while
+        # it runs and in a shell history afterwards.
+        pw = sys.stdin.readline().rstrip("\n")
+        if len(pw) < 8:
+            sys.stderr.write("that password is too short to be worth storing\n")
+            return 2
+        ensure_dirs()
+        web_password_set(pw)
+        # Anything already signed in was signed in against the old one.
+        web_sessions_drop_all()
+        print("web password set; existing browser sessions revoked")
+        return 0
+
     if action == "token":
         print(token_load_or_create())
         return 0

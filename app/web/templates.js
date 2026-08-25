@@ -88,7 +88,9 @@ const BUILD = {
     el('div', { class: 'sidebar-header-body' },
       navRow({ label: 'New session', icon: 'agent', badge: '⌘N' }),
       navRow({ label: 'Servers', icon: 'server' }),
-      navRow({ label: 'Models', icon: 'robot' }))),
+      navRow({ label: 'Models', icon: 'robot' }),
+      // Only shown where it can do anything -- see can('servers') in app.js.
+      navRow({ label: 'Web', icon: 'server' }))),
 
   navRow: () => navRow({ label: '', icon: 'agent' }),
 

@@ -86,6 +86,14 @@ step "SSH provisioning payload (exact file bytes)"
 node tests/provision-upload_test.cjs
 result $? "provision-upload_test.cjs"
 
+step "removing a server (its tunnel and its port go with it)"
+node tests/web_removal_test.cjs >/dev/null 2>&1
+result $? "web_removal_test.cjs"
+
+step "forward identity (a port answering is not the daemon you meant)"
+node tests/forward_identity_test.cjs >/dev/null 2>&1
+result $? "forward_identity_test.cjs"
+
 step "detached engines (survive a daemon restart)"
 python3 tests/detach_test.py --home "$HOME_DIR/detach" >/dev/null 2>&1
 result $? "detach_test.py"
@@ -93,6 +101,26 @@ result $? "detach_test.py"
 step "supervision (systemd unit, cron watchdog, crash recovery)"
 python3 tests/supervise_test.py --home "$HOME_DIR/supervise" --port $((PORT + 3)) >/dev/null 2>&1
 result $? "supervise_test.py"
+
+step "file permissions (a shared box cannot read the session tree)"
+python3 tests/permissions_test.py >/dev/null 2>&1
+result $? "permissions_test.py"
+
+step "fast mode (an opt-in with no flag behind it, sent at spawn)"
+python3 tests/fast_mode_test.py >/dev/null 2>&1
+result $? "fast_mode_test.py"
+
+step "provider credentials (key_ref resolved by the daemon, not by a proxy)"
+python3 tests/key_ref_test.py >/dev/null 2>&1
+result $? "key_ref_test.py"
+
+step "signing in to the console (password, cookie, and what next= may not do)"
+python3 tests/web_login_test.py >/dev/null 2>&1
+result $? "web_login_test.py"
+
+step "the console over HTTP (served, cached, and no way out of the web root)"
+python3 tests/console_serving_test.py >/dev/null 2>&1
+result $? "console_serving_test.py"
 
 step "event stream (the terminal event survives the close)"
 python3 tests/stream_close_test.py
@@ -127,6 +155,14 @@ step "end-to-end (renderer in a real browser, mock engine)"
 if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
   node tests/e2e/session.mjs
   result $? "e2e (playwright)"
+  node tests/e2e/narrow.mjs
+  result $? "e2e narrow (phone-sized viewport, touch pointer)"
+  node tests/e2e/gateway.mjs
+  result $? "e2e gateway (served by a proxy, with the Mac switched off)"
+  node tests/e2e/viewports.mjs
+  result $? "e2e viewports (every width a phone reports, and a desktop)"
+  node tests/e2e/fast.mjs
+  result $? "e2e fast (a switch only where the engine can honour it)"
 else
   echo "   skip  e2e -- npm install && npx playwright install chromium"
 fi

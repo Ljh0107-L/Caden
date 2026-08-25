@@ -52,6 +52,30 @@ ssh "$TARGET" "mkdir -p $REMOTE && chmod 700 $REMOTE"
 echo "==> uploading heartbeat.py, bootstrap.sh and supervise.sh"
 scp -q server/heartbeat.py server/bootstrap.sh server/supervise.sh "$TARGET:$REMOTE/"
 
+# The console, so the daemon can serve it to a browser -- and the credentials,
+# so it can resolve a key_ref with no host in front of it to do that for it.
+# The app sends both (app/host.js, buildProvisionScript); a server set up with
+# this script has to end up the same, or "provisioned" means two things.
+echo "==> uploading the console"
+# --no-owner/--no-group: `-a` would carry this Mac's uid across, and 501:staff
+# is nobody on a Linux server. Harmless while the daemon runs as root, wrong
+# the moment it does not.
+rsync -a --no-owner --no-group --delete --exclude '.*' app/web/ "$TARGET:$REMOTE/web/"
+ssh "$TARGET" "chmod 700 $REMOTE/web"
+
+# Piped rather than written to a temp file and copied: these are API keys, and
+# the shortest path is the one that leaves no local copy behind. `null` means
+# the config lists providers and the keychain answered for none of them --
+# locked, most likely -- and overwriting the server's working keys with an
+# empty set is the one outcome worse than doing nothing.
+CREDS=$(CADEN_FLAVOR="$FLAVOR" node -p 'JSON.stringify(require("./app/host").providerSecrets())')
+if [ "$CREDS" = "null" ]; then
+  echo "==> no provider keys could be read; leaving any on the server alone"
+else
+  echo "==> syncing provider credentials"
+  printf '%s\n' "$CREDS" | ssh "$TARGET" "umask 077; cat > $REMOTE/providers.json"
+fi
+
 echo "==> starting the daemon on port $PORT"
 OUT=$(ssh "$TARGET" "sh $REMOTE/bootstrap.sh --home $REMOTE --port $PORT --supervise" | tail -1)
 
@@ -84,6 +108,16 @@ SID=$(echo "$ID" | cut -f1); TOKEN=$(echo "$ID" | cut -f2); HOSTNAME=$(echo "$ID
 
 security add-generic-password -s "$SERVICE" -a "server.$SID" -w "$TOKEN" -U
 echo "==> $HOSTNAME ready; token stored in the login keychain under $SERVICE"
+
+# And on the phone, if there is a gateway to put it on. The app does this at
+# the end of provisioning; a server set up from here has to end up in the same
+# state, or "provisioned" means two different things depending on which way
+# you did it.
+CADEN_FLAVOR="$FLAVOR" SID="$SID" node -e '
+const host = require("./app/host");
+const server = (host.readConfig().servers || []).find(s => s.id === process.env.SID);
+if (server) host.attachToWebGateway(server, t => console.log("==> " + t));
+' || echo "==> the web gateway was not updated"
 echo
 echo "Open the forward, then start $LABEL:"
 echo "  ssh -N -L $PORT:127.0.0.1:$PORT $TARGET"

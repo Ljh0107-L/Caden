@@ -493,7 +493,9 @@ for (const [proto, want] of [['anthropic-messages', 'claude'],
 // answers 200 and drops fields it does not know is otherwise indistinguishable
 // from a working one, which is how archiving looked like a client-side bug.
 {
-  const ping = await fetch(`${BASE}/v1/ping`).then(r => r.json());
+  const ping = await fetch(`${BASE}/v1/ping`,
+                           { headers: { Authorization: `Bearer ${TOKEN}` } })
+    .then(r => r.json());
   const { createHash } = await import('node:crypto');
   const { readFileSync } = await import('node:fs');
   const want = createHash('sha256')
@@ -503,6 +505,18 @@ for (const [proto, want] of [['anthropic-messages', 'claude'],
         ping.revision);
   check('the revision matches this checkout', ping.revision === want,
         `${ping.revision} vs ${want}`);
+
+  // And says nothing about itself to anyone else. The daemon is meant to sit
+  // behind a proxy that authenticates, but a banner naming the software, the
+  // version and the exact source revision is the first line of a scanner's
+  // report if that proxy is ever configured wrong. Liveness still answers,
+  // because app/host.js checks a forward without a token.
+  const anon = await fetch(`${BASE}/v1/ping`).then(r => r.json());
+  check('an unauthenticated ping still reports liveness', anon.ok === true,
+        JSON.stringify(anon));
+  check('but names no version or revision',
+        anon.version === undefined && anon.revision === undefined
+        && anon.protocol === undefined, JSON.stringify(anon));
 }
 
 // -- the filesystem browser the workdir picker uses ---------------------------
