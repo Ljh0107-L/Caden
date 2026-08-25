@@ -1246,13 +1246,40 @@ function renderTranscript(ctl) {
       // put back sixty times a second underneath it. The moment it counts from
       // is written into the node instead, the same way the interval above
       // ticks the number itself.
-      place('live', ['live', ran, !!compacting], () =>
+      // What the turn is actually doing, as far as this side can tell.
+      //
+      // `ran` says a tool ran earlier in this turn, not that one is running
+      // now -- so a turn stalled on the network read "Working…", which claims
+      // progress. Before anything at all has come back, the honest word is
+      // that we are waiting: on a slow link the first token can be the whole
+      // wait, and that is worth telling apart from a model that is thinking
+      // with its answer already streaming.
+      const heard = items.some(i => i.turn === tail?.turn
+        && (i.kind === 'assistant' || i.kind === 'thinking' || i.kind === 'tool'));
+      const phase = compacting ? 'Compacting the conversation…'
+        : !heard ? 'Waiting for the model…'
+        : ran ? 'Working…' : 'Thinking…';
+      place('live', ['live', ran, heard, !!compacting], () =>
         el('div', { class: 't-row reply' },
           el('div', { class: 'working-row' },
             tpl('dotLoader'),
-            el('span', {}, compacting ? 'Compacting the conversation…'
-                                      : ran ? 'Working…' : 'Thinking…'),
+            el('span', {}, phase),
             el('span', { class: 'live-elapsed' }))));
+      // A long silence is the one thing here worth acting on, and a bare
+      // number does not read as one: two seconds and two minutes look alike
+      // apart from the digits. Past a threshold the row says outright that
+      // nothing has arrived, which on a link that drops connections is
+      // usually what has happened.
+      const row = next.get('live')?.node;
+      if (row) {
+        const quiet = since && Date.now() - since > 45000;
+        row.dataset.quiet = quiet ? 'yes' : '';
+        row.title = quiet && !compacting
+          ? 'Nothing has come back since the time shown — the turn is still '
+            + 'open, so this is usually a slow first token or a connection '
+            + 'being re-established'
+          : '';
+      }
       const clock = next.get('live')?.node.querySelector('.live-elapsed');
       if (clock && clock.dataset.since !== String(since)) {
         clock.dataset.since = String(since);
@@ -1371,8 +1398,16 @@ function renderRow(row, open, liveTail = false, ctl = null) {
       // No decorative rows: skip thinking blocks that carry no text (some
       // gateways strip thinking deltas), unless it's the live tail.
       if (!item.text.trim() && !liveTail) return null;
+      // Open while it is arriving. A new fold starts closed -- `open` is the
+      // set the reader has opened by hand -- so reasoning streamed into a
+      // collapsed block: the one part of a long turn that says what it is
+      // doing was behind a chevron, and the transcript sat still for a minute
+      // with the answer already on screen and hidden. It collapses again when
+      // it finishes, which is where the header stops saying "Thinking…" and
+      // starts saying how long it took.
+      const shown = liveTail ? new Set([...open, `think:${item.id}`]) : open;
       return toolFold({
-        key: `think:${item.id}`, open, action: thinkLabel(item, liveTail),
+        key: `think:${item.id}`, open: shown, action: thinkLabel(item, liveTail),
         buildBody: () => {
           const body = el('div', { class: 'fold-body', text: item.text || '…' });
           // How much of the block is already on screen, so a later delta can
@@ -2181,7 +2216,10 @@ function buildStatusRow(ctl, entry, onToggleContext) {
     });
   }
 
-  row.append(slot, fastBtn, effortBtn, gauge);
+  // Filtered, because this is the DOM's `append` and not `el`: given null it
+  // inserts the string "null" as a text node. `fastBtn` is null on every
+  // Claude session, which is where the word turned up.
+  row.append(...[slot, fastBtn, effortBtn, gauge].filter(Boolean));
   row.classList.add('caden-status-row');
   return row;
 }

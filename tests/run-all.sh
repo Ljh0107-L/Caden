@@ -167,6 +167,8 @@ if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
   result $? "e2e viewports (every width a phone reports, and a desktop)"
   node tests/e2e/fast.mjs
   result $? "e2e fast (a switch only where the engine can honour it)"
+  node tests/e2e/reasoning.mjs
+  result $? "e2e reasoning (visible while it is still arriving)"
 else
   echo "   skip  e2e -- npm install && npx playwright install chromium"
 fi

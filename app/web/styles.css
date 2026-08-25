@@ -645,6 +645,12 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
 .effort-btn[data-on]:hover { background: var(--accent-bg-hover); }
 .effort-btn[data-on] svg { color: var(--accent-fg); }
 
+/* A live row that has heard nothing for a while. The dots keep moving -- the
+   turn is open and this is not a failure -- but the row stops reading as
+   ordinary progress. */
+.t-row[data-quiet="yes"] .working-row { color: var(--text-2); }
+.t-row[data-quiet="yes"] .live-elapsed { color: var(--warn, #c9a227); }
+
 /* ---------- scrollbars ---------- */
 
 @layer caden-reset {

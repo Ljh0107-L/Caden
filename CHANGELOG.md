@@ -46,6 +46,22 @@ Two things a devbox found.
   not look alike: a machine with no route says so instantly and always, and a
   machine whose egress drops connections times out and then works — only the
   first is worth refusing.
+- **Reasoning is on screen while it is arriving.** A fold starts closed —
+  `open` is the set the reader has opened by hand — so a reasoning block
+  streamed into a collapsed one, and the body a delta appends to is only built
+  when the fold opens. So the deltas had nowhere to land: not hidden, not
+  rendered, rebuilt from scratch on the first click. What a long think looked
+  like was a chevron and a header that never changed, which is exactly what a
+  turn that has stopped looks like — and on a model that reasons for a minute
+  before its first visible word, that is the whole turn. The live block is open
+  now and grows in place, and folds away when the header stops saying
+  "Thinking…" and starts saying how long it took.
+- **A turn with nothing back yet says it is waiting, not working.** "Working…"
+  was drawn whenever a tool had run earlier in the turn — earlier, not now — so
+  a turn stalled on the network claimed progress it was not making. Before
+  anything at all has arrived the honest word is that we are waiting, and past
+  three quarters of a minute of silence the row says so rather than leaving the
+  reader to compare two timestamps.
 - **A wait that is going somewhere says how long it has been.** The bottom rung
   retries, so the probe window has to be long enough to let it, and a minute of
   one unchanging line reads as a hang in exactly the case where it is not one.
