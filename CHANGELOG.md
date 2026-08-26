@@ -3,6 +3,38 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 until 1.0 the minor number carries breaking changes.
 
+## 0.2.2
+
+Two hosts that cannot supervise, and the two ways that went wrong.
+
+- **A crontab that refuses no longer throws away a daemon that started.** With
+  no systemd user bus on the host, `supervise.sh` falls back to a cron
+  watchdog, and it has always given up gracefully when there was no `crontab`
+  to install one with. A container image whose `/usr/bin/crontab` has lost its
+  setgid bit is not that host: the binary is there, `command -v` finds it, and
+  the write comes back `/var/spool/cron/: mkstemp: Permission denied`. Under
+  `set -e` that ended the script, so bootstrap called it `supervision install
+  failed` and never printed the line the Mac reads — and the daemon it had
+  started a moment earlier, listening and healthy, was reported as "Daemon:
+  not installed", with the forward closed and both engines unknown. Every
+  retry reached the same wall, so the server could not be set up at all. A
+  crontab that will not have us is now the same answer as no crontab: the
+  supervisor comes back `none`, the card says the daemon will not restart by
+  itself, and the rest of the provisioning stands.
+- **A systemd rung that dies with the last login is declined rather than
+  taken.** The tunnel ladder took the systemd rung wherever `systemctl --user`
+  answered, wrote the unit, started it and reported a supervised tunnel. An
+  account that cannot enable lingering — `loginctl enable-linger` answers
+  `Access denied` — has a `systemd --user` that stops with the last login
+  session and takes `caden-tunnel.service` with it. That failure has an
+  unusually mean shape: an ssh session is what keeps the user manager alive,
+  so the tunnel is up whenever anyone is looking at the machine and gone by
+  the time they reach the console — every check from a terminal found the unit
+  running while the phone went on getting a 502. Availability and durability
+  are different questions and the rung asks both now, a bus *and* lingering.
+  Where lingering is refused it has nothing the rungs below it do not, so it
+  stands aside and lets them have the tunnel.
+
 ## 0.2.1
 
 Two things a devbox found.

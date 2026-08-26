@@ -144,7 +144,25 @@ cron_install() {
   cron_current > "$tmp"
   cron_line_reboot >> "$tmp"
   cron_line_watch >> "$tmp"
-  "$CRON" "$tmp"
+  # Present is not the same as usable, and the guard above only covered
+  # absent. A devbox image whose `/usr/bin/crontab` had lost its setgid bit
+  # answered `command -v` and then refused the write -- `/var/spool/cron/:
+  # mkstemp: Permission denied`, and `crontab -l` no better. Under `set -e`
+  # that ended the script, bootstrap reported `supervision install failed`,
+  # and a daemon that was already up and listening on the host was thrown
+  # away with it: provisioning could never finish there, however often it was
+  # retried. A crontab that will not have us is the case above, arrived at
+  # one step later.
+  #
+  # stderr goes nowhere on purpose. bootstrap captures this command's output
+  # with `2>&1` and parses it as the one JSON line, so a crontab that
+  # explains itself would take the `supervisor` field down with it -- and
+  # "none" is exactly what the server card needs to warn with.
+  if ! "$CRON" "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    SUPERVISOR="none"
+    return 0
+  fi
   rm -f "$tmp"
   SUPERVISOR="cron"
 }
@@ -154,7 +172,10 @@ cron_uninstall() {
   tmp=$(mktemp)
   cron_current > "$tmp"
   if [ -s "$tmp" ]; then
-    "$CRON" "$tmp"
+    # Non-fatal for the same reason install is: a host that never accepted our
+    # two lines has none of ours to take out, and refusing to finish the
+    # uninstall there would strand the teardown that calls it.
+    "$CRON" "$tmp" 2>/dev/null || true
   else
     # Nothing left: drop the whole crontab rather than installing an empty one.
     "$CRON" -r 2>/dev/null || true
