@@ -61,6 +61,13 @@ case "${1:-}" in
 esac
 """
 
+FAKE_CRONTAB_DENIED = """#!/bin/sh
+# A crontab that is installed and will not have us: the devbox image whose
+# binary had lost its setgid bit answered every call like this.
+echo "/var/spool/cron/: mkstemp: Permission denied" >&2
+exit 1
+"""
+
 FAKE_SYSTEMCTL = """#!/bin/sh
 # Records every call and fakes active/inactive state in a file.
 echo "$*" >> "$CADEN_FAKE_SYS_LOG"
@@ -161,6 +168,31 @@ def main():
     if r.returncode == 0:
         out = json.loads(r.stdout.strip().splitlines()[-1])
         check("reports no supervisor", out.get("supervisor") == "none", str(out))
+
+    # A crontab that answers `command -v` and then refuses the write. The
+    # guard above only covered absent, so this one exited non-fatally under
+    # `set -e`, bootstrap called it `supervision install failed`, and the
+    # daemon already listening on that host was discarded with it -- the box
+    # could never finish provisioning however often it was retried.
+    denied_env = dict(os.environ, CADEN_SUPERVISOR="cron",
+                      CADEN_CRON_CMD=write_fake(tmp, "crontab-denied",
+                                                FAKE_CRONTAB_DENIED),
+                      CADEN_UNIT_DIR=os.path.join(tmp, "no-unit-here"))
+    r = subprocess.run(sup + args, env=denied_env,
+                       capture_output=True, text=True)
+    check("a crontab that refuses is non-fatal", r.returncode == 0,
+          r.stderr.strip())
+    if r.returncode == 0:
+        lines = r.stdout.strip().splitlines()
+        # bootstrap reads this with `2>&1` and parses the whole of it, so what
+        # the crontab had to say must not end up on stdout beside the JSON.
+        check("stdout stays one JSON line", len(lines) == 1, r.stdout)
+        out = json.loads(lines[-1])
+        check("reports no supervisor", out.get("supervisor") == "none", str(out))
+
+    r = subprocess.run(sup + ["uninstall", "--home", home],
+                       env=denied_env, capture_output=True, text=True)
+    check("uninstall survives it too", r.returncode == 0, r.stderr.strip())
 
     # ----------------------------------------------------- systemd service
     print("== systemd user service")
