@@ -198,9 +198,9 @@ leaves the recorded window exactly where it was. What works is replacing the
 catalog. `model_catalog_json` takes a path, so Caden reads the CLI's own catalog
 back out of `codex debug models`, sets every window to what the session
 declared, clones an entry for a model the catalog is missing, and points the
-spawn at the result. 800k declared then records as 760k — the catalog's own
-`effective_context_window_percent`, which is left alone because that 5% is the
-CLI's reply headroom, the same idea as Claude Code's 33k buffer.
+spawn at the result. The catalog's own `effective_context_window_percent` is
+set to 100 on the way past, or the CLI charges for the reply a second time on
+top of the headroom Caden has already left it.
 
 An entry has twenty-five fields, which is why the catalog is patched rather
 than written: inventing one invites a parse failure, and Codex refuses to start
@@ -215,10 +215,26 @@ phase belongs to `BaseEngine`, so one client vocabulary covers both. The item
 carries no token counts, so a Codex compaction reports how long it took and
 nothing else, and the row reads as a sentence either way.
 
-Codex needs no such approximation: its catalog window is set to the declared
-number **plus `CODEX_REPLY_RESERVE`**, its own percentage cut is disabled, and
-`model_auto_compact_token_limit` is set to the declared number itself. The reply
-gets the reserve, the conversation gets exactly what was asked for.
+Codex compacts at **nine tenths of its catalog window**, and takes no
+instruction on the point. That was measured rather than assumed, in both
+directions: on `codex-cli` 0.146.0 a catalog window of 100k resolved
+`auto_compact_scope_limit=Some(90000)` with `model_auto_compact_token_limit`
+set to 95000 on the command line, and again with `auto_compact_token_limit`
+written into the catalog entry itself — a real field of the entry schema; a
+0.149.1 on a devbox logged a limit of 748800 against a window of 832000. The
+line to read is `post sampling token usage` in `$CODEX_HOME/logs_2.sqlite`,
+which is where to re-measure this after a Codex release.
+
+So the catalog window is not only what fits, it is where compaction lands, and
+a window written as `declared + reserve` spent the reserve on the threshold
+instead of the reply: 800k declared recorded 832000 and compacted at 748800,
+51200 short, on every turn, with the gauge still drawing 800k. What is written
+now is ten ninths of the declared number — 800k records 888889 — so Codex's own
+tenth comes off it onto 800000 exactly, and the tenth above the compaction
+point is the reply's room. `model_auto_compact_token_limit` is still set to the
+declared number: nothing reads it today, and it names the same point the window
+already puts the session at, so a build that starts reading it agrees rather
+than moves anybody.
 
 **Codex** is driven through `codex app-server`, the newline-delimited JSON-RPC
 protocol the interactive Codex speaks — one long-lived process per session, as

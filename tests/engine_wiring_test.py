@@ -16,11 +16,12 @@ symptom is behaviour nobody chose.
     `model_provider` and `model`, which would decide for a session that already
     said what it wanted -- the substitution `SEEDED_ENV_DENY` takes back out of
     Claude's `settings.json`, arriving through Codex's file instead.
-  * A declared context window is two settings, not one: what fits, and when to
-    make room. Codex takes the first from its catalog and the second from
-    `model_auto_compact_token_limit`, so setting only the catalog left a
-    session compacting wherever Codex's default put it -- with the gauge still
-    drawing the number Caden asked for.
+  * A declared context window is one setting doing two jobs: Codex takes what
+    fits from its catalog, and takes when to make room from nine tenths of the
+    same number -- `model_auto_compact_token_limit` looks like the second
+    lever and, measured, moves nothing. A catalog written to the declared
+    number therefore compacts a tenth early, with the gauge still drawing what
+    Caden asked for.
 
     python3 tests/engine_wiring_test.py
 """
@@ -169,16 +170,22 @@ CATALOG = {"models": [
 def test_compaction_limit(caden, root):
     """A declared window has to move the compaction point, not just the gauge.
 
-    Codex resolves the window from its catalog but decides when to compact
-    from `model_auto_compact_token_limit`, a key of its own. Setting only the
-    first is what left a session showing 72% of a declared 800k while the
-    engine was already rewriting the conversation.
+    Codex decides when to compact from the catalog window and from nothing
+    else: nine tenths of it, with no way to ask for another number. Measured
+    on `codex-cli` 0.146.0, a catalog window of 100k resolved
+    `auto_compact_scope_limit=Some(90000)` both with
+    `-c model_auto_compact_token_limit=95000` on the command line and with
+    `auto_compact_token_limit` written into the catalog entry itself; a
+    0.149.1 on a devbox agreed from the other end, logging a limit of 748800
+    against a catalog window of 832000.
 
-    And the declared number is what has to fit in the *conversation*. Codex
-    reads its catalog window as the whole budget and keeps a slice back for the
-    answer, so a session that asked for 800k was compacted at 631k. The room
-    for the reply is added on top instead, and compaction fires at the number
-    that was asked for.
+    So a session that declared 800k got `800000 + 32000` written down and was
+    compacted at 748800 -- 51200 short, on every single turn, with the gauge
+    still drawing 800k and the conversation quietly losing six percent of what
+    it had been promised. Ten ninths of the declared number is written down
+    now, and Codex's own tenth comes off it to land on 800000 exactly. What
+    sits above the compaction point is the reply's room, which is what the
+    flat reserve was for.
     """
     engine = object.__new__(caden.CodexEngine)
     engine.session = FakeSession(root, {"model": "gpt-5.6-sol",
@@ -194,23 +201,37 @@ def test_compaction_limit(caden, root):
         caden.run_capture = real
 
     written = json.load(open(path))
-    check("the catalog carries the declared window plus the reply's room",
-          all(m["context_window"] == 832000 for m in written["models"]),
-          str([m["context_window"] for m in written["models"]]))
-    # Codex would otherwise take its own percentage off that total, charging
-    # for the reply a second time.
+    windows = [m["context_window"] for m in written["models"]]
+    check("the catalog carries ten ninths of the declared window",
+          all(w == 888889 for w in windows), str(windows))
+    # The property is the point, not the number: this is where compaction
+    # actually lands, and rounding the line above down would put it one token
+    # short of what the session asked for.
+    check("so Codex's own tenth comes off it onto the declared number",
+          all(w * caden.CODEX_AUTO_COMPACT_PERCENT // 100 == 800000
+              for w in windows),
+          str([w * caden.CODEX_AUTO_COMPACT_PERCENT // 100 for w in windows]))
+    check("and it holds for every window a session might declare",
+          all(caden.CodexEngine._catalog_window(d)
+              * caden.CODEX_AUTO_COMPACT_PERCENT // 100 == d
+              for d in (100000, 128000, 200000, 272000, 400000, 1000000)))
+    # Codex would otherwise take a second percentage off that total, charging
+    # for the reply twice.
     check("and Codex is told not to take its own cut as well",
           all(m["effective_context_window_percent"] == 100
               for m in written["models"]),
           str([m["effective_context_window_percent"] for m in written["models"]]))
     check("max_context_window keeps up with it",
-          all(m["max_context_window"] >= 832000 for m in written["models"]),
+          all(m["max_context_window"] >= 888889 for m in written["models"]),
           str([m["max_context_window"] for m in written["models"]]))
-    check("compaction fires at the number the session asked for",
+    check("the limit asked for by name is the same point",
           engine._auto_compact_limit == 800000, str(engine._auto_compact_limit))
 
     argv = engine.argv()
-    check("the limit is passed alongside the catalog",
+    # Sent even though no build tried has read it: it names the same point the
+    # catalog puts the session at, so a build that starts honouring it agrees
+    # with the window rather than moving the session.
+    check("and is passed alongside the catalog",
           cfg_value(argv, "model_auto_compact_token_limit") == "800000",
           "%r" % cfg_value(argv, "model_auto_compact_token_limit"))
     check("the catalog is passed too",

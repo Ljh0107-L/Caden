@@ -797,15 +797,22 @@ THINKING_BUDGET = {"low": 4096, "medium": 16000, "high": 32000,
 # few hundred tokens, against a turn whose reasoning cannot be read at all.
 CODEX_REASONING_SUMMARY = "detailed"
 
-# Room for the reply, added on top of the window a session declared.
+# How much of a catalog context window Codex lets a conversation reach before
+# it compacts, as a percentage of that window.
 #
-# A declared window is a promise about what fits in the conversation. Codex
-# reads its catalog number as the whole budget and then keeps a percentage of
-# it back for the answer -- about a fifth -- so a session that asked for 800k
-# was compacted at 631k and the other 169k was never conversation at all.
-# Telling it 800k + this, and compacting at 800k, keeps the promise and leaves
-# the reply somewhere to go.
-CODEX_REPLY_RESERVE = 32000
+# It takes no instruction on the point. Measured against `codex-cli` 0.146.0
+# with a catalog window of 100k: `-c model_auto_compact_token_limit=95000`
+# resolved to `auto_compact_scope_limit=Some(90000)`, and writing
+# `auto_compact_token_limit` into the catalog entry itself -- a real field of
+# the entry schema -- resolved to 90000 as well. A 0.149.1 on a devbox agrees
+# from the other end: a catalog window of 832000 logged a limit of 748800.
+#
+# So the catalog window is the only lever, and it sets the threshold as much
+# as the ceiling: whatever a session declares has to *be* this percentage of
+# the number written down, which is what `_catalog_window` does. To re-measure
+# after a Codex release, run one turn and read `auto_compact_scope_limit` and
+# `full_context_window_limit` out of `$CODEX_HOME/logs_2.sqlite`.
+CODEX_AUTO_COMPACT_PERCENT = 90
 
 
 class EngineError(Exception):
@@ -2492,8 +2499,12 @@ class CodexEngine(BaseEngine):
         # AUTO_COMPACT_WINDOW; see `engine_env`.
         #
         # Compaction fires at the declared number, which is the whole point of
-        # declaring one. The catalog is `window + CODEX_REPLY_RESERVE`, so what
-        # is left when this fires is the reply's, not the conversation's.
+        # declaring one -- but not because of this. Codex takes the threshold
+        # from the catalog window and nothing else (see
+        # CODEX_AUTO_COMPACT_PERCENT), so `_catalog_window` is what puts it on
+        # the declared number and what is left above is the reply's. This is
+        # kept because it is the right number to hand a build that starts
+        # reading it, whichever way it then combines the two.
         self._auto_compact_limit = max(1, window)
         path = self.catalog_path()
         atomic_write(path, json_dumps(catalog))
@@ -2503,10 +2514,22 @@ class CodexEngine(BaseEngine):
     def _catalog_window(window):
         """What to tell Codex the window is, given what the session declared.
 
-        The declared number is what has to fit in the conversation, so the
-        reply's room goes on top of it rather than being taken out of it.
+        The declared number is what has to fit in the conversation, and Codex
+        compacts at `CODEX_AUTO_COMPACT_PERCENT` of whatever this returns, so
+        the declared number has to be that percentage of it. What is left
+        above is the reply's room -- the job a flat 32k reserve was written to
+        do here, back when the percentage underneath it had not been measured
+        and the reserve was quietly being spent on the threshold instead. A
+        session declaring 800k recorded 832000 and compacted at 748800: 51200
+        short of the promise, every time, with the gauge still drawing 800k.
+
+        Ten ninths of the declared number, rounded up, records 888889 and
+        compacts at 800000.
         """
-        return int(window) + CODEX_REPLY_RESERVE
+        window = int(window)
+        # Up, not down: nine tenths of the result has to *reach* the declared
+        # number, and the arithmetic Codex does on it truncates.
+        return -(-window * 100 // CODEX_AUTO_COMPACT_PERCENT)
 
     def argv(self):
         binary = TOOLCHAIN.binary_for("codex")
@@ -2556,8 +2579,12 @@ class CodexEngine(BaseEngine):
         # `model_catalog_json` path it cannot read.
         if self.session.meta.get("context_window") and os.path.exists(self.catalog_path()):
             argv += self._cfg("model_catalog_json", self._quote(self.catalog_path()))
-            # The window says what fits; this says when to make room. Set
-            # together or the second stays at whatever Codex defaults to.
+            # The window says what fits, and -- measured -- it also says when
+            # to make room, at nine tenths of itself. This asks for the same
+            # point by name. No build tried has honoured it, and it is sent
+            # anyway: it agrees with the window rather than fighting it, so a
+            # build that starts reading it lands where the catalog already
+            # puts the session.
             if self._auto_compact_limit:
                 argv += self._cfg("model_auto_compact_token_limit",
                                   str(int(self._auto_compact_limit)))
@@ -3896,7 +3923,7 @@ class Session(object):
             # Compaction then fires a little under this: the CLI holds a
             # buffer back for the reply -- 33k at the time of writing -- and
             # there is no lever to hand it that room separately, the way the
-            # Codex catalog takes CODEX_REPLY_RESERVE. So a declared 800k is
+            # Codex catalog takes its tenth off the top. So a declared 800k is
             # compacted at about 767k. The gauge is still drawn against 800k:
             # the four percent nobody can see is not worth a second number on
             # screen explaining itself.
@@ -6906,12 +6933,17 @@ def selftest():
                    and CodexEngine._usage_from({"inputTokens": 5,
                                                 "cachedInputTokens": 9})["input_tokens"] == 0)
 
-    # The reply headroom is a ceiling, not a target: a big window stops paying
-    # a percentage for room the reply cannot use, a small one keeps Codex's own
-    # smaller reserve rather than being handed a worse one.
-    reserve_ok = (CodexEngine._catalog_window(800000) == 832000
-                  and CodexEngine._catalog_window(200000) == 232000
-                  and CODEX_REPLY_RESERVE == 32000)
+    # Codex compacts at nine tenths of the catalog window whatever else it is
+    # told, so the catalog has to carry ten ninths of what the session declared
+    # for compaction to land on the declared number. The property, not just the
+    # two numbers: rounding down here costs a session the last token of what it
+    # asked for.
+    compact_point_ok = (
+        CodexEngine._catalog_window(800000) == 888889
+        and CodexEngine._catalog_window(200000) == 222223
+        and CODEX_AUTO_COMPACT_PERCENT == 90
+        and all(CodexEngine._catalog_window(w) * CODEX_AUTO_COMPACT_PERCENT // 100 == w
+                for w in (100000, 128000, 200000, 400000, 800000, 1000000)))
 
     ctx_ok = (usable_context_usage({"input_tokens": 12}) is True
               and usable_context_usage({"cache_read_input_tokens": 900}) is True
@@ -6934,7 +6966,7 @@ def selftest():
     ok = (not missing and sess.meta.get("turns") == 2 and replay
           and env_ok and window_ok and catalog_ok and ctx_ok and ver_ok
           and merge_ok and disjoint_ok and tail_ok and compact_ok
-          and reserve_ok)
+          and compact_point_ok)
     print(json_dumps({"ok": bool(ok), "events": len(events), "types": types,
                       "missing": missing, "turns": sess.meta.get("turns"),
                       "replay_after_cursor": len(replay),
@@ -6945,7 +6977,7 @@ def selftest():
                       "context_usage_rule": ctx_ok,
                       "context_usage_merge": merge_ok,
                       "codex_usage_disjoint": disjoint_ok,
-                      "codex_reply_reserve": reserve_ok,
+                      "codex_compact_point": compact_point_ok,
                       "version_compare": ver_ok,
                       "totals": sess.meta.get("totals")}))
     SESSIONS.delete(sess.id)
