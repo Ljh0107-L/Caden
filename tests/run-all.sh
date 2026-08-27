@@ -138,6 +138,10 @@ step "turn ownership (work that outlives the turn it started in)"
 python3 tests/turn_ownership_test.py
 result $? "turn_ownership_test.py"
 
+step "codex handshake (a slow app-server does not wedge the session)"
+python3 tests/codex_handshake_test.py >/dev/null 2>&1
+result $? "codex_handshake_test.py"
+
 step "/goal on the claude side (the CLI's own answers, and asking again)"
 python3 tests/goal_claude_test.py >/dev/null 2>&1
 result $? "goal_claude_test.py"

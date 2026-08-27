@@ -816,7 +816,18 @@ CODEX_AUTO_COMPACT_PERCENT = 90
 
 
 class EngineError(Exception):
-    pass
+    """Something the engine did, or failed to do, in words a session can show.
+
+    `timeout` separates "the engine said no" from "the engine has not said
+    anything yet". They arrive at a call site as the same exception and mean
+    opposite things -- the first is an answer to act on, the second is a busy
+    machine -- and treating the second as the first is how a session throws
+    away a thread the server still has.
+    """
+
+    def __init__(self, message, timeout=False):
+        Exception.__init__(self, message)
+        self.timeout = timeout
 
 
 class BaseEngine(object):
@@ -2315,6 +2326,10 @@ class CodexEngine(BaseEngine):
         self._server_took_over = False
         # When a turn Caden opened by itself last heard anything.
         self._orphan_seen = 0.0
+        # `initialize` answered and a thread live, both. `alive` says only that
+        # the process exists, which it does from the moment it is spawned --
+        # see `ensure_started`.
+        self._handshake_done = False
         # Numbers the `/goal` acknowledgements. They used to key off the turn
         # alone, so two of them inside one turn shared a block and the second
         # overwrote the first.
@@ -2619,20 +2634,43 @@ class CodexEngine(BaseEngine):
                     self._sandbox_mode(), {"type": "workspaceWrite"})
 
     def ensure_started(self):
-        with self.lock:
-            if self.alive:
-                return
-            try:
-                self.write_model_catalog()
-            except Exception:
-                log("warn", "[%s] writing the model catalog failed: %s",
-                    self.session.id, traceback.format_exc())
-            argv = self.argv()
-            self.spawn(argv, stdin_pipe=True)
-            self.remember_signature(argv)
+        """Up, initialized, and holding the session's thread -- all three.
 
-        self._request("initialize",
-                      {"clientInfo": {"name": "caden", "version": VERSION}}, timeout=60)
+        `alive` is true from the moment the process exists, and both of the
+        other two happen after that. Guarding the whole method on it alone
+        meant a handshake that fell over left the session wedged for good: on a
+        worker under a load average of 197, app-server answered `initialize`
+        two minutes late, this raised at the 60s mark having already spawned
+        it, and every submit after that took the early return -- no
+        `initialize`, no resume -- and sent `turn/start` for a thread the new
+        process had never been asked to open. `thread not found: 01a03774-...`,
+        instantly, on every message, until the process was killed by hand.
+        """
+        with self.lock:
+            if self.alive and self._handshake_done:
+                return
+            # A live process with an unfinished handshake is not one to
+            # replace: `initialize` may still be on its way to it, and what it
+            # is actually missing is the thread below.
+            fresh = not self.alive
+            if fresh:
+                self._handshake_done = False
+                try:
+                    self.write_model_catalog()
+                except Exception:
+                    log("warn", "[%s] writing the model catalog failed: %s",
+                        self.session.id, traceback.format_exc())
+                argv = self.argv()
+                self.spawn(argv, stdin_pipe=True)
+                self.remember_signature(argv)
+
+        # Once per process, and app-server means it -- a second one comes back
+        # `Already initialized`. Everything below it is safe to repeat, and has
+        # to be: it is the only path that gets this session a thread.
+        if fresh:
+            self._request("initialize",
+                          {"clientInfo": {"name": "caden", "version": VERSION}},
+                          timeout=60)
 
         params = {"cwd": self.session.workdir(),
                   "approvalPolicy": "never",
@@ -2650,6 +2688,14 @@ class CodexEngine(BaseEngine):
                 result = self._request("thread/resume",
                                        dict(params, threadId=thread_id), timeout=60)
             except EngineError as exc:
+                # Only where the server actually answered. A resume that timed
+                # out says nothing about the thread -- the rollout is still on
+                # disk, the server still has it, the machine was just busy --
+                # and dropping `native_id` on that would answer a slow box by
+                # starting the conversation over from nothing. Let it through
+                # instead: the next submit resumes the same thread.
+                if exc.timeout:
+                    raise
                 # The thread is gone -- a wiped engine home, a pruned history.
                 # Starting fresh beats refusing to run.
                 log("info", "[%s] resume failed (%s); starting a new thread",
@@ -2661,6 +2707,7 @@ class CodexEngine(BaseEngine):
         tid = ((result or {}).get("thread") or {}).get("id") or (result or {}).get("threadId")
         if tid:
             self.session.set_native_id(tid)
+        self._handshake_done = True
 
     # -- JSON-RPC --------------------------------------------------------
     def _send(self, obj):
@@ -2676,7 +2723,7 @@ class CodexEngine(BaseEngine):
             self._send({"jsonrpc": "2.0", "id": rid, "method": method,
                         "params": {} if params is None else params})
             if not box["event"].wait(timeout or self.RPC_TIMEOUT):
-                raise EngineError("%s timed out" % method)
+                raise EngineError("%s timed out" % method, timeout=True)
             if box["error"]:
                 err = box["error"]
                 raise EngineError("%s failed: %s" % (
