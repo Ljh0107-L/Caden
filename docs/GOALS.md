@@ -36,9 +36,13 @@ whichever CLI is underneath — including the next one.
 
 Four, and the absence of one. There is deliberately no terminal "achieved"
 state: a goal that is met is deleted, and the chip disappears with it. Keeping
-one would leave a dead thing on screen for the user to tidy up, when what
-actually wants recording is why it was called finished — and that belongs in
-the transcript, which is where `Goal met: …` is written.
+one would leave a dead thing on screen for somebody to tidy up.
+
+Nothing is written down about it either. The chip is the whole display — it
+carries the objective, the state, the turn count and the last check right up to
+the moment it goes — and a session that also narrated every one of those into
+the transcript read as a log of Caden talking to itself with the work buried
+between the lines.
 
 | State | Meaning | Caden drives? | Engine reaped when idle? |
 | --- | --- | --- | --- |
@@ -61,6 +65,13 @@ a turn.
 | `/goal pause` | `active` → `paused` |
 | `/goal resume` | `paused` or `blocked` → `active` |
 | `/goal budget <n>` | token ceiling; `/goal budget <n> turns` for the other one |
+
+Only two things put words in the transcript: `/goal` typed on its own, which
+is a question and gets an answer, and a command that could not do what it was
+asked (`No goal is set`, a spent budget refusing `resume`). Everything that
+worked is already on the chip. The three automatic stops — blocked, out of
+budget, and a check that could not be made — do say so out loud, because they
+happen with nobody watching and mean the goal is waiting on a person.
 
 Every one of them skips the queue. That is not a nicety: a goal-driven session
 leaves milliseconds between turns, and a `/goal clear` that waits its turn is a
@@ -122,7 +133,7 @@ be over. `consider_goal` decides whether the next move is Caden's and
    person it is working for.
 2. Over budget → `exhausted`, and say which budget.
 3. Ask the judge.
-4. `done` → delete the goal, write `Goal met: <reason>` into the transcript.
+4. `done` → delete the goal. The chip going is the report.
 5. `blocked` → count it; at `GOAL_BLOCKED_STREAK` in a row, stop and say what
    it is stuck on. Below that, carry on: the first sight of a blocker is
    usually the engine noticing it, and the turn after often walks around it.
@@ -138,7 +149,7 @@ It is shown the objective, the budget, and the tail of the transcript **with
 tool output in it**: command output, test results, file contents. An assistant
 saying it finished is not evidence, and a judge given only assistant prose is a
 judge given only claims. It answers with one line of JSON — `done`, `continue`
-or `blocked`, and a reason that goes on the chip and into the transcript.
+or `blocked`, and a reason, which is what the chip shows as its last check.
 
 Uncertain resolves to `continue`. The default has to be "not finished", because
 the failure that matters is not a loop that runs one turn too many; it is a
@@ -168,9 +179,10 @@ judge and the working model reports completion itself by calling a tool. Caden
 has a judge, so the two prompts are kept apart: this one says where to go, the
 judge's says what would prove arrival.
 
-In the transcript a driven turn is a `Continuing …` row, in the same register
-as `Ran` and `Explored`. Drawing it as a user message would put words in the
-reader's mouth.
+A driven turn writes no `user` event at all, so nothing of the message
+reaches the transcript: the turn opens, the work appears in it, and the chip's
+turn count is what says where it came from. Echoing the instructions Caden
+sends itself, once per turn, buries what the turn was sent to do.
 
 ## Migrating a session
 

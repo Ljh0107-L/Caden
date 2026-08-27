@@ -1176,12 +1176,8 @@ function renderTranscript(ctl) {
   rows.forEach((row, i) => {
     const prev = rows[i - 1];
     const cls = ['t-row'];
-    // A driven turn is not somebody speaking, so it does not open an
-    // exchange or leave the row after it looking like a reply to one.
-    const spoke = it => it?.kind === 'item' && it.item.kind === 'user'
-                        && !it.item.driven;
-    if (spoke(row)) cls.push('exchange');
-    else if (spoke(prev)) cls.push('reply');
+    if (row.kind === 'item' && row.item.kind === 'user') cls.push('exchange');
+    else if (prev?.kind === 'item' && prev.item.kind === 'user') cls.push('reply');
     const liveTail = live && i === rows.length - 1;
     place(`row:${row.id}`, rowSig(row, ctl, liveTail), () => {
       const inner = renderRow(row, open, liveTail, ctl);
@@ -1343,7 +1339,7 @@ function rowSig(row, ctl, liveTail) {
     return sig;
   }
   switch (item.kind) {
-    case 'user':      return ['u', item.text, !!item.driven];
+    case 'user':      return ['u', item.text];
     case 'assistant': return ['a', item.text];
     // Deliberately not the text. Reasoning arrives a few characters at a
     // frame, and a signature that moved with it rebuilt the row sixty times a
@@ -1395,7 +1391,7 @@ function renderRow(row, open, liveTail = false, ctl = null) {
   const item = row.item;
   switch (item.kind) {
     case 'user':
-      return item.driven ? rowDriven(item.text) : rowHuman(item.text);
+      return rowHuman(item.text);
     case 'assistant':
       return rowText(renderMarkdown(item.text));
     case 'thinking': {
@@ -1458,17 +1454,6 @@ function renderRow(row, open, liveTail = false, ctl = null) {
 
 // ---- Cursor transcript rows, from captured markup: we fill text and wire
 // the collapse; every class and state attribute is Cursor's own.
-
-/// The objective out of a drive message, which is the only part of it worth
-/// a row. The rest is the standing instructions that go with every one of
-/// them, and repeating those down the transcript would bury the work.
-function rowDriven(text) {
-  const row = tpl('rowDriven');
-  const m = /<objective>\n?([\s\S]*?)\n?<\/objective>/.exec(text || '');
-  row.querySelector('.subject').textContent =
-    (m ? m[1] : (text || '')).trim().split('\n')[0];
-  return row;
-}
 
 function rowHuman(text) {
   const row = tpl('rowHuman');

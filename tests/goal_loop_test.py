@@ -121,7 +121,10 @@ def main():
 
     out = h.cmd("/goal make every test in tests/ pass")
     g = h.goal()
-    check("setting one answers", "Goal set:" in out, out)
+    # Silent on purpose: the chip appearing is the answer, and a line saying
+    # so again turned a goal-driven session into a log of Caden talking to
+    # itself.
+    check("setting one says nothing", out == "", repr(out))
     check("it starts active", h.status() == "active", str(g))
     check("with the objective it was given",
           g["objective"] == "make every test in tests/ pass", str(g))
@@ -135,7 +138,7 @@ def main():
     h.step(("continue", "3 of 47 tests still failing"))
     check("a turn nobody typed is begun", len(h.driven) == 1, str(h.driven))
     item = h.driven[0] if h.driven else {}
-    check("marked as driven, not as the user speaking",
+    check("marked driven, which is what keeps it out of the transcript",
           item.get("driven") is True, str(item.keys()))
     check("carrying the objective",
           "make every test in tests/ pass" in (item.get("text") or ""))
@@ -168,8 +171,8 @@ def main():
     h.step(("done", "all 47 tests pass, output above"))
     check("the goal is gone, not marked finished", h.goal() is None,
           str(h.goal()))
-    check("and the transcript says why",
-          any("Goal met: all 47 tests pass" in x for x in h.said), str(h.said))
+    check("and says nothing about it -- the chip going is the report",
+          not h.said, str(h.said))
     check("nothing more is driven", len(h.driven) == 1, str(len(h.driven)))
 
     # -- blocked, with hysteresis -----------------------------------------
@@ -225,7 +228,8 @@ def main():
           h.status() == "exhausted" and "budget is spent" in out, out)
 
     out = h.cmd("/goal budget 10 turns")
-    check("raising the ceiling is the way back", h.status() == "active", out)
+    check("raising the ceiling is the way back", h.status() == "active",
+          "%s %r" % (h.status(), out))
     check("and the count is kept, not reset", h.goal()["turns_used"] == 2,
           str(h.goal()["turns_used"]))
 
@@ -237,7 +241,7 @@ def main():
     print("== pause, resume, clear")
     h = new_harness()
     h.cmd("/goal tidy the docs")
-    check("pause stops the driving", "paused" in h.cmd("/goal pause")
+    check("pause stops the driving", h.cmd("/goal pause") == ""
           and h.status() == "paused", h.status())
     check("a message does not undo a pause", True)
     h.session.meta["state"] = hb.STATE_RUNNING
@@ -245,15 +249,16 @@ def main():
     check("even one that queues", h.status() == "paused", h.status())
     h.session.queue[:] = []
     h.session.meta["state"] = hb.STATE_IDLE
-    check("resume starts it again", "resumed" in h.cmd("/goal resume")
+    check("resume starts it again", h.cmd("/goal resume") == ""
           and h.status() == "active", h.status())
 
     out = h.cmd("/goal")
     check("`/goal` reports state, budget and the last check",
           "tidy the docs" in out and "driven turns" in out, out)
 
-    check("clear removes it", "cleared" in h.cmd("/goal clear")
+    check("clear removes it", h.cmd("/goal clear") == ""
           and h.goal() is None)
+    # The one thing left to say: a command that could not do what it was told.
     check("and clearing nothing says so", "No goal" in h.cmd("/goal clear"))
 
     # -- a judge that cannot answer ---------------------------------------
@@ -277,6 +282,111 @@ def main():
     check("the objective changes", g["objective"] == "second", str(g))
     check("and its accounting starts over",
           g["turns_used"] == 0 and g["blocked_streak"] == 0, str(g))
+
+    # -- goals written by the daemon before this one ----------------------
+    #
+    # `set` was Claude's word for "in force". Nothing writes it now, so a goal
+    # still saying it would never be corrected: the chip draws anything but
+    # `active` as stopped, and the loop only moves on `active`. It would sit
+    # there looking paused for good.
+    print("== a goal from an older daemon")
+    old = hb.goal_migrated({"objective": "finish the port", "status": "set"},
+                           tokens_now=4200)
+    check("`set` was in force, so it still is", old["status"] == "active",
+          str(old))
+    check("the missing budget gets the default",
+          old["turn_budget"] == hb.GOAL_DEFAULT_TURNS, str(old))
+    check("and the tally starts from here, not from the whole session",
+          old["tokens_at_set"] == 4200, str(old))
+
+    for was, now in (("usageLimited", "exhausted"),
+                     ("budgetLimited", "exhausted"),
+                     ("paused", "paused"), ("blocked", "blocked"),
+                     ("active", "active")):
+        got = hb.goal_migrated({"objective": "x", "status": was})["status"]
+        check("%s reads as %s" % (was, now), got == now, got)
+
+    check("a status nobody recognises is read as still running",
+          hb.goal_migrated({"objective": "x", "status": "??"})["status"]
+          == "active")
+    check("and a goal with no objective is no goal",
+          hb.goal_migrated({"status": "set"}) is None)
+
+    # Applying it twice must not move anything.
+    once = hb.goal_migrated({"objective": "finish the port", "status": "set"},
+                            tokens_now=4200)
+    check("migrating an already-migrated goal changes nothing",
+          hb.goal_migrated(once, tokens_now=9999) == once, str(once))
+
+    # And it happens on the way in, not only when asked.
+    sid = h.session.id if False else None
+    stale = mgr.create({"engine": "codex", "model": "gpt-5.6-sol", "cwd": home,
+                        "permission_mode": "bypassPermissions",
+                        "provider": {"protocol": "openai-responses",
+                                     "api_key": "sk-test"}})
+    stale.meta["goal"] = {"objective": "left over", "status": "set"}
+    stale.save()
+    reloaded = hb.Session(mgr, json.load(open(stale.path("meta.json"))))
+    check("a session loaded from disk is migrated as it comes in",
+          reloaded.meta["goal"]["status"] == "active",
+          str(reloaded.meta.get("goal")))
+
+    # -- nothing of it reaches the transcript ------------------------------
+    print("== a driven turn writes nothing down")
+    h = new_harness()
+    del h.session._begin                       # the real one, this time
+    h.cmd("/goal say ok twice")
+    mark = h.session.bus.seq
+    h.session._begin({"text": "drive me", "images": [], "id": "turn_d1",
+                      "driven": True})
+    after = h.session.bus.since(mark)
+    check("no `user` event for a turn nobody typed",
+          not [e for e in after if e["type"] == "user"], str(after[:3]))
+    check("but the turn itself is still opened",
+          any(e["type"] == "turn.start" for e in after),
+          str([e["type"] for e in after]))
+
+    # -- goals written by the daemon before this one ----------------------
+    #
+    # `set` was Claude's word for "in force". Nothing writes it now, so a goal
+    # still saying it would never be corrected: the chip draws anything but
+    # `active` as stopped, and the loop only moves on `active`. It would sit
+    # there looking stopped for good.
+    print("== a goal from an older daemon")
+    old_goal = hb.goal_migrated({"objective": "finish the port",
+                                 "status": "set"}, tokens_now=4200)
+    check("`set` was in force, so it still is",
+          old_goal["status"] == "active", str(old_goal))
+    check("the missing budget gets the default",
+          old_goal["turn_budget"] == hb.GOAL_DEFAULT_TURNS, str(old_goal))
+    check("and the tally starts here, not at the session's whole spend",
+          old_goal["tokens_at_set"] == 4200, str(old_goal))
+
+    for was, now in (("usageLimited", "exhausted"),
+                     ("budgetLimited", "exhausted"),
+                     ("paused", "paused"), ("blocked", "blocked"),
+                     ("active", "active")):
+        got = hb.goal_migrated({"objective": "x", "status": was})["status"]
+        check("%s reads as %s" % (was, now), got == now, got)
+
+    check("a status nobody recognises is read as still running",
+          hb.goal_migrated({"objective": "x", "status": "??"})["status"]
+          == "active")
+    check("a goal with no objective is no goal",
+          hb.goal_migrated({"status": "set"}) is None)
+    check("and migrating twice moves nothing",
+          hb.goal_migrated(old_goal, tokens_now=9999) == old_goal)
+
+    stale = mgr.create({"engine": "codex", "model": "gpt-5.6-sol", "cwd": home,
+                        "permission_mode": "bypassPermissions",
+                        "provider": {"protocol": "openai-responses",
+                                     "api_key": "sk-test"}})
+    stale.meta["goal"] = {"objective": "left over", "status": "set"}
+    stale.save()
+    reloaded = hb.Session(mgr, json.load(open(stale.path("meta.json"))))
+    check("a session read off disk is migrated on the way in",
+          reloaded.meta["goal"]["status"] == "active",
+          str(reloaded.meta.get("goal")))
 
     # -- the parts the stub stands in for ---------------------------------
     #

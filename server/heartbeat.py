@@ -958,6 +958,48 @@ def model_reply(provider, model, system, prompt, max_tokens=600, timeout=90):
     raise EngineError("no judge for a %s provider" % (proto or "missing"))
 
 
+# What the two engines used to call these states, and what they meant. `set`
+# was the Claude adapter's word for "in force" -- the reason every reader once
+# tested `in ("active", "set")` -- and the two `*Limited` ones were Codex's
+# server reporting a ceiling of its own.
+GOAL_LEGACY_STATUS = {"set": "active",
+                      "usageLimited": "exhausted",
+                      "budgetLimited": "exhausted"}
+
+
+def goal_migrated(goal, tokens_now=0):
+    """A goal an older daemon stored, in the shape this one reads.
+
+    Not cosmetic. Nothing writes `set` any more, so nothing would ever correct
+    a goal still saying it either: the chip would draw it as a stopped state
+    and the loop, which moves only on `active`, would never touch it again. A
+    goal that survives an upgrade has to survive it running.
+
+    `tokens_now` is where the session's accounting stands, and it becomes the
+    mark an upgraded goal counts from -- charging it for everything spent
+    before Caden was keeping the tally would put it over a budget it never had.
+    """
+    if not isinstance(goal, dict) or not goal.get("objective"):
+        return None
+    status = GOAL_LEGACY_STATUS.get(goal.get("status"), goal.get("status"))
+    if status not in GOAL_STATES:
+        # Somebody set this and meant it to run. If it should be stopped, the
+        # next check stops it, with a reason.
+        status = "active"
+    at_set = goal.get("tokens_at_set")
+    return {"objective": goal["objective"],
+            "status": status,
+            "set_at": goal.get("set_at") or now_ms(),
+            "turns_used": int(goal.get("turns_used") or 0),
+            "tokens_used": int(goal.get("tokens_used") or 0),
+            "tokens_at_set": int(tokens_now if at_set is None else at_set),
+            "token_budget": goal.get("token_budget"),
+            "turn_budget": goal.get("turn_budget") or GOAL_DEFAULT_TURNS,
+            "last_verdict": goal.get("last_verdict"),
+            "last_reason": goal.get("last_reason"),
+            "blocked_streak": int(goal.get("blocked_streak") or 0)}
+
+
 def goal_evidence(bus):
     """The tail of the transcript, in the shape a judge can audit.
 
@@ -3646,6 +3688,12 @@ class Session(object):
         # One goal step at a time: the judge is a network call and a turn can
         # end while it is still out.
         self._goal_busy = False
+        # A goal written by a daemon from before this one is read in its own
+        # vocabulary and kept in ours. In memory only -- the next save writes
+        # it, and a session nothing writes again is served from here anyway.
+        if meta.get("goal"):
+            meta["goal"] = goal_migrated(
+                meta["goal"], self._token_total(meta.get("totals")))
         self.verbose_logs = bool(meta.get("verbose_logs"))
         # The session's own directory too, and on load as well as on create:
         # a home provisioned before sessions went 0700 still has 0755 ones in
@@ -3940,7 +3988,13 @@ class Session(object):
         self.bus.emit("goal", goal=goal)
 
     def goal_say(self, text):
-        """Caden answering for itself, in the transcript where it was asked."""
+        """Caden answering for itself, in the transcript where it was asked.
+
+        Only two things reach here: an answer to `/goal` typed on its own, and
+        a refusal -- a command that could not do what it was asked. Everything
+        that worked is already on the chip, and saying it twice made a
+        goal-driven session mostly a log of Caden talking to itself.
+        """
         self.bus.emit("text", block=new_id("goal"), text=text)
 
     @staticmethod
@@ -4008,7 +4062,6 @@ class Session(object):
                 self.goal_say("No goal is set.")
                 return
             self.goal_write(None)
-            self.goal_say("Goal cleared.")
             # Clearing is "stop", not "stop after this one": the turn running
             # is the goal's work too, and letting it finish means the session
             # goes on thinking for however long that turn had left. The queue
@@ -4026,7 +4079,6 @@ class Session(object):
                 self.goal_say("The goal is already %s." % g.get("status"))
             else:
                 self.goal_write(dict(g, status="paused"))
-                self.goal_say("Goal paused. `/goal resume` starts it again.")
             return
 
         if head in ("resume", "start"):
@@ -4043,7 +4095,6 @@ class Session(object):
                               "`/goal budget <n> turns`.")
             else:
                 self.goal_write(dict(g, status="active", blocked_streak=0))
-                self.goal_say("Goal resumed.")
                 self.consider_goal()
             return
 
@@ -4068,7 +4119,6 @@ class Session(object):
             if g.get("status") == "exhausted" and not self.goal_over_budget(g):
                 g["status"] = "active"
             self.goal_write(g)
-            self.goal_say(self.goal_line(g))
             if g.get("status") == "active":
                 self.consider_goal()
             return
@@ -4076,9 +4126,7 @@ class Session(object):
         # Anything else is the objective. A new one replaces whatever was
         # there and starts its accounting over: the budget belongs to the
         # goal, not to the session.
-        g = self.goal_new(rest)
-        self.goal_write(g)
-        self.goal_say("Goal set: %s" % rest)
+        self.goal_write(self.goal_new(rest))
         self.consider_goal()
 
     def consider_goal(self):
@@ -4139,10 +4187,10 @@ class Session(object):
             g["tokens_used"] = self.goal_tokens_used(g)
 
             if verdict == "done":
-                # No terminal state: a goal that is met is history, and
-                # history is what the transcript is for. The chip goes away.
+                # No terminal state and no notice: the chip going away is
+                # the whole report. The reason it went is on the last check,
+                # which the chip carried right up to the moment it vanished.
                 self.goal_write(None)
-                self.goal_say("Goal met: %s" % reason)
                 return
 
             if verdict == "blocked":
@@ -4272,12 +4320,13 @@ class Session(object):
             self.meta["title"] = title_from(item["text"])
             self.meta["auto_title"] = True
         self.save()
-        if not item.get("queued_emitted"):
-            fields = {"turn": item["id"], "text": item["text"],
-                      "images": len(item["images"])}
-            if item.get("driven"):
-                fields["driven"] = True
-            self.bus.emit("user", **fields)
+        # A driven turn is not something anybody said, so nothing is written
+        # down for it. The chip is where the goal lives; a row echoing the
+        # instructions Caden sends itself, once per turn, buries the work it
+        # was sent to do.
+        if not item.get("queued_emitted") and not item.get("driven"):
+            self.bus.emit("user", turn=item["id"], text=item["text"],
+                          images=len(item["images"]))
         self.bus.emit("turn.start", turn=item["id"])
         self.bus.emit("status", state=STATE_RUNNING)
         try:
