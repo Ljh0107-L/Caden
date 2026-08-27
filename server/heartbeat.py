@@ -3688,6 +3688,11 @@ class Session(object):
         # One goal step at a time: the judge is a network call and a turn can
         # end while it is still out.
         self._goal_busy = False
+        # Bumped on every write to the goal. A step reads the goal, spends
+        # seconds in the judge, and must not act on what it read if `/goal
+        # pause` or `/goal clear` landed in the meantime -- least of all write
+        # its stale copy back and resurrect a goal somebody just cleared.
+        self._goal_epoch = 0
         # A goal written by a daemon from before this one is read in its own
         # vocabulary and kept in ours. In memory only -- the next save writes
         # it, and a session nothing writes again is served from here anyway.
@@ -3984,6 +3989,7 @@ class Session(object):
             if self.meta.get("goal") == goal:
                 return
             self.meta["goal"] = goal
+            self._goal_epoch += 1
             self.save()
         self.bus.emit("goal", goal=goal)
 
@@ -4156,6 +4162,8 @@ class Session(object):
 
     def _goal_step(self):
         try:
+            with self.lock:
+                epoch = self._goal_epoch
             g = dict(self.goal() or {})
             if g.get("status") != "active":
                 return
@@ -4179,6 +4187,15 @@ class Session(object):
                 self.goal_say("Goal stopped: the check failed (%s). "
                               "`/goal resume` tries again." % exc)
                 return
+
+            # The judge took seconds, and a `/goal pause` or `/goal clear`
+            # typed inside them has already been answered. Acting on what was
+            # read before it would start the turn that command existed to
+            # prevent, and writing this copy back would undo the command
+            # itself.
+            with self.lock:
+                if self._goal_epoch != epoch:
+                    return
 
             g["last_verdict"], g["last_reason"] = verdict, reason
             # Refreshed on the way past rather than stored live: the chip
@@ -4221,6 +4238,12 @@ class Session(object):
                 "images": [], "id": new_id("turn"), "driven": True}
         with self.lock:
             if self.queue or self.meta.get("state") == STATE_RUNNING:
+                return
+            # Checked again here and not only by the caller: this is the last
+            # moment before a turn exists, and the goal is written from three
+            # threads.
+            live = self.meta.get("goal") or {}
+            if live.get("status") != "active":
                 return
         self._begin(item)
 

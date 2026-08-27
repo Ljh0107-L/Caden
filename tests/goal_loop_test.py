@@ -331,6 +331,38 @@ def main():
           reloaded.meta["goal"]["status"] == "active",
           str(reloaded.meta.get("goal")))
 
+    # -- a command typed while the judge is out ---------------------------
+    #
+    # The judge is a network call taking seconds. `/goal pause` and
+    # `/goal clear` are answered inside them, and a step that acted on what it
+    # read beforehand would start the very turn the command existed to stop --
+    # and write its stale copy back over a goal that had just been cleared.
+    print("== pause and clear land while the judge is out")
+
+    for command, expected in (("/goal pause", "paused"), ("/goal clear", None)):
+        h = new_harness()
+        h.cmd("/goal keep going")
+
+        def judge_then_interfere(_s, _g, cmd=command):
+            h.session.goal_command(cmd)
+            return "continue", "still going"
+
+        hb.judge_goal = judge_then_interfere
+        del h.said[:]
+        h._real_step()
+        check("%s stops the turn it would have started" % command,
+              not h.driven, str(h.driven))
+        check("and stands", (h.goal() or {}).get("status") == expected
+              if expected else h.goal() is None, str(h.goal()))
+
+    # A step that is not interfered with still drives, so the guard is not
+    # simply refusing to work.
+    h = new_harness()
+    h.cmd("/goal keep going")
+    h.step(("continue", "still going"))
+    check("an undisturbed step still takes its turn", len(h.driven) == 1,
+          str(len(h.driven)))
+
     # -- nothing of it reaches the transcript ------------------------------
     print("== a driven turn writes nothing down")
     h = new_harness()
