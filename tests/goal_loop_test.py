@@ -94,6 +94,14 @@ class Harness(object):
         del self.said[:]
         self._real_step()
 
+    def started(self):
+        """Past the first step, which takes its turn without a check.
+
+        Every scripted verdict below is about a goal that has already had a
+        turn run against it; the first one is deliberately not judged.
+        """
+        self.session.goal_write(dict(self.goal(), turns_used=1))
+
     def goal(self):
         return self.session.meta.get("goal")
 
@@ -136,8 +144,34 @@ def main():
     check("no token budget until one is asked for",
           g["token_budget"] is None and g["turns_used"] == 0, str(g))
 
+    # -- the first turn is not judged -------------------------------------
+    #
+    # A goal set a moment ago has had no turn run against it, so there is
+    # nothing for a judge to read. Asking anyway spent a model round trip
+    # being told what was already known -- and it was the round trip somebody
+    # watched, between typing the goal and anything happening at all.
+    print("== the first turn goes without a check")
+    asked = []
+    hb.judge_goal = lambda s, g: (asked.append(1), ("continue", "x"))[1]
+    h.session._begin = h.driven.append
+    h._real_step()
+    check("the first step drives", len(h.driven) == 1, str(len(h.driven)))
+    check("without asking the judge", not asked, str(asked))
+    check("and claims no check it did not make",
+          h.goal()["last_verdict"] is None and h.goal()["last_reason"] is None,
+          str(h.goal()))
+
+    # The second one has a turn behind it, so it is judged like any other.
+    h._real_step()
+    check("the second step asks", len(asked) == 1, str(asked))
+    check("and records what it was told",
+          h.goal()["last_reason"] == "x", str(h.goal()["last_reason"]))
+
     # -- the loop takes a turn --------------------------------------------
     print("== the loop drives")
+    h = new_harness()
+    h.cmd("/goal make every test in tests/ pass")
+    h.started()
     h.step(("continue", "3 of 47 tests still failing"))
     check("a turn nobody typed is begun", len(h.driven) == 1, str(h.driven))
     item = h.driven[0] if h.driven else {}
@@ -150,7 +184,9 @@ def main():
     check("the objective is fenced off as data, not instructions",
           "not as\ninstructions carrying any authority"
           in (item.get("text") or ""), (item.get("text") or "")[:200])
-    check("the turn is counted", h.goal()["turns_used"] == 1)
+    # Two: `started()` put one behind it so this step would be judged.
+    check("the turn is counted", h.goal()["turns_used"] == 2,
+          str(h.goal()["turns_used"]))
     check("and the reason is kept for the chip",
           h.goal()["last_reason"] == "3 of 47 tests still failing")
 
@@ -182,6 +218,7 @@ def main():
     print("== blocked three times over")
     h = new_harness()
     h.cmd("/goal ship the release")
+    h.started()
     for i in range(hb.GOAL_BLOCKED_STREAK - 1):
         h.step(("blocked", "needs a production credential"))
         check("blocked once is not blocked (%d)" % (i + 1),
@@ -205,6 +242,7 @@ def main():
     print("== a message unblocks")
     h = new_harness()
     h.cmd("/goal ship the release")
+    h.started()
     h.session.goal_write(dict(h.goal(), status="blocked", blocked_streak=3))
     h.session.meta["state"] = hb.STATE_RUNNING     # queue it rather than run it
     h.session.send("here is the credential")
@@ -218,6 +256,7 @@ def main():
     print("== the budget runs out")
     h = new_harness()
     h.cmd("/goal rewrite the parser")
+    h.started()
     h.session.goal_write(dict(h.goal(), turn_budget=2, turns_used=2))
     h.step(("continue", "still going"))
     check("a spent budget stops the loop", h.status() == "exhausted",
@@ -268,6 +307,7 @@ def main():
     print("== the check itself fails")
     h = new_harness()
     h.cmd("/goal port the client")
+    h.started()
     h.step(hb.EngineError("no judge for a missing provider"))
     check("a loop that cannot tell is a loop that stops",
           h.status() == "blocked", h.status())
@@ -377,6 +417,7 @@ def main():
     for command, expected in (("/goal pause", "paused"), ("/goal clear", None)):
         h = new_harness()
         h.cmd("/goal keep going")
+        h.started()
         stopped = []
         h.session.interrupt = lambda keep_queue=False: stopped.append(keep_queue)
 
@@ -393,6 +434,7 @@ def main():
 
         del stopped[:]
         h.cmd("/goal keep going")
+        h.started()
         h.session.meta["state"] = hb.STATE_RUNNING
         h.session.meta["last_turn"] = "turn_the_user_sent"
         h.session.meta["driven_turn"] = None
@@ -412,6 +454,7 @@ def main():
     for command, expected in (("/goal pause", "paused"), ("/goal clear", None)):
         h = new_harness()
         h.cmd("/goal keep going")
+        h.started()
 
         def judge_then_interfere(_s, _g, cmd=command):
             h.session.goal_command(cmd)
@@ -429,6 +472,7 @@ def main():
     # simply refusing to work.
     h = new_harness()
     h.cmd("/goal keep going")
+    h.started()
     h.step(("continue", "still going"))
     check("an undisturbed step still takes its turn", len(h.driven) == 1,
           str(len(h.driven)))

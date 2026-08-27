@@ -132,7 +132,12 @@ be over. `consider_goal` decides whether the next move is Caden's and
    running. **A queued message goes first** — the loop stands aside for the
    person it is working for.
 2. Over budget → `exhausted`, and say which budget.
-3. Ask the judge.
+3. Ask the judge — **except on the first step**, which drives without one. A
+   goal set a moment ago has had no turn run against it, so there is nothing to
+   read: asking spends a model round trip being told what is already known, and
+   it is the round trip somebody watches between typing the goal and anything
+   happening. It costs one turn when a goal was already satisfied before it was
+   set, which is the cheaper mistake.
 4. `done` → delete the goal. The chip going is the report.
 5. `blocked` → count it; at `GOAL_BLOCKED_STREAK` in a row, stop and say what
    it is stuck on. Below that, carry on: the first sight of a blocker is

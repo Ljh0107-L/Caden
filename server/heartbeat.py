@@ -4230,18 +4230,32 @@ class Session(object):
                               "`/goal budget <tokens>`." % spent)
                 return
 
-            try:
-                verdict, reason = judge_goal(self, g)
-            except Exception as exc:
-                # Not "keep going": a loop that cannot tell whether it is
-                # finished is a loop that does not know when to stop.
-                log("warn", "[%s] goal check failed: %s", self.id, exc)
-                self.goal_write(dict(g, status="blocked",
-                                     last_verdict="blocked",
-                                     last_reason="the check failed: %s" % exc))
-                self.goal_say("Goal stopped: the check failed (%s). "
-                              "`/goal resume` tries again." % exc)
-                return
+            # The first step has nothing to judge. A goal set a moment ago
+            # has had no turn run against it, so asking a model whether it is
+            # finished is a round trip spent being told what is already known
+            # -- and it is the round trip somebody watches, between typing the
+            # goal and anything happening at all. Work first; the check has
+            # something to read afterwards.
+            #
+            # It costs one turn when a goal was already satisfied before it was
+            # set, which is the cheaper mistake: the alternative charges every
+            # goal a model call before it starts.
+            first = not int(g.get("turns_used") or 0)
+            if first:
+                verdict, reason = "continue", None
+            else:
+                try:
+                    verdict, reason = judge_goal(self, g)
+                except Exception as exc:
+                    # Not "keep going": a loop that cannot tell whether it is
+                    # finished is a loop that does not know when to stop.
+                    log("warn", "[%s] goal check failed: %s", self.id, exc)
+                    self.goal_write(dict(g, status="blocked",
+                                         last_verdict="blocked",
+                                         last_reason="the check failed: %s" % exc))
+                    self.goal_say("Goal stopped: the check failed (%s). "
+                                  "`/goal resume` tries again." % exc)
+                    return
 
             # The judge took seconds, and a `/goal pause` or `/goal clear`
             # typed inside them has already been answered. Acting on what was
@@ -4252,7 +4266,10 @@ class Session(object):
                 if self._goal_epoch != epoch:
                     return
 
-            g["last_verdict"], g["last_reason"] = verdict, reason
+            # Left alone on the first step: no check was made, and the chip
+            # should not claim one.
+            if not first:
+                g["last_verdict"], g["last_reason"] = verdict, reason
             # Refreshed on the way past rather than stored live: the chip
             # wants a number, and once per driven turn is as often as anyone
             # reads it.
