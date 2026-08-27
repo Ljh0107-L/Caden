@@ -331,6 +331,38 @@ def main():
           reloaded.meta["goal"]["status"] == "active",
           str(reloaded.meta.get("goal")))
 
+    # -- a command that never becomes a turn still closes the exchange -----
+    #
+    # A client marks itself running the moment a message is accepted, and
+    # `/goal` is the one message that never becomes a turn. Nothing followed
+    # it, so the composer sat on "Thinking…" against an idle session waiting
+    # for a reply nobody was going to send. The acknowledgements each command
+    # used to print hid it -- a user message with a reply under it is a closed
+    # exchange -- and it surfaced the moment those went quiet.
+    print("== /goal leaves the session where it says it is")
+    h = new_harness()
+    h.cmd("/goal something")
+    h.session.meta["state"] = hb.STATE_IDLE
+    mark = h.session.bus.seq
+    h.session._run_goal_command("/goal pause")
+    closing = [e for e in h.session.bus.since(mark) if e["type"] == "status"]
+    check("a status follows the command", bool(closing),
+          str([e["type"] for e in h.session.bus.since(mark)]))
+    check("and it says idle, which is what the session is",
+          closing and closing[-1]["state"] == hb.STATE_IDLE,
+          str(closing[-1] if closing else None))
+
+    # It reports what is true, not a fixed answer: a `/goal clear` that
+    # interrupted a turn is still running while the engine winds down.
+    h.session.meta["state"] = hb.STATE_RUNNING
+    mark = h.session.bus.seq
+    h.session._run_goal_command("/goal")
+    closing = [e for e in h.session.bus.since(mark) if e["type"] == "status"]
+    check("and running when the session is running",
+          closing and closing[-1]["state"] == hb.STATE_RUNNING,
+          str(closing[-1] if closing else None))
+    h.session.meta["state"] = hb.STATE_IDLE
+
     # -- stopping a goal stops the goal's turn -----------------------------
     #
     # "Go idle" is the point of both commands: the turn in flight is the

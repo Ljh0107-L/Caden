@@ -4325,6 +4325,17 @@ class Session(object):
         except Exception as exc:
             log("warn", "[%s] /goal failed: %s", self.id, exc)
             self.bus.emit("error", message=str(exc) or "/goal failed")
+        finally:
+            # A client marks itself running the moment a message is accepted,
+            # and `/goal` is the one message that never becomes a turn. Nothing
+            # would follow it: the composer sat on "Thinking…" against an idle
+            # session, waiting for a reply nobody was going to send. It used to
+            # be hidden by the acknowledgement each command printed -- a user
+            # message with a reply under it is a closed exchange -- and went
+            # unnoticed the moment those went quiet. Saying what the state
+            # actually is costs one event and does not depend on the client
+            # knowing which messages are commands.
+            self.bus.emit("status", state=self.meta.get("state") or STATE_IDLE)
 
     def adopt_turn(self):
         """Open a turn the engine started without being asked.
