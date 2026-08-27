@@ -3993,6 +3993,22 @@ class Session(object):
             self.save()
         self.bus.emit("goal", goal=goal)
 
+    def goal_stop_turn(self):
+        """End the turn the goal is running, if that is what is running.
+
+        Stopping a goal means stopping its work, not the user's: a `/goal
+        pause` typed while their own message was being answered would
+        otherwise throw that answer away too.
+        """
+        with self.lock:
+            if self.meta.get("state") != STATE_RUNNING:
+                return
+            if self.meta.get("last_turn") != self.meta.get("driven_turn"):
+                return
+        # The queue survives: what was cancelled is the goal, not the messages
+        # waiting behind it.
+        self.interrupt(keep_queue=True)
+
     def goal_say(self, text):
         """Caden answering for itself, in the transcript where it was asked.
 
@@ -4068,11 +4084,11 @@ class Session(object):
                 self.goal_say("No goal is set.")
                 return
             self.goal_write(None)
-            # Clearing is "stop", not "stop after this one": the turn running
-            # is the goal's work too, and letting it finish means the session
-            # goes on thinking for however long that turn had left. The queue
-            # survives -- the user's own messages are not what was cancelled.
-            self.interrupt(keep_queue=True)
+            # Both of these are "stop", not "stop after this one". The turn
+            # running is the goal's own work, and letting it finish means the
+            # session goes on thinking for however long that turn had left --
+            # minutes, on a real agent turn.
+            self.goal_stop_turn()
             return
 
         head, _, arg = rest.partition(" ")
@@ -4085,6 +4101,7 @@ class Session(object):
                 self.goal_say("The goal is already %s." % g.get("status"))
             else:
                 self.goal_write(dict(g, status="paused"))
+                self.goal_stop_turn()
             return
 
         if head in ("resume", "start"):
@@ -4347,6 +4364,11 @@ class Session(object):
         # down for it. The chip is where the goal lives; a row echoing the
         # instructions Caden sends itself, once per turn, buries the work it
         # was sent to do.
+        # Which turn belongs to the goal. `/goal pause` and `/goal clear`
+        # stop the goal's work, and a person's own message is not that -- one
+        # typed while their turn was running would have been thrown away with
+        # it.
+        self.meta["driven_turn"] = item["id"] if item.get("driven") else None
         if not item.get("queued_emitted") and not item.get("driven"):
             self.bus.emit("user", turn=item["id"], text=item["text"],
                           images=len(item["images"]))
@@ -4429,6 +4451,8 @@ class Session(object):
             if summary:
                 self.meta["last_summary"] = clip(summary, 400)
             self.meta["last_active_at"] = now_ms()
+            if self.meta.get("driven_turn") == turn_id:
+                self.meta["driven_turn"] = None
             new_state = STATE_ERROR if error else STATE_IDLE
 
         self.bus.emit("turn.end", turn=turn_id, usage=usage or {},

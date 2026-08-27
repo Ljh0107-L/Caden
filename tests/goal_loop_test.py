@@ -331,6 +331,41 @@ def main():
           reloaded.meta["goal"]["status"] == "active",
           str(reloaded.meta.get("goal")))
 
+    # -- stopping a goal stops the goal's turn -----------------------------
+    #
+    # "Go idle" is the point of both commands: the turn in flight is the
+    # goal's own work, and letting it finish means the session carries on
+    # thinking for however long that turn had left. But only the goal's turn
+    # -- a `/goal pause` typed while the user's own message was being answered
+    # would otherwise throw that answer away with it.
+    print("== pause and clear stop the turn they own")
+    for command, expected in (("/goal pause", "paused"), ("/goal clear", None)):
+        h = new_harness()
+        h.cmd("/goal keep going")
+        stopped = []
+        h.session.interrupt = lambda keep_queue=False: stopped.append(keep_queue)
+
+        h.session.meta["state"] = hb.STATE_RUNNING
+        h.session.meta["last_turn"] = "turn_driven"
+        h.session.meta["driven_turn"] = "turn_driven"
+        h.cmd(command)
+        check("%s ends the goal's own turn" % command, stopped == [True],
+              str(stopped))
+        check("and leaves the queue alone", stopped == [True], str(stopped))
+        check("state after %s" % command,
+              (h.goal() or {}).get("status") == expected
+              if expected else h.goal() is None, str(h.goal()))
+
+        del stopped[:]
+        h.cmd("/goal keep going")
+        h.session.meta["state"] = hb.STATE_RUNNING
+        h.session.meta["last_turn"] = "turn_the_user_sent"
+        h.session.meta["driven_turn"] = None
+        h.cmd(command)
+        check("%s does not touch a turn the user started" % command,
+              not stopped, str(stopped))
+    h.session.meta["state"] = hb.STATE_IDLE
+
     # -- a command typed while the judge is out ---------------------------
     #
     # The judge is a network call taking seconds. `/goal pause` and
