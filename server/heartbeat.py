@@ -4531,11 +4531,19 @@ class Session(object):
         away the very thing being hurried along.
         """
         with self.lock:
+            dropped = 0 if keep_queue else len(self.queue)
             if not keep_queue:
                 self.queue = []
             eng = self.engine
             running = (self.meta.get("last_turn")
                        if self.meta.get("state") == STATE_RUNNING else None)
+        # Nothing was running and nothing was waiting, so nothing was stopped.
+        # This used to signal the engine anyway and leave an `Interrupted` line
+        # in the transcript for it: ten presses of a button that had no work to
+        # cancel wrote ten of them, and a session that had simply gone quiet
+        # read as one that had gone badly wrong.
+        if not running and not dropped:
+            return
         if eng:
             try:
                 eng.interrupt()

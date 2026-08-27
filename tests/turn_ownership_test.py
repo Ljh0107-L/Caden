@@ -222,6 +222,20 @@ def main():
     q.meta["state"] = heartbeat.STATE_RUNNING
     q.queue = [{"text": "next", "images": [], "id": "turn_queued"}]
     q.interrupt(keep_queue=True)
+    # Pressing stop with nothing to stop. It used to signal the engine and
+    # write an `Interrupted` line anyway, so a button pressed ten times on a
+    # session that had gone quiet left ten of them behind.
+    quiet = heartbeat.SESSIONS.create({"engine": "mock", "model": "mock-1",
+                             "title": "nothing running"})
+    quiet.meta["state"] = heartbeat.STATE_IDLE
+    before = quiet.bus.seq
+    quiet.interrupt()
+    quiet.interrupt()
+    check("interrupting an idle session with nothing queued says nothing",
+          not [e for e in quiet.bus.since(before)
+               if e["type"] == "interrupted"],
+          str([e["type"] for e in quiet.bus.since(before)]))
+
     check("keep_queue leaves the next message in place",
           [i["id"] for i in q.queue] == ["turn_queued"])
 
