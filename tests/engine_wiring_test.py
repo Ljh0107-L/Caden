@@ -253,6 +253,8 @@ def test_compaction_reports_its_size(caden, root):
     engine._compact_pre = 0
     engine._ctx_usage = {"cache_read_tokens": 572200, "input_tokens": 2500,
                          "output_tokens": 786, "cache_write_tokens": 0}
+    engine._usage_trail = []
+    engine._model_window = None
     emitted = []
     engine.emit = lambda type_, **f: emitted.append((type_, f))
     engine._key = lambda x: x
@@ -282,6 +284,82 @@ def test_compaction_reports_its_size(caden, root):
           str(done[0] if done else None))
 
 
+def test_compaction_leaves_a_trail(caden, root):
+    """An automatic compaction says what it was counting.
+
+    Codex compacts at nine tenths of its catalog window, and the number it
+    compares against that is not the one Caden draws: a session declaring 800k
+    was compacted fifteen times at between 78% and 88% of it by the gauge's
+    reckoning, and the once both sides were logged app-server's counter read
+    750776 against Caden's 700134. Reconstructing the difference out of the
+    rollout afterwards was not conclusive, so the readings are kept as they
+    arrive and written out when the compaction actually fires.
+    """
+    engine = object.__new__(caden.CodexEngine)
+    engine.session = FakeSession(root, {"model": "gpt-5.6-sol"})
+    engine._items = {}
+    engine._item_keys = {}
+    engine._compacting = None
+    engine._compact_pre = 0
+    engine._usage_trail = []
+    engine._model_window = None
+    engine._ctx_usage = {}
+    engine._usage = {}
+    engine.emit = lambda type_, **f: None
+    engine._key = lambda x: x
+
+    lines = []
+    real_log = caden.log
+    caden.log = lambda level, msg, *a: lines.append(msg % a if a else msg)
+    try:
+        for i, (inp, out) in enumerate(((700000, 500), (740000, 4200))):
+            engine._on_notification("thread/tokenUsage/updated", {
+                "turnId": "01a04152-8d48-7823-81e0-81ea3154%02d" % i,
+                "tokenUsage": {
+                    "last": {"inputTokens": inp, "cachedInputTokens": inp - 2000,
+                             "cacheWriteInputTokens": 0, "outputTokens": out,
+                             "reasoningOutputTokens": out // 2,
+                             "totalTokens": inp + out},
+                    "total": {"inputTokens": inp * 2, "totalTokens": inp * 2},
+                    "modelContextWindow": 888889}})
+        engine._on_item(False, {"type": "contextCompaction", "id": "c1"})
+    finally:
+        caden.log = real_log
+
+    trail = [l for l in lines if "automatic compaction" in l]
+    check("an automatic compaction writes one line", len(trail) == 1,
+          str(lines))
+    body = trail[0] if trail else ""
+    # The window is app-server's own, so the threshold beside it is the real
+    # one rather than whatever the session declared.
+    check("it carries the window app-server reported",
+          "modelContextWindow=888889" in body, body[:160])
+    check("and the threshold that follows from it",
+          "compacts at 800000" in body, body[:160])
+    check("and what Caden thought the window held",
+          "pre_tokens=744200" in body, body[:160])
+    check("with every reading behind it, raw",
+          body.count("last[in=") == 2
+          and "in=700000 cached=698000 write=0 out=500" in body
+          and "in=740000 cached=738000 write=0 out=4200" in body,
+          body)
+
+    # Twelve is the cap; a long turn must not put a thousand lines in the log.
+    engine._compacting = None
+    engine._usage_trail = []
+    for i in range(30):
+        engine._on_notification("thread/tokenUsage/updated", {
+            "turnId": "t", "tokenUsage": {
+                "last": {"inputTokens": 1000 + i, "totalTokens": 1000 + i},
+                "total": {}, "modelContextWindow": 888889}})
+    check("the trail is capped",
+          len(engine._usage_trail) == caden.CodexEngine.USAGE_TRAIL,
+          str(len(engine._usage_trail)))
+    check("and keeps the newest readings",
+          engine._usage_trail[-1][2]["inputTokens"] == 1029,
+          str(engine._usage_trail[-1][2]))
+
+
 def main():
     home = tempfile.mkdtemp(prefix="caden-wiring-")
     keep = os.environ.get("CADEN_HOME")
@@ -297,6 +375,7 @@ def main():
         test_argv_pins_routing(caden, os.path.join(home, "session"))
         test_compaction_limit(caden, os.path.join(home, "session"))
         test_compaction_reports_its_size(caden, os.path.join(home, "session"))
+        test_compaction_leaves_a_trail(caden, os.path.join(home, "session"))
         test_companion_link(caden)
     finally:
         shutil.rmtree(home, ignore_errors=True)

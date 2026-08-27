@@ -2325,6 +2325,11 @@ class CodexEngine(BaseEngine):
         # to the `done` event: that is the one a client learns the engine's
         # real limit from.
         self._compact_pre = 0
+        # The last few raw token readings, and the window app-server says the
+        # model has. Kept only to be written out when an automatic compaction
+        # fires -- see `_log_compaction_trail`.
+        self._usage_trail = []
+        self._model_window = None
         # Worked out by `write_model_catalog`; see there.
         self._auto_compact_limit = None
 
@@ -2984,6 +2989,71 @@ class CodexEngine(BaseEngine):
             "reasoning_tokens": b.get("reasoningOutputTokens") or 0,
         }
 
+    # How many `thread/tokenUsage/updated` readings to keep behind for the
+    # line an automatic compaction writes.
+    USAGE_TRAIL = 12
+
+    def _note_usage_reading(self, params, usage):
+        """Keep the reading as it arrived, for `_log_compaction_trail`.
+
+        Raw rather than through `_usage_from`, because the question is what
+        app-server said and not what Caden made of it.
+        """
+        window = usage.get("modelContextWindow")
+        if window:
+            self._model_window = int(window)
+        self._usage_trail.append((now_ms(), params.get("turnId"),
+                                  usage.get("last") or {},
+                                  usage.get("total") or {}))
+        del self._usage_trail[:-self.USAGE_TRAIL]
+
+    @staticmethod
+    def _trail_row(b):
+        b = b or {}
+        return "in=%s cached=%s write=%s out=%s reasoning=%s total=%s" % tuple(
+            b.get(k) for k in ("inputTokens", "cachedInputTokens",
+                               "cacheWriteInputTokens", "outputTokens",
+                               "reasoningOutputTokens", "totalTokens"))
+
+    def _log_compaction_trail(self):
+        """What the readings were doing when app-server decided to compact.
+
+        Codex compacts at nine tenths of its catalog window -- measured -- and
+        `modelContextWindow`, which rides on every reading, says what that
+        window is. What it compares against that threshold is not the number
+        Caden draws: a session declaring 800k, threshold 748800, was compacted
+        fifteen times at between 624879 and 705969 by the gauge's reckoning,
+        and the one time both sides were logged app-server's own counter read
+        750776 against Caden's 700134.
+
+        Reconstructing that counter afterwards out of the rollout puts it
+        between `last prompt + last output` and `last prompt + every output
+        since the previous compaction`, which is not an answer. So the
+        readings are kept as they arrive and written out when the thing fires,
+        with the threshold beside them: the next automatic compaction on any
+        host says what it was counting instead of leaving it to be inferred
+        two days later.
+
+        A trail whose last reading is well short of the threshold is itself an
+        answer -- it means the reading that tripped it never reached Caden at
+        all, and the gauge was a turn behind rather than measuring the wrong
+        thing.
+        """
+        window = self._model_window
+        head = ("[%s] automatic compaction at pre_tokens=%s; "
+                "modelContextWindow=%s, so codex compacts at %s"
+                % (self.session.id, self._compact_pre, window,
+                   window * CODEX_AUTO_COMPACT_PERCENT // 100 if window else "?"))
+        if not self._usage_trail:
+            log("info", "%s; no readings behind it", head)
+            return
+        t0 = self._usage_trail[0][0]
+        rows = ["    +%6.1fs turn=%s last[%s] total[%s]"
+                % ((ts - t0) / 1000.0, (turn or "-")[-6:],
+                   self._trail_row(last), self._trail_row(total))
+                for ts, turn, last, total in self._usage_trail]
+        log("info", "%s\n%s", head, "\n".join(rows))
+
     def _context_total(self):
         """Everything the last request put in the window.
 
@@ -3065,6 +3135,7 @@ class CodexEngine(BaseEngine):
             usage = p.get("tokenUsage") or {}
             self._usage = self._usage_from(usage.get("total"))
             self._ctx_usage = self._usage_from(usage.get("last"))
+            self._note_usage_reading(p, usage)
             # Live, not just at turn.end: a long turn -- or one the server ran
             # on its own, which never produced a turn.end at all -- left the
             # window gauge frozen for as long as it lasted.
@@ -3179,6 +3250,7 @@ class CodexEngine(BaseEngine):
                 # engine would have compacted on its own and must not teach
                 # the gauge a smaller window.
                 self._compact_pre = self._context_total()
+                self._log_compaction_trail()
                 self._begin_compaction(trigger="auto",
                                        pre_tokens=self._compact_pre)
 
