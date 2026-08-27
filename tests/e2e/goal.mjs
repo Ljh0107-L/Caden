@@ -70,34 +70,49 @@ try {
   check('a /goal query leaves the composer idle', await busy() === 0,
         `${await busy()} working row(s)`);
 
-  // -- setting one, then clearing it ----------------------------------------
-  // The same shape, with the goal actually changing underneath. Nothing
-  // drives here: the harness has no model behind the judge, so the loop's
-  // first check fails and the goal stops itself -- which is fine, because what
-  // is under test is the composer, not the loop.
+  // -- setting one drives at once, and clearing it stops that turn ---------
+  // The first step is deliberately not judged: a goal set a moment ago has had
+  // no turn run against it, so there is nothing to read and the round trip
+  // would be the one somebody watches. Which means a turn starts here -- the
+  // harness has no model behind the judge, so anything that waited for one
+  // would go nowhere.
   await composer.click();
   await page.keyboard.type('/goal keep the chip on screen');
-  await page.locator('.send-btn').last().click();
-  // Guarded rather than awaited bare: a composer stuck on "Thinking…" turns
-  // its send button into a stop button, so the command never goes out and the
-  // wait below is the second symptom of the first failure. A test that throws
-  // there reports a timeout instead of the thing that actually broke.
+  await page.keyboard.press('Enter');
   try {
     await page.waitForSelector('.goal-chip', { timeout: 15000 });
     check('setting a goal puts the chip up', true);
   } catch {
     check('setting a goal puts the chip up', false, 'no chip appeared');
   }
+  try {
+    await page.waitForFunction(() => !!document.querySelector('.working-row'),
+                               null, { timeout: 15000 });
+    check('and a turn starts without waiting on a check', true);
+  } catch {
+    check('and a turn starts without waiting on a check', false, 'nothing ran');
+  }
 
+  // Cleared while that turn is running, which is the case worth testing:
+  // stopping a goal has to stop the work it started. Enter rather than the
+  // button -- while a turn runs the button is a stop button, and clicking it
+  // would interrupt instead of sending.
   await composer.click();
   await page.keyboard.type('/goal clear');
-  await page.locator('.send-btn').last().click();
+  await page.keyboard.press('Enter');
   try {
     await page.waitForFunction(() => !document.querySelector('.goal-chip'),
                                null, { timeout: 15000 });
     check('clearing it takes the chip away', true);
   } catch {
     check('clearing it takes the chip away', false, 'the chip stayed');
+  }
+  try {
+    await page.waitForFunction(() => !document.querySelector('.working-row'),
+                               null, { timeout: 20000 });
+    check('and the turn it was running stops', true);
+  } catch {
+    check('and the turn it was running stops', false, 'still working');
   }
 
   await page.waitForTimeout(1500);
