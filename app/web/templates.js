@@ -176,6 +176,15 @@ const BUILD = {
   rowHuman: () => el('div', { class: 'human-msg' },
     el('div', { class: 'human-msg-body' })),
 
+  /// A turn Caden took on a goal's behalf. Deliberately not `rowHuman`:
+  /// nobody typed it, and drawing it as a user message puts words in the
+  /// reader's mouth -- it belongs with `Ran` and `Explored`, which are also
+  /// things that happened rather than things anyone said.
+  rowDriven: () => el('div', { class: 'row-activity' },
+    el('div', { class: 'tool-call' },
+      el('span', { class: 'verb', text: 'Continuing' }),
+      el('span', { class: 'subject' }))),
+
   /// Assistant prose.
   rowText: () => el('div', { class: 'row-markdown' },
     el('div', { class: 'md', dataset: { size: 'md' } })),

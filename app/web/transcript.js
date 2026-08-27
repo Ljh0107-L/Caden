@@ -101,7 +101,11 @@ export class Transcript {
       case 'user':
         // A new turn supersedes the last one's parting status.
         this.activity = null;
-        this.upsert(`u:${ev.seq}`, 'user', turn, ts, it => { it.text = ev.text || ''; });
+        this.upsert(`u:${ev.seq}`, 'user', turn, ts, it => {
+          it.text = ev.text || '';
+          // Caden continuing a goal, not the person typing.
+          it.driven = !!ev.driven;
+        });
         break;
       // `streaming` marks a block that is still arriving. The final event for
       // a block clears it: a finished paragraph looks identical to a live one

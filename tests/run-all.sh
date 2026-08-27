@@ -142,13 +142,9 @@ step "codex handshake (a slow app-server does not wedge the session)"
 python3 tests/codex_handshake_test.py >/dev/null 2>&1
 result $? "codex_handshake_test.py"
 
-step "/goal on the claude side (the CLI's own answers, and asking again)"
-python3 tests/goal_claude_test.py >/dev/null 2>&1
-result $? "goal_claude_test.py"
-
-step "/goal against a codex that runs turns of its own"
-python3 tests/goal_test.py --home "$HOME_DIR/goal" --port $((PORT + 4)) >/dev/null 2>&1
-result $? "goal_test.py"
+step "goals (Caden's own loop: states, commands, when it stands aside)"
+python3 tests/goal_loop_test.py >/dev/null 2>&1
+result $? "goal_loop_test.py"
 
 step "client (HTTP, SSE, transcript reduction, routing)"
 CLIENT_HOME="$HOME_DIR/client"
