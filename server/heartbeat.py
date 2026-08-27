@@ -859,6 +859,32 @@ GOAL_WINDOW_EVENTS = 80
 GOAL_WINDOW_CHARS = 24000
 GOAL_TOOL_CHARS = 1200
 
+# How many goes the judge gets before the loop gives up on it, and how long
+# it waits between them. A gateway that drops one TLS handshake is not the
+# loop failing to know whether it is finished, and blocking a goal over it
+# loses a night's work to a hiccup -- measured on a devbox, where the check
+# came back `EOF occurred in violation of protocol` once and the goal stopped
+# dead on the first turn.
+GOAL_JUDGE_TRIES = 3
+GOAL_JUDGE_BACKOFF = (1.5, 5.0)
+
+
+def judge_retryable(exc):
+    """Worth another go, or a wall?
+
+    A refusal that came with a reason -- a key the gateway will not take, a
+    model it has never heard of, a provider Caden cannot speak to at all -- is
+    a wall, and asking three times only says the same thing three times more
+    slowly. Everything else is the network, which is worth another go.
+    """
+    import urllib.error
+    if isinstance(exc, EngineError):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (408, 409, 425, 429) or exc.code >= 500
+    return True
+
+
 GOAL_JUDGE_SYSTEM = """You decide whether a coding goal has been reached. \
 You are not doing the work; you are auditing it.
 
@@ -1052,7 +1078,19 @@ def judge_goal(session, goal):
               % (goal.get("objective") or "",
                  goal.get("turns_used") or 0,
                  goal_evidence(session.bus) or "(nothing yet)"))
-    raw = (model_reply(provider, model, GOAL_JUDGE_SYSTEM, prompt) or "").strip()
+    raw = ""
+    for attempt in range(GOAL_JUDGE_TRIES):
+        try:
+            raw = (model_reply(provider, model, GOAL_JUDGE_SYSTEM,
+                               prompt) or "").strip()
+            break
+        except Exception as exc:
+            if not judge_retryable(exc) or attempt == GOAL_JUDGE_TRIES - 1:
+                raise
+            log("info", "[%s] goal check failed (%s); retrying",
+                session.id, exc)
+            time.sleep(GOAL_JUDGE_BACKOFF[min(attempt,
+                                              len(GOAL_JUDGE_BACKOFF) - 1)])
     verdict, reason = "continue", ""
     m = re.search(r"\{.*\}", raw, re.S)
     if m:

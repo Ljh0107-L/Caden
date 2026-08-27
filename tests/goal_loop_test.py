@@ -104,6 +104,9 @@ class Harness(object):
 def main():
     home = tempfile.mkdtemp(prefix="caden-goal-")
     hb = load_daemon(home)
+    # Held before any harness replaces it: the retry check below is about the
+    # real one.
+    real_judge_goal = hb.judge_goal
     mgr = hb.SessionManager()
 
     def new_harness():
@@ -514,6 +517,43 @@ def main():
     except hb.EngineError as exc:
         check("an unknown provider is refused, not guessed at",
               "no judge" in str(exc), str(exc))
+
+    # A dropped connection is the network, not an answer. Blocking a goal for
+    # one of them is how a night's work is lost to a hiccup: measured on a
+    # devbox, where the check came back `EOF occurred in violation of
+    # protocol` once and the goal stopped dead on its first turn.
+    import ssl
+    import urllib.error
+    check("a dropped TLS handshake is worth another go",
+          hb.judge_retryable(ssl.SSLError("EOF occurred in violation")))
+    check("so is a gateway that is briefly unwell",
+          hb.judge_retryable(urllib.error.HTTPError("u", 503, "x", None, None))
+          and hb.judge_retryable(
+              urllib.error.HTTPError("u", 429, "x", None, None)))
+    check("a key the gateway will not take is a wall",
+          not hb.judge_retryable(
+              urllib.error.HTTPError("u", 401, "x", None, None)))
+    check("and a provider Caden cannot speak to at all is a wall",
+          not hb.judge_retryable(hb.EngineError("no judge for a missing provider")))
+
+    calls = []
+    real_reply = hb.model_reply
+    hb.GOAL_JUDGE_BACKOFF = (0.0,)
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise ssl.SSLError("EOF occurred in violation of protocol")
+        return '{"verdict": "continue", "reason": "back on its feet"}'
+
+    hb.model_reply = flaky
+    try:
+        verdict, reason = real_judge_goal(h.session, {"objective": "x"})
+        check("the judge rides out a blip and answers",
+              verdict == "continue" and len(calls) == 3,
+              "%s after %d tries" % (verdict, len(calls)))
+    finally:
+        hb.model_reply = real_reply
 
     # -- meta survives two writers ----------------------------------------
     #
