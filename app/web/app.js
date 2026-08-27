@@ -328,7 +328,15 @@ function makeController(server, session) {
     async send(text, images) {
       try {
         await ctl.api.sendMessage(ctl.session.id, text, images);
-        ctl.session.state = 'running';
+        // Optimism, so the composer answers the keystroke rather than the
+        // round trip -- but `/goal` is answered by the daemon itself and never
+        // becomes a turn. Claiming one started left the composer on
+        // "Thinking…" waiting for a reply nobody was going to send, and it
+        // could not be corrected from the other end either: the daemon's own
+        // `status` for the command arrives in milliseconds, which is before
+        // this line runs, so the fix that emits it was overwritten by the very
+        // thing it was fixing.
+        if (!/^\s*\/goal(\s|$)/.test(text || '')) ctl.session.state = 'running';
         ctl.syncList();
         ctl.notify();
       } catch (e) {
