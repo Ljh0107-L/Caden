@@ -106,7 +106,7 @@ picked up again after a daemon restart. One schema, fields always present:
   "turns_used":     14,
   "tokens_used":    182400,
   "tokens_at_set":  9100,
-  "token_budget":   2000000,
+  "token_budget":   null,
   "last_verdict":   "continue",
   "last_reason":    "3 of 47 tests still failing in tests/supervise_test.py",
   "blocked_streak": 0
@@ -117,13 +117,18 @@ picked up again after a daemon restart. One schema, fields always present:
 sums — less what it stood at when the goal was set. Nothing new is collected
 for it.
 
-`token_budget` is the ceiling, in tokens, and it defaults to
-`GOAL_DEFAULT_TOKEN_BUDGET`. Tokens are the unit Codex's own goals budget in
-and the one a bill is denominated in; turns are easier to picture and much
-worse to budget with, because a turn that reads three files and one that
-rewrites a module cost two orders of magnitude apart. Codex leaves the ceiling
-unset and runs until told to stop, which is reasonable with somebody watching
-and is not what a loop left running overnight needs.
+`token_budget` is the ceiling, in tokens, and there is no default — exactly as
+Codex does it: `thread/goal/set` without a `tokenBudget` records null and the
+goal runs until it is finished or stopped. A budget is something you reach for,
+with `/goal budget <n>`, not something you are handed.
+
+Tokens are the unit because they are what a bill is denominated in. Turns are
+easier to picture and much worse to budget with: a turn that reads three files
+and one that rewrites a module cost two orders of magnitude apart.
+
+**A goal with no budget has no ceiling.** Left running it will keep taking
+turns until it is finished, blocked, or stopped by hand. That is the deliberate
+choice, and `/goal budget <n>` is the answer when it matters.
 
 Every drive message carries the budget the way Codex's own continuation does —
 used, total, and **remaining** — because what a model needs to pace itself is
@@ -214,9 +219,10 @@ Caden no longer sets one.
 
 ## Still open
 
-- **The default token budget.** There is none; the turn ceiling is what stops a
-  runaway. A token figure is easier to reason about against a bill and harder
-  to reason about against a task.
+- **Whether "no budget by default" is right.** It is what Codex does, and it
+  is deliberate — but Codex's loop runs with somebody watching it, and this one
+  can be left overnight. Nothing stops an unbudgeted goal but finishing,
+  blocking, or a person.
 - **Which model judges.** Currently the session's own. A cheaper one would run
   on every idle for a fraction of the cost, at some risk of a worse call on the
   evidence.

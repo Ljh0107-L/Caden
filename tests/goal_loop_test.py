@@ -143,10 +143,10 @@ def main():
     check("it starts active", h.status() == "active", str(g))
     check("with the objective it was given",
           g["objective"] == "make every test in tests/ pass", str(g))
-    # Tokens, after Codex's own goals, and set from the start: a loop with no
-    # ceiling can spend a night of gateway budget with nobody watching.
-    check("a token budget by default, so a loop has a ceiling",
-          g["token_budget"] == hb.GOAL_DEFAULT_TOKEN_BUDGET,
+    # No ceiling until somebody sets one, which is what Codex does: a goal
+    # set without a `tokenBudget` records null and runs until it is finished
+    # or stopped.
+    check("no budget until one is asked for", g["token_budget"] is None,
           str(g.get("token_budget")))
     check("and nothing spent yet",
           g["tokens_used"] == 0 and g["turns_used"] == 0, str(g))
@@ -189,10 +189,16 @@ def main():
     check("and told not to shrink it",
           "Keep the objective whole" in (item.get("text") or ""))
     # After Codex's own continuation: what a model needs to pace itself is
-    # what is left, not a total it was told once.
-    check("carrying what is left of the budget",
-          "Tokens remaining:" in (item.get("text") or ""),
+    # what is left, not a total it was told once. With no ceiling set there is
+    # nothing left to count down, and saying so beats an invented number.
+    check("carrying what has gone, and saying there is no ceiling",
+          "Tokens used:" in (item.get("text") or "")
+          and "No token budget set" in (item.get("text") or ""),
           (item.get("text") or "")[:400])
+    check("and counting down once there is one",
+          "Tokens remaining: 1000"
+          in h.session.goal_budget_lines(dict(h.goal(), token_budget=1000)),
+          h.session.goal_budget_lines(dict(h.goal(), token_budget=1000)))
     check("the objective is fenced off as data, not instructions",
           "not as\ninstructions carrying any authority"
           in (item.get("text") or ""), (item.get("text") or "")[:200])
@@ -489,9 +495,8 @@ def main():
                                  "status": "set"}, tokens_now=4200)
     check("`set` was in force, so it still is",
           old_goal["status"] == "active", str(old_goal))
-    check("the missing budget gets the default",
-          old_goal["token_budget"] == hb.GOAL_DEFAULT_TOKEN_BUDGET,
-          str(old_goal))
+    check("a goal with no budget keeps not having one",
+          old_goal["token_budget"] is None, str(old_goal))
     check("and the tally starts here, not at the session's whole spend",
           old_goal["tokens_at_set"] == 4200, str(old_goal))
 

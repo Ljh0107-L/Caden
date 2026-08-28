@@ -847,16 +847,6 @@ GOAL_STATES = ("active", "paused", "blocked", "exhausted")
 # noticing it, and the turn after often walks around it.
 GOAL_BLOCKED_STREAK = 3
 
-# The ceiling a goal starts with, in tokens -- the unit Codex's own goals use,
-# and the one a bill is denominated in. Turns are easier to picture and worse
-# to budget with: a turn that reads three files and one that rewrites a module
-# cost two orders of magnitude apart.
-#
-# Codex leaves this unset and runs until told to stop, which is reasonable
-# with somebody watching and is not what a loop left running overnight needs.
-# Roughly a few full context windows of work, and `/goal budget <n>` moves it.
-GOAL_DEFAULT_TOKEN_BUDGET = 2000000
-
 # What the judge is shown: the tail of the transcript, tool output included.
 # An assistant saying it finished is not evidence, which is the whole reason
 # the window carries `tool.end` rather than a summary of it.
@@ -1024,8 +1014,7 @@ def goal_migrated(goal, tokens_now=0):
             "turns_used": int(goal.get("turns_used") or 0),
             "tokens_used": int(goal.get("tokens_used") or 0),
             "tokens_at_set": int(tokens_now if at_set is None else at_set),
-            "token_budget": (goal.get("token_budget")
-                             or GOAL_DEFAULT_TOKEN_BUDGET),
+            "token_budget": goal.get("token_budget"),
             "last_verdict": goal.get("last_verdict"),
             "last_reason": goal.get("last_reason"),
             "blocked_streak": int(goal.get("blocked_streak") or 0)}
@@ -4112,7 +4101,15 @@ class Session(object):
         return {"objective": objective, "status": "active",
                 "set_at": now_ms(), "turns_used": 0, "tokens_used": 0,
                 "tokens_at_set": self._token_total(self.meta.get("totals")),
-                "token_budget": GOAL_DEFAULT_TOKEN_BUDGET,
+                # No ceiling until somebody sets one, which is what Codex
+                # does: `thread/goal/set` without a `tokenBudget` records
+                # null and the goal runs until it is finished or stopped. The
+                # budget is a thing you reach for, not a thing you are given
+                # -- `/goal budget <n>` puts one on. Tokens are the unit, the
+                # one a bill is denominated in: a turn that reads three files
+                # and one that rewrites a module cost two orders of magnitude
+                # apart, so counting turns budgets nothing.
+                "token_budget": None,
                 "last_verdict": None, "last_reason": None,
                 "blocked_streak": 0}
 
