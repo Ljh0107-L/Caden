@@ -90,6 +90,10 @@ class Harness(object):
         return "\n".join(self.said)
 
     def step(self, *verdicts):
+        # Pointed back at this harness first. Building a second one rebinds the
+        # module's `judge_goal`, so a step on the older one silently read the
+        # newer one's empty script and took the default verdict instead.
+        self.hb.judge_goal = self._judge
         self.verdicts = list(verdicts)
         del self.said[:]
         self._real_step()
@@ -139,10 +143,13 @@ def main():
     check("it starts active", h.status() == "active", str(g))
     check("with the objective it was given",
           g["objective"] == "make every test in tests/ pass", str(g))
-    check("a turn budget by default, so a loop has a ceiling",
-          g["turn_budget"] == hb.GOAL_DEFAULT_TURNS, str(g.get("turn_budget")))
-    check("no token budget until one is asked for",
-          g["token_budget"] is None and g["turns_used"] == 0, str(g))
+    # Tokens, after Codex's own goals, and set from the start: a loop with no
+    # ceiling can spend a night of gateway budget with nobody watching.
+    check("a token budget by default, so a loop has a ceiling",
+          g["token_budget"] == hb.GOAL_DEFAULT_TOKEN_BUDGET,
+          str(g.get("token_budget")))
+    check("and nothing spent yet",
+          g["tokens_used"] == 0 and g["turns_used"] == 0, str(g))
 
     # -- the first turn is not judged -------------------------------------
     #
@@ -181,6 +188,11 @@ def main():
           "make every test in tests/ pass" in (item.get("text") or ""))
     check("and told not to shrink it",
           "Keep the objective whole" in (item.get("text") or ""))
+    # After Codex's own continuation: what a model needs to pace itself is
+    # what is left, not a total it was told once.
+    check("carrying what is left of the budget",
+          "Tokens remaining:" in (item.get("text") or ""),
+          (item.get("text") or "")[:400])
     check("the objective is fenced off as data, not instructions",
           "not as\ninstructions carrying any authority"
           in (item.get("text") or ""), (item.get("text") or "")[:200])
@@ -280,27 +292,27 @@ def main():
     h = new_harness()
     h.cmd("/goal rewrite the parser")
     h.started()
-    h.session.goal_write(dict(h.goal(), turn_budget=2, turns_used=2))
+    h.session.meta["totals"] = {"input_tokens": 5000}
+    h.session.goal_write(dict(h.goal(), token_budget=4000, tokens_at_set=0))
     h.step(("continue", "still going"))
     check("a spent budget stops the loop", h.status() == "exhausted",
           h.status())
     check("no turn is taken", not h.driven, str(h.driven))
-    check("and it says which budget", any("driven turns used" in x
-                                          for x in h.said), str(h.said))
+    check("and it says how much went", any("tokens used" in x
+                                           for x in h.said), str(h.said))
 
     out = h.cmd("/goal resume")
     check("resume is refused rather than failing one turn later",
           h.status() == "exhausted" and "budget is spent" in out, out)
 
-    out = h.cmd("/goal budget 10 turns")
+    out = h.cmd("/goal budget 900000")
     check("raising the ceiling is the way back", h.status() == "active",
           "%s %r" % (h.status(), out))
-    check("and the count is kept, not reset", h.goal()["turns_used"] == 2,
-          str(h.goal()["turns_used"]))
-
-    out = h.cmd("/goal budget 900000")
-    check("a plain number is tokens",
+    check("the number is tokens",
           h.goal()["token_budget"] == 900000, str(h.goal()))
+    check("and what was spent is kept, not reset",
+          h.session.goal_tokens_used(h.goal()) == 5000,
+          str(h.session.goal_tokens_used(h.goal())))
 
     # -- pause and resume -------------------------------------------------
     print("== pause, resume, clear")
@@ -319,7 +331,7 @@ def main():
 
     out = h.cmd("/goal")
     check("`/goal` reports state, budget and the last check",
-          "tidy the docs" in out and "driven turns" in out, out)
+          "tidy the docs" in out and "tokens" in out, out)
 
     check("clear removes it", h.cmd("/goal clear") == ""
           and h.goal() is None)
@@ -348,55 +360,6 @@ def main():
     check("the objective changes", g["objective"] == "second", str(g))
     check("and its accounting starts over",
           g["turns_used"] == 0 and g["blocked_streak"] == 0, str(g))
-
-    # -- goals written by the daemon before this one ----------------------
-    #
-    # `set` was Claude's word for "in force". Nothing writes it now, so a goal
-    # still saying it would never be corrected: the chip draws anything but
-    # `active` as stopped, and the loop only moves on `active`. It would sit
-    # there looking paused for good.
-    print("== a goal from an older daemon")
-    old = hb.goal_migrated({"objective": "finish the port", "status": "set"},
-                           tokens_now=4200)
-    check("`set` was in force, so it still is", old["status"] == "active",
-          str(old))
-    check("the missing budget gets the default",
-          old["turn_budget"] == hb.GOAL_DEFAULT_TURNS, str(old))
-    check("and the tally starts from here, not from the whole session",
-          old["tokens_at_set"] == 4200, str(old))
-
-    for was, now in (("usageLimited", "exhausted"),
-                     ("budgetLimited", "exhausted"),
-                     ("paused", "paused"), ("blocked", "blocked"),
-                     ("active", "active")):
-        got = hb.goal_migrated({"objective": "x", "status": was})["status"]
-        check("%s reads as %s" % (was, now), got == now, got)
-
-    check("a status nobody recognises is read as still running",
-          hb.goal_migrated({"objective": "x", "status": "??"})["status"]
-          == "active")
-    check("and a goal with no objective is no goal",
-          hb.goal_migrated({"status": "set"}) is None)
-
-    # Applying it twice must not move anything.
-    once = hb.goal_migrated({"objective": "finish the port", "status": "set"},
-                            tokens_now=4200)
-    check("migrating an already-migrated goal changes nothing",
-          hb.goal_migrated(once, tokens_now=9999) == once, str(once))
-
-    # And it happens on the way in, not only when asked.
-    sid = h.session.id if False else None
-    stale = mgr.create({"engine": "codex", "model": "gpt-5.6-sol", "cwd": home,
-                        "permission_mode": "bypassPermissions",
-                        "provider": {"protocol": "openai-responses",
-                                     "api_key": "sk-test"}})
-    stale.meta["goal"] = {"objective": "left over", "status": "set"}
-    stale.save()
-    reloaded = hb.Session(mgr, json.load(open(stale.path("meta.json"))))
-    check("a session loaded from disk is migrated as it comes in",
-          reloaded.meta["goal"]["status"] == "active",
-          str(reloaded.meta.get("goal")))
-
     # -- a command that never becomes a turn still closes the exchange -----
     #
     # A client marks itself running the moment a message is accepted, and
@@ -527,7 +490,8 @@ def main():
     check("`set` was in force, so it still is",
           old_goal["status"] == "active", str(old_goal))
     check("the missing budget gets the default",
-          old_goal["turn_budget"] == hb.GOAL_DEFAULT_TURNS, str(old_goal))
+          old_goal["token_budget"] == hb.GOAL_DEFAULT_TOKEN_BUDGET,
+          str(old_goal))
     check("and the tally starts here, not at the session's whole spend",
           old_goal["tokens_at_set"] == 4200, str(old_goal))
 

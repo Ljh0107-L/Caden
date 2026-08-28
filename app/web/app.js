@@ -1771,7 +1771,7 @@ function buildPromptInput({ root, placeholder, modelLabel, engine, onPlusMenu, o
   // all, and a shared line had to be vague enough to be true of both.
   const SLASH = [
     { name: 'goal', takesArg: true,
-      desc: 'Work toward an objective — also: /goal pause, resume, budget, clear' },
+      desc: 'Work toward an objective — also: /goal pause, resume, clear, budget <tokens>' },
     { name: 'compact', takesArg: false,
       desc: 'Summarize the conversation to prevent hitting the context limit' },
   ];
@@ -2151,13 +2151,15 @@ function buildStatusRow(ctl, entry, onToggleContext) {
       // for Claude's spelling -- reading the engine off a status field with
       // the session's own `engine` sitting on the same object.
       const tip = [`Goal: ${goal.objective}`, `status: ${goal.status}`];
-      tip.push(goal.turn_budget
-        ? `${goal.turns_used ?? 0} of ${goal.turn_budget} driven turns`
-        : `${goal.turns_used ?? 0} driven turns`);
-      if (goal.token_budget) {
-        tip.push(`${compactTokens(goal.tokens_used)} / `
-                 + `${compactTokens(goal.token_budget)} tokens`);
-      }
+      // Tokens are the ceiling, after Codex's own goals: a turn that reads
+      // three files and one that rewrites a module are two orders of
+      // magnitude apart, so counting turns budgets nothing. The turn count is
+      // still worth showing -- it says how far this has gone.
+      tip.push(goal.token_budget
+        ? `${compactTokens(goal.tokens_used)} of `
+          + `${compactTokens(goal.token_budget)} tokens`
+        : `${compactTokens(goal.tokens_used)} tokens, no budget set`);
+      tip.push(`${goal.turns_used ?? 0} driven turns`);
       // Why the last check did not call it finished. There is always one once
       // the loop has run: the judge answers with a reason whatever it decides.
       if (goal.last_reason) tip.push(`last check: ${goal.last_reason}`);

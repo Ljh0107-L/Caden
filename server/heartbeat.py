@@ -847,10 +847,15 @@ GOAL_STATES = ("active", "paused", "blocked", "exhausted")
 # noticing it, and the turn after often walks around it.
 GOAL_BLOCKED_STREAK = 3
 
-# Driven turns a goal gets before it stops. A loop with no ceiling can spend a
-# night of gateway budget with nobody watching, and turns are the unit someone
-# can reason about before starting one. A token budget is opt-in on top.
-GOAL_DEFAULT_TURNS = 50
+# The ceiling a goal starts with, in tokens -- the unit Codex's own goals use,
+# and the one a bill is denominated in. Turns are easier to picture and worse
+# to budget with: a turn that reads three files and one that rewrites a module
+# cost two orders of magnitude apart.
+#
+# Codex leaves this unset and runs until told to stop, which is reasonable
+# with somebody watching and is not what a loop left running overnight needs.
+# Roughly a few full context windows of work, and `/goal budget <n>` moves it.
+GOAL_DEFAULT_TOKEN_BUDGET = 2000000
 
 # What the judge is shown: the tail of the transcript, tool output included.
 # An assistant saying it finished is not evidence, which is the whole reason
@@ -1019,8 +1024,8 @@ def goal_migrated(goal, tokens_now=0):
             "turns_used": int(goal.get("turns_used") or 0),
             "tokens_used": int(goal.get("tokens_used") or 0),
             "tokens_at_set": int(tokens_now if at_set is None else at_set),
-            "token_budget": goal.get("token_budget"),
-            "turn_budget": goal.get("turn_budget") or GOAL_DEFAULT_TURNS,
+            "token_budget": (goal.get("token_budget")
+                             or GOAL_DEFAULT_TOKEN_BUDGET),
             "last_verdict": goal.get("last_verdict"),
             "last_reason": goal.get("last_reason"),
             "blocked_streak": int(goal.get("blocked_streak") or 0)}
@@ -4070,27 +4075,35 @@ class Session(object):
 
     def goal_over_budget(self, g):
         """The budget that ran out, worded for a person, or None."""
-        turns, cap = int(g.get("turns_used") or 0), g.get("turn_budget")
-        if cap and turns >= int(cap):
-            return "%d driven turns used, the budget was %d" % (turns, int(cap))
-        spent, tok = self.goal_tokens_used(g), g.get("token_budget")
-        if tok and spent >= int(tok):
-            return "%s tokens used, the budget was %s" % (spent, int(tok))
+        spent, cap = self.goal_tokens_used(g), g.get("token_budget")
+        if cap and spent >= int(cap):
+            return "%s tokens used, the budget was %s" % (spent, int(cap))
         return None
+
+    def goal_budget_lines(self, g):
+        """The budget as the drive message carries it.
+
+        Three lines, after Codex's own: what a model needs to pace itself is
+        what is left, and it cannot work that out from a total it was told
+        once. Codex puts the same block in every continuation it sends.
+        """
+        spent = self.goal_tokens_used(g)
+        cap = g.get("token_budget")
+        if not cap:
+            return "Budget:\n- Tokens used: %s\n- No token budget set." % spent
+        return ("Budget:\n- Tokens used: %s\n- Token budget: %s\n"
+                "- Tokens remaining: %s" % (spent, int(cap),
+                                            max(0, int(cap) - spent)))
 
     def goal_line(self, g):
         """`/goal` with nothing after it, and the notice when one is set."""
         if not g:
             return "No goal is set."
         parts = ["Goal (%s): %s" % (g.get("status"), g.get("objective"))]
-        budget = "%d/%s driven turns" % (int(g.get("turns_used") or 0),
-                                         g.get("turn_budget") or "\u221e")
-        if g.get("token_budget"):
-            budget += ", %s/%s tokens" % (self.goal_tokens_used(g),
-                                          g["token_budget"])
-        else:
-            budget += ", %s tokens" % self.goal_tokens_used(g)
-        parts.append(budget)
+        spent = self.goal_tokens_used(g)
+        parts.append("%s/%s tokens, %d driven turns"
+                     % (spent, g.get("token_budget") or "\u221e",
+                        int(g.get("turns_used") or 0)))
         if g.get("last_reason"):
             parts.append("last check: %s" % g["last_reason"])
         return "\n".join(parts)
@@ -4099,7 +4112,7 @@ class Session(object):
         return {"objective": objective, "status": "active",
                 "set_at": now_ms(), "turns_used": 0, "tokens_used": 0,
                 "tokens_at_set": self._token_total(self.meta.get("totals")),
-                "token_budget": None, "turn_budget": GOAL_DEFAULT_TURNS,
+                "token_budget": GOAL_DEFAULT_TOKEN_BUDGET,
                 "last_verdict": None, "last_reason": None,
                 "blocked_streak": 0}
 
@@ -4163,18 +4176,12 @@ class Session(object):
             if not g:
                 self.goal_say("No goal is set.")
                 return
-            n, _, unit = arg.partition(" ")
             try:
-                n = int(n.replace(",", "").replace("_", ""))
-            except ValueError:
-                self.goal_say("Usage: `/goal budget <tokens>` or "
-                              "`/goal budget <n> turns`.")
+                n = int(arg.split()[0].replace(",", "").replace("_", ""))
+            except (ValueError, IndexError):
+                self.goal_say("Usage: `/goal budget <tokens>`.")
                 return
-            g = dict(g)
-            if unit.strip().startswith("turn"):
-                g["turn_budget"] = n
-            else:
-                g["token_budget"] = n
+            g = dict(g, token_budget=n)
             # Raising the ceiling is the one way out of `exhausted`, so it
             # also has to be the thing that reopens it.
             if g.get("status") == "exhausted" and not self.goal_over_budget(g):
@@ -4325,9 +4332,7 @@ class Session(object):
         # On disk before the turn starts, so a daemon that dies mid-turn does
         # not wake up having forgotten it.
         self.goal_write(counted)
-        budget = "Budget: %d of %s driven turns used." % (
-            counted["turns_used"],
-            counted.get("turn_budget") or "no set number")
+        budget = self.goal_budget_lines(counted)
         # `_begin` outside the lock: it submits to the engine, and that call
         # blocks -- holding the session lock across it puts the reader thread
         # to sleep behind a reply only the reader can deliver.

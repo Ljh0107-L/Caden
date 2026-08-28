@@ -64,7 +64,7 @@ a turn.
 | `/goal clear` | delete it, and interrupt the turn it was running |
 | `/goal pause` | `active` → `paused` |
 | `/goal resume` | `paused` or `blocked` → `active` |
-| `/goal budget <n>` | token ceiling; `/goal budget <n> turns` for the other one |
+| `/goal budget <n>` | the token ceiling |
 
 Only two things put words in the transcript: `/goal` typed on its own, which
 is a question and gets an answer, and a command that could not do what it was
@@ -106,8 +106,7 @@ picked up again after a daemon restart. One schema, fields always present:
   "turns_used":     14,
   "tokens_used":    182400,
   "tokens_at_set":  9100,
-  "token_budget":   null,
-  "turn_budget":    50,
+  "token_budget":   2000000,
   "last_verdict":   "continue",
   "last_reason":    "3 of 47 tests still failing in tests/supervise_test.py",
   "blocked_streak": 0
@@ -118,15 +117,23 @@ picked up again after a daemon restart. One schema, fields always present:
 sums — less what it stood at when the goal was set. Nothing new is collected
 for it.
 
-`turn_budget` defaults to `GOAL_DEFAULT_TURNS`. A loop with no ceiling can
-spend a night of gateway budget with nobody watching, and turns are the unit a
-person can reason about before starting one. A token ceiling is opt-in on top.
+`token_budget` is the ceiling, in tokens, and it defaults to
+`GOAL_DEFAULT_TOKEN_BUDGET`. Tokens are the unit Codex's own goals budget in
+and the one a bill is denominated in; turns are easier to picture and much
+worse to budget with, because a turn that reads three files and one that
+rewrites a module cost two orders of magnitude apart. Codex leaves the ceiling
+unset and runs until told to stop, which is reasonable with somebody watching
+and is not what a loop left running overnight needs.
 
-`turns_used` counts **turns Caden sent**, and only those that actually
-started. Not idles, and not the turns a person sent themselves — their own
-messages are free, and a goal that stood aside for one is not charged for the
-turn it did not take. The judge runs on a different meter: once per idle,
-including the idles after a person's own turn.
+Every drive message carries the budget the way Codex's own continuation does —
+used, total, and **remaining** — because what a model needs to pace itself is
+what is left, and it cannot work that out from a figure it was told once.
+
+`turns_used` is a counter, not a ceiling: it says how far this has gone. It
+counts **turns Caden sent**, and only those that actually started — not idles,
+and not the turns a person sent themselves. A goal that stood aside for
+somebody's message is not charged for the turn it did not take. The judge runs
+on its own meter: once per idle, including the idles after a person's turn.
 
 ## The loop
 
