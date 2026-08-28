@@ -223,6 +223,7 @@ scripts/               build-app.sh, provision.sh, dev-seed.sh, screenshots.mjs,
 tests/                 run-all.sh, the client suite and the offline-install suite
 docs/ARCHITECTURE.md   how the pieces fit, and the event vocabulary
 docs/API.md            the daemon's HTTP surface
+docs/GOALS.md          working toward an objective across turns
 docs/DESIGN.md         the visual system
 docs/DEVELOPING.md     working on Caden while using Caden: the two installs
 docs/WEB.md            reaching a daemon from a phone, with the Mac switched off

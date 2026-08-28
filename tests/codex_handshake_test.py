@@ -183,8 +183,11 @@ def main():
     # sending it is not a harmless retry -- it is the failure all over again.
     check("nor sends initialize a second time",
           "initialize" not in methods(eng, mark), methods(eng, mark))
+    # `thread/goal/clear` rides along with every start: Codex drives a goal
+    # of its own if one is set, and Caden drives one now too.
     check("it resumes the thread it was wedged on",
-          methods(eng, mark) == ["thread/resume", "turn/start"],
+          methods(eng, mark) == ["thread/resume", "thread/goal/clear",
+                                 "turn/start"],
           methods(eng, mark))
     check("with the id the session was holding",
           params_of(eng, "thread/resume").get("threadId")
@@ -233,7 +236,8 @@ def main():
     eng = engine_for(hb, s, {"thread/start": lambda p: {"thread": {"id": "th_1"}}})
     eng.submit("t1", "hello")
     check("a fresh session initializes and starts a thread",
-          methods(eng) == ["initialize", "thread/start", "turn/start"],
+          methods(eng) == ["initialize", "thread/start", "thread/goal/clear",
+                           "turn/start"],
           methods(eng))
     mark = len(eng.calls)
     eng.submit("t2", "again")
@@ -245,7 +249,8 @@ def main():
     mark = len(eng.calls)
     eng.submit("t3", "and again")
     check("a process that died is greeted from the start",
-          methods(eng, mark) == ["initialize", "thread/resume", "turn/start"],
+          methods(eng, mark) == ["initialize", "thread/resume",
+                                 "thread/goal/clear", "turn/start"],
           methods(eng, mark))
     check("respawned once", eng.spawns == 2, eng.spawns)
 

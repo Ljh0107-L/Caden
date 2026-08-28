@@ -168,9 +168,14 @@ def main():
 
     eng3._on_item(True, {"type": "commandExecution", "id": "c1",
                          "command": "echo hi", "exitCode": 0})
+    # Both, in one wait. The engine's flag is set on the way into the close
+    # and the session's state on the way out of it, so waiting on the first
+    # and reading the second lands in the gap between them -- rarely alone,
+    # reliably under the load of the whole suite.
     check("and closes once it is done and nothing follows",
-          until(lambda: eng3._turn_closed, timeout=6.0)
-          and stray.meta.get("state") == heartbeat.STATE_IDLE,
+          until(lambda: eng3._turn_closed
+                and stray.meta.get("state") == heartbeat.STATE_IDLE,
+                timeout=6.0),
           "closed=%s state=%s" % (eng3._turn_closed, stray.meta.get("state")))
     ends = [e for e in stray.bus.since(0) if e["type"] == "turn.end"]
     check("closed cleanly, not as a failure",
@@ -217,6 +222,20 @@ def main():
     q.meta["state"] = heartbeat.STATE_RUNNING
     q.queue = [{"text": "next", "images": [], "id": "turn_queued"}]
     q.interrupt(keep_queue=True)
+    # Pressing stop with nothing to stop. It used to signal the engine and
+    # write an `Interrupted` line anyway, so a button pressed ten times on a
+    # session that had gone quiet left ten of them behind.
+    quiet = heartbeat.SESSIONS.create({"engine": "mock", "model": "mock-1",
+                             "title": "nothing running"})
+    quiet.meta["state"] = heartbeat.STATE_IDLE
+    before = quiet.bus.seq
+    quiet.interrupt()
+    quiet.interrupt()
+    check("interrupting an idle session with nothing queued says nothing",
+          not [e for e in quiet.bus.since(before)
+               if e["type"] == "interrupted"],
+          str([e["type"] for e in quiet.bus.since(before)]))
+
     check("keep_queue leaves the next message in place",
           [i["id"] for i in q.queue] == ["turn_queued"])
 

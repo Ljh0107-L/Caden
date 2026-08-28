@@ -240,10 +240,15 @@ than moves anybody.
 protocol the interactive Codex speaks — one long-lived process per session, as
 above. The batch entry point (`codex exec`) was the obvious choice and the wrong
 one: it hands its prompt straight to the model, so a slash command never reaches
-a parser and `/compact` silently does nothing. app-server has `thread/compact/start`
-and `thread/goal/set|get|clear` as methods, streams reasoning and message deltas
-that exec only ever delivered at the end of a turn, and takes the sandbox and
-model per turn rather than baking them into a process.
+a parser and `/compact` silently does nothing. app-server has
+`thread/compact/start` as a method, streams reasoning and message deltas that
+exec only ever delivered at the end of a turn, and takes the sandbox and model
+per turn rather than baking them into a process.
+
+It has `thread/goal/set|get|clear` too, and Caden uses exactly one of them:
+`clear`, on every start, so that Codex's own goal loop cannot run alongside
+Caden's. Goals are Caden's now — one set of states and one judgement whichever
+CLI is underneath. See [GOALS.md](GOALS.md).
 
 Two shapes for one decision, worth remembering: `thread/*` takes `sandbox` as a
 mode string (`read-only`), `turn/*` takes `sandboxPolicy` as a tagged object

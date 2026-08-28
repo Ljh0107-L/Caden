@@ -328,7 +328,15 @@ function makeController(server, session) {
     async send(text, images) {
       try {
         await ctl.api.sendMessage(ctl.session.id, text, images);
-        ctl.session.state = 'running';
+        // Optimism, so the composer answers the keystroke rather than the
+        // round trip -- but `/goal` is answered by the daemon itself and never
+        // becomes a turn. Claiming one started left the composer on
+        // "Thinking…" waiting for a reply nobody was going to send, and it
+        // could not be corrected from the other end either: the daemon's own
+        // `status` for the command arrives in milliseconds, which is before
+        // this line runs, so the fix that emits it was overwritten by the very
+        // thing it was fixing.
+        if (!/^\s*\/goal(\s|$)/.test(text || '')) ctl.session.state = 'running';
         ctl.syncList();
         ctl.notify();
       } catch (e) {
@@ -1757,18 +1765,13 @@ function buildPromptInput({ root, placeholder, modelLabel, engine, onPlusMenu, o
   // two long -- the commands that change how a long session behaves -- rather
   // than a mirror of everything the CLIs accept.
   //
-  // Both CLIs have `/goal`, but they do not mean the same thing, so neither
-  // does the line describing it. For Codex it is a standing objective the
-  // server works on, with a status and a token budget, and `resume` is the way
-  // back from a run it stopped. For Claude it is a stop condition -- "keep
-  // working until this is true" -- with no resume at all. One shared line had
-  // to be vague enough to be true of both, and ended up advertising `resume`
-  // on sessions that have never heard of it.
+  // `/goal` is Caden's own now and means one thing on both engines, so one
+  // line describes it. It used to be two: Codex's was a standing objective its
+  // server drove, Claude's a stop condition inside the CLI with no resume at
+  // all, and a shared line had to be vague enough to be true of both.
   const SLASH = [
     { name: 'goal', takesArg: true,
-      desc: engine === 'codex'
-        ? 'Set the objective to work toward — also: /goal clear, /goal resume'
-        : 'Set a condition Claude checks before it stops — also: /goal clear' },
+      desc: 'Work toward an objective — also: /goal pause, resume, clear, budget <tokens>' },
     { name: 'compact', takesArg: false,
       desc: 'Summarize the conversation to prevent hitting the context limit' },
   ];
@@ -2143,28 +2146,29 @@ function buildStatusRow(ctl, entry, onToggleContext) {
     slot.replaceChildren();
 
     if (goal) {
-      // `set` is Claude's case: the objective is what the user asked for, and
-      // Caden cannot see whether the condition has been met, so it claims
-      // nothing about that. Codex reports a real status.
-      const tip = goal.status === 'set'
-        ? [`Goal: ${goal.objective}`,
-           'Claude checks this before it stops — clear it with /goal clear']
-        : [`Goal: ${goal.objective}`, `status: ${goal.status}`];
-      if (goal.token_budget) {
-        tip.push(`${compactTokens(goal.tokens_used)} / `
-                 + `${compactTokens(goal.token_budget)} tokens`);
-      }
-      // What the engine last said about it. On the Claude side Caden asks after
-      // every turn, so this is as fresh as the last time it stopped -- and it
-      // is the only place the reason a condition has not been met is stated.
-      if (goal.checked) tip.push(`checked: ${goal.checked}`);
+      // One vocabulary, whichever engine is underneath. It used to take two
+      // here, and the tooltip picked between them by testing the status value
+      // for Claude's spelling -- reading the engine off a status field with
+      // the session's own `engine` sitting on the same object.
+      const tip = [`Goal: ${goal.objective}`, `status: ${goal.status}`];
+      // Tokens are the ceiling, after Codex's own goals: a turn that reads
+      // three files and one that rewrites a module are two orders of
+      // magnitude apart, so counting turns budgets nothing. The turn count is
+      // still worth showing -- it says how far this has gone.
+      tip.push(goal.token_budget
+        ? `${compactTokens(goal.tokens_used)} of `
+          + `${compactTokens(goal.token_budget)} tokens`
+        : `${compactTokens(goal.tokens_used)} tokens, no budget set`);
+      tip.push(`${goal.turns_used ?? 0} driven turns`);
+      // Why the last check did not call it finished. There is always one once
+      // the loop has run: the judge answers with a reason whatever it decides.
       if (goal.last_reason) tip.push(`last check: ${goal.last_reason}`);
       // The state goes first: trailing it put the one word that matters behind
       // an objective long enough to be ellipsized, so a paused goal looked
       // exactly like a running one. `active` says nothing -- no news is news,
       // and it means the goal is in force, not that a turn is running right
       // now; whether one is is already the spinner's job.
-      const idle = goal.status !== 'active' && goal.status !== 'set';
+      const idle = goal.status !== 'active';
       slot.append(el('span', { class: 'goal-chip', 'data-idle': idle || null,
                                title: tip.join('\n') },
         // A word rather than a pictogram, like every other label in the
@@ -2174,8 +2178,8 @@ function buildStatusRow(ctl, entry, onToggleContext) {
         // running: both answer "is this going anywhere", and only one of them
         // is ever true at a time.
         idle ? el('em', { class: 'goal-state' }, goal.status)
-             : /\d/.test(goal.checked || '') ? el('em', { class: 'goal-state' },
-                                                   goal.checked) : null,
+             : goal.turns_used ? el('em', { class: 'goal-state' },
+                                    `${goal.turns_used}`) : null,
         el('span', {}, goal.objective)));
     } else if (tasks.length) {
       // No goal, but work still running: an idle session with a job pending
