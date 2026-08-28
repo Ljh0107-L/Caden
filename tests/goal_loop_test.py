@@ -190,6 +190,29 @@ def main():
     check("and the reason is kept for the chip",
           h.goal()["last_reason"] == "3 of 47 tests still failing")
 
+    # -- a turn that never ran is not charged for -------------------------
+    #
+    # The judge takes seconds. A message arriving inside them sends the drive
+    # down the "somebody is talking, stand aside" branch -- and the budget used
+    # to be charged before that branch was reached, so a session with somebody
+    # in it could spend its whole ceiling without the goal moving once.
+    print("== standing aside costs nothing")
+    h2 = new_harness()
+    h2.cmd("/goal count carefully")
+    h2.started()
+    before = h2.goal()["turns_used"]
+    h2.session.queue.append({"id": "q1"})       # as if typed during the judge
+    h2.step(("continue", "carry on"))
+    check("the drive stands aside", not h2.driven, str(h2.driven))
+    check("and the budget is untouched",
+          h2.goal()["turns_used"] == before, "%s -> %s"
+          % (before, h2.goal()["turns_used"]))
+    h2.session.queue[:] = []
+    h2.step(("continue", "carry on"))
+    check("the turn it does take is counted",
+          h2.goal()["turns_used"] == before + 1 and len(h2.driven) == 1,
+          "%s, %d driven" % (h2.goal()["turns_used"], len(h2.driven)))
+
     # -- standing aside ---------------------------------------------------
     print("== whose turn it is")
     h.session.queue.append({"id": "q1"})

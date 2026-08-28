@@ -122,6 +122,12 @@ for it.
 spend a night of gateway budget with nobody watching, and turns are the unit a
 person can reason about before starting one. A token ceiling is opt-in on top.
 
+`turns_used` counts **turns Caden sent**, and only those that actually
+started. Not idles, and not the turns a person sent themselves — their own
+messages are free, and a goal that stood aside for one is not charged for the
+turn it did not take. The judge runs on a different meter: once per idle,
+including the idles after a person's own turn.
+
 ## The loop
 
 Hung off the end of `finish_turn`, which is the only place a turn is known to

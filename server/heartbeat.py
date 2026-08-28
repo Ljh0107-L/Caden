@@ -4293,7 +4293,6 @@ class Session(object):
             else:
                 g["blocked_streak"] = 0
 
-            g["turns_used"] = int(g.get("turns_used") or 0) + 1
             self.goal_write(g)
             self.drive_goal(g)
         except Exception:
@@ -4303,21 +4302,38 @@ class Session(object):
                 self._goal_busy = False
 
     def drive_goal(self, g):
-        """Send the turn nobody typed."""
-        budget = "Budget: %d of %s driven turns used." % (
-            int(g.get("turns_used") or 0), g.get("turn_budget") or "no set number")
-        item = {"text": GOAL_DRIVE % (g.get("objective") or "", budget),
-                "images": [], "id": new_id("turn"), "driven": True}
+        """Send the turn nobody typed. True when one actually started.
+
+        The budget is charged here rather than by the caller, because here is
+        where the decision is made. Counting first meant a turn that never ran
+        was paid for anyway: the judge takes seconds, a message arriving inside
+        them sends this down the `queue` branch below, and the ceiling went
+        down by one with the goal not having moved. A session somebody was
+        talking to could spend its whole allowance that way.
+        """
         with self.lock:
             if self.queue or self.meta.get("state") == STATE_RUNNING:
-                return
-            # Checked again here and not only by the caller: this is the last
+                return False
+            # Re-read rather than trusting the caller's copy: this is the last
             # moment before a turn exists, and the goal is written from three
             # threads.
             live = self.meta.get("goal") or {}
             if live.get("status") != "active":
-                return
-        self._begin(item)
+                return False
+            counted = dict(live)
+            counted["turns_used"] = int(counted.get("turns_used") or 0) + 1
+        # On disk before the turn starts, so a daemon that dies mid-turn does
+        # not wake up having forgotten it.
+        self.goal_write(counted)
+        budget = "Budget: %d of %s driven turns used." % (
+            counted["turns_used"],
+            counted.get("turn_budget") or "no set number")
+        # `_begin` outside the lock: it submits to the engine, and that call
+        # blocks -- holding the session lock across it puts the reader thread
+        # to sleep behind a reply only the reader can deliver.
+        self._begin({"text": GOAL_DRIVE % (counted.get("objective") or "", budget),
+                     "images": [], "id": new_id("turn"), "driven": True})
+        return True
 
     # -- turns ----------------------------------------------------------
     def send(self, text, images=None):
