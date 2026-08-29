@@ -4727,6 +4727,17 @@ class Session(object):
             "model": self.meta.get("model"),
             "model_label": self.meta.get("model_label"),
             "protocol": (self.meta.get("provider") or {}).get("protocol"),
+            # Which entry in the console's provider list this session was
+            # created from, and the endpoint it reaches.  Two providers can
+            # sell the same model id under the same name -- one gateway's
+            # `gpt-5.6-sol` and another's -- and the picker could not tell
+            # which of them a session was on, so it ticked both.  The id is
+            # the exact answer; the base URL is what a session set up before
+            # the id existed can still be matched by.  Neither is a secret:
+            # the renderer is holding the whole provider list already, and the
+            # key is the part it never sees.
+            "provider_id": self.meta.get("provider_id"),
+            "base_url": (self.meta.get("provider") or {}).get("base_url"),
             "cwd": self.meta.get("cwd") or self.path("workspace"),
             "state": self.meta.get("state") or STATE_IDLE,
             "native_id": self.meta.get("native_id"),
@@ -4824,6 +4835,7 @@ class SessionManager(object):
             "model": spec.get("model"),
             "model_label": spec.get("model_label"),
             "provider": provider,
+            "provider_id": spec.get("provider_id"),
             "cwd": cwd,
             "env": spec.get("env") or {},
             "add_dirs": spec.get("add_dirs") or [],
@@ -6679,6 +6691,10 @@ def h_session_patch(req, params, query):
         # one does not set them, which is how a session ends up quietly talking
         # to the old gateway with the old key.
         sess.meta["provider"] = body["provider"] or {}
+        # Carried by the same patch and replaced with it.  A `provider_id`
+        # left behind by a provider that has been swapped out names the wrong
+        # entry, which is worse than naming none.
+        sess.meta["provider_id"] = body.get("provider_id")
     sess.verbose_logs = bool(sess.meta.get("verbose_logs"))
     sess.save()
     # Nothing is done to the engine here.  `apply_settings` picks the change up

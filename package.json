@@ -9,7 +9,7 @@
     "build": "scripts/build-app.sh",
     "dev": "node app/server.js 8790",
     "test": "tests/run-all.sh",
-    "test:e2e": "node tests/e2e/session.mjs && node tests/e2e/narrow.mjs && node tests/e2e/gateway.mjs && node tests/e2e/goal.mjs && node tests/e2e/viewports.mjs"
+    "test:e2e": "node tests/e2e/session.mjs && node tests/e2e/narrow.mjs && node tests/e2e/gateway.mjs && node tests/e2e/goal.mjs && node tests/e2e/model.mjs && node tests/e2e/sidebar.mjs && node tests/e2e/viewports.mjs"
   },
   "devDependencies": {
     "@fontsource/jetbrains-mono": "^5.3.0",
