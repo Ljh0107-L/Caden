@@ -3,6 +3,83 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org);
 until 1.0 the minor number carries breaking changes.
 
+## 0.2.5
+
+`/goal` is Caden's own now, and four things that were quietly not what they
+claimed to be: a window, a handshake, a folder name and a model name.
+
+- **`/goal` no longer reaches either CLI.** The two commands were never the
+  same thing. Codex's is a standing objective its own server drives —
+  `thread/goal/set`, and app-server starts a turn, then another, with
+  milliseconds in between. Claude Code's is a stop condition living inside the
+  CLI, and nothing structured about it reaches the wire at all: Caden read it
+  back out of the CLI's own prose with four regexes and sent a silent `/goal`
+  after every turn to find out whether it still held. Both wrote one
+  `meta["goal"]`, so the field carried two vocabularies — "in force" was
+  `active` on one side and `set` on the other — and the front end went as far
+  as testing the status value to work out which engine it was talking to, with
+  the session's own `engine` sitting on the same object. The states, the
+  judgement and the turn that carries the work on are all Caden's now, so both
+  engines behave the same and the next one will too. Four states — `active`,
+  `paused`, `blocked`, `exhausted` — and no terminal "achieved": a goal that is
+  met is deleted and the chip goes with it. Six commands, none of which reaches
+  the CLI, none of which takes a turn, and all of which skip the queue, because
+  a `/goal clear` that waits its turn is a brake queued behind the wheel it is
+  trying to stop. After each turn Caden asks a judge of its own — the session's
+  provider rather than the engine, shown the objective and a window of the
+  transcript with tool output in it, since an assistant saying it finished is a
+  claim and a judge given only claims is not auditing anything — and drives the
+  next turn itself when the answer is that it is not finished.
+  [docs/GOALS.md](https://github.com/Ljh0107-L/Caden/blob/main/docs/GOALS.md)
+  is the design.
+- **A Codex session compacts at the window it declared, not nine tenths of
+  it.** A session that asked for 800k was being compacted at 748,800 — 51,200
+  short, on every turn, with the gauge still drawing 800k. Codex's threshold
+  comes off the catalog window, not off `model_auto_compact_token_limit`, which
+  moves nothing at all: four runs against a mock endpoint, reading the resolved
+  number back out of Codex's own log, and 69 rows on a live devbox agreeing at
+  a ratio of 0.9000. The reserve that was supposed to leave the reply somewhere
+  to go was therefore being spent on the compaction point instead — a fix for
+  the right symptom that under-corrected, 631k to 748.8k and never 800k. The
+  catalog window is ten ninths of the declared number now, which puts the
+  compaction point exactly on it, and the reply's room is the tenth above.
+- **A handshake that timed out is finished on the next turn, not skipped for
+  good.** On a box at load 197 the `initialize` after a respawn took longer
+  than sixty seconds, and every message sent afterwards came back
+  `thread not found` within milliseconds — forever, with the session's 63MB
+  rollout sitting on disk the whole time. `ensure_started` spawns, initializes
+  and then resumes the thread, and its re-entry guard was `if self.alive`;
+  `alive` is true from the moment the process exists, which is before either of
+  the other two has happened. So the timeout left a live process that had never
+  been asked to open the thread, and nothing ran the handshake again while it
+  was up. The guard is the handshake now rather than the process, a live
+  process with an unfinished one is sent the resume it never got instead of
+  being replaced, and a resume that times out no longer reads as "the thread is
+  gone" and starts the conversation over.
+- **A sidebar section is one directory on one machine.** Sessions were bucketed
+  by working directory alone and the section titled with its basename, which
+  went wrong in both directions. Two servers laid out the same way — what
+  happens when the same person sets both of them up — shared a section, and the
+  `+` on its heading ("new session here") started the session on whichever of
+  them happened to own the most recently touched row. Two *different* paths
+  ending in the same name were two sections with the same title and one fold
+  state between them, so folding one folded both. Keyed by server and path now:
+  the heading carries the machine's name whenever more than one server is
+  connected, and enough of the path when one machine has two directories of the
+  same name. Archived stays machine-wide — it is where sessions go to stop
+  being looked at, and splitting that by machine is two places to not look.
+- **The model picker ticks the row the session is actually on.** A model id is
+  unique to a provider, not to the console, so two gateways in front of the
+  same upstream put one model in the list twice under one alias — and the tick
+  was the model id, so both rows carried one. The composer's footer showed that
+  alias alone, which is the same string either way, so nothing on screen said
+  which gateway a session was talking to. A session records the provider entry
+  it was created from now, the tick tests that, and the name is qualified by
+  the provider — `GPT 5.6 Sol · Seed` — when the name alone does not identify
+  it. A session set up before the id was recorded is matched by its endpoint,
+  which separates any two gateways without waiting for the model to be picked
+  again.
+
 ## 0.2.2
 
 Two hosts that cannot supervise, and the two ways that went wrong.
