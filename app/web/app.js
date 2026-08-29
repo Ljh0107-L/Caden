@@ -48,7 +48,8 @@ const state = {
   pane: null,                  // 'models' | {sessionDetail: id}
   sidebarOpen: !NARROW.matches,   // a phone opens on the content, not the list
   // Archived starts folded: it is where sessions go to stop taking up room.
-  foldedRepos: new Set(['Archived']),
+  // Held by bucket key, which for Archived is the one that is not per-server.
+  foldedRepos: new Set(['\u0000archived']),
   // The whole repository list folds too, from its group heading.
   repoListFolded: false,
   serverStatus: new Map(),     // id -> readiness report from /host/servers/<id>/status
@@ -476,6 +477,29 @@ function models() {
   ];
 }
 
+/// Whether a picker row is the model a session is actually running on.
+///
+/// The model id alone was the test, and it is not enough: two provider
+/// entries can sell the same id under the same display name -- one gateway's
+/// `gpt-5.6-sol` and another's -- so both rows came back ticked and nothing
+/// on screen said which of them the session was on. A session records the
+/// provider entry it was created from; one set up before it did is matched
+/// by the endpoint instead, which separates any two gateways.
+function isCurrentModel(m, cur) {
+  if (!cur || m.modelID !== cur.model) return false;
+  if (cur.provider_id) return m.providerId === cur.provider_id;
+  return (m.baseURL || '') === (cur.base_url || '');
+}
+
+/// A model's name, qualified by its provider when the name alone does not
+/// identify it. Only then: with one provider selling a name the qualifier is
+/// noise, and the composer's footer is 220px wide.
+function modelDisplay(m) {
+  const name = m.name || m.modelID;
+  const twins = models().filter(x => (x.name || x.modelID) === name).length;
+  return twins > 1 ? `${name} \u00b7 ${m.provider}` : name;
+}
+
 const newId = () => (crypto.randomUUID ? crypto.randomUUID()
   : Math.random().toString(36).slice(2));
 
@@ -772,9 +796,19 @@ function renderServerList() {
   if (listFolded) body.style.display = 'none';
   group.append(body);
 
-  // The project is the axis and the machine is an attribute: sessions from
-  // every connected server merge into one repository list.
-  const buckets = new Map();          // key -> {label, items:[{serverId,entry,session}]}
+  // A section is one directory on one machine. It used to be keyed by the
+  // path alone -- the project as the axis, the machine as an attribute -- and
+  // that went wrong in both directions. Two servers laid out the same way
+  // shared a section, and its `+` ("new session here") started the session on
+  // whichever of them happened to own the newest row. Two different paths
+  // ending in the same directory name were the case actually complained
+  // about: `~/LP` on the devbox and `~/work/LP` on the other box gave two
+  // sections titled `LP` with nothing to tell them apart, and a fold state
+  // keyed by that title, so folding one folded both.
+  const buckets = new Map();   // key -> {key,label,machine,cwd,items:[…]}
+  // With one server connected its name is on every section and says nothing.
+  const showMachine = [...state.servers.values()]
+    .filter(e => e.status === 'online').length > 1;
   for (const [serverId, entry] of state.servers) {
     if (entry.status !== 'online') continue;
     const cadenHome = entry.facts?.caden_home || '';
@@ -782,12 +816,18 @@ function renderServerList() {
       const scratch = cadenHome && session.cwd.startsWith(cadenHome);
       // Archived sessions leave the repository list entirely and collect in one
       // group of their own, so getting a session out of the way does not mean
-      // losing track of it.
-      const key = session.archived ? '\u0000archived'
-                                   : (scratch ? '\u0000norepo' : session.cwd);
+      // losing track of it. It is the one bucket that stays machine-wide:
+      // splitting the place sessions go to stop being looked at, by machine,
+      // is two places to not look.
+      const key = session.archived
+        ? '\u0000archived'
+        : serverId + '\u0000' + (scratch ? '\u0000norepo' : session.cwd);
       if (!buckets.has(key)) {
         buckets.set(key, {
+          key,
           label: session.archived ? 'Archived' : (scratch ? 'No Repo' : basename(session.cwd)),
+          serverId: session.archived ? null : serverId,
+          machine: session.archived ? null : entry.profile.name,
           cwd: (session.archived || scratch) ? null : session.cwd,
           items: [] });
       }
@@ -795,6 +835,19 @@ function renderServerList() {
     }
   }
   const groups = [...buckets.values()];
+  // The machine settles which box; on one box two directories can still end
+  // in the same name, and then the name is not an address. Those sections
+  // carry enough of the path to tell them apart -- but only those, because
+  // `…/src/app` where `app` would do is a section heading nobody can scan.
+  // Collected before any of it is applied: relabelling as we go would make
+  // the second of a pair stop matching the first.
+  const twins = new Set();
+  for (const g of groups) {
+    if (!g.cwd) continue;
+    if (groups.some(o => o !== g && o.cwd && o.serverId === g.serverId
+                                 && o.label === g.label)) twins.add(g);
+  }
+  for (const g of twins) g.label = shortPath(g.cwd);
   for (const g of groups) g.items.sort((a, b) => b.session.updated_at - a.session.updated_at);
   // Repositories first, then the scratch bucket, and Archived at the very
   // bottom: it is the one group you are not meant to be looking at.
@@ -802,7 +855,7 @@ function renderServerList() {
   groups.sort((a, b) => (rank(a) - rank(b))
     || ((b.items[0]?.session.updated_at || 0) - (a.items[0]?.session.updated_at || 0)));
 
-  for (const g of groups) body.append(repoSection(g));
+  for (const g of groups) body.append(repoSection(g, showMachine));
 
   const anyOnline = [...state.servers.values()].some(e => e.status === 'online');
   if (!anyOnline) {
@@ -819,9 +872,11 @@ function renderServerList() {
   list.append(group);
 }
 
-function repoSection(g) {
+function repoSection(g, showMachine) {
   const sec = el('section', { class: cls('sectionCls') });
-  const folded = state.foldedRepos.has(g.label);
+  // Keyed by the bucket, not by what is printed on it: two sections can be
+  // called the same thing and folding is per section.
+  const folded = state.foldedRepos.has(g.key);
   // Fold contract: expanded sections carry data-expanded=true, collapsed ones
   // drop the attribute and the list zeroes out.
   if (!folded) sec.dataset.expanded = 'true';
@@ -836,12 +891,17 @@ function repoSection(g) {
   const headBtn = head.matches('.nav-row') ? head : head.querySelector('.nav-row');
   const headLabel = headBtn.querySelector('.section-head-title');
   if (headLabel) headLabel.textContent = g.label;
+  // Which copy of it. The directory name is what you are looking for and the
+  // machine is which one, so it sits after the name and gives way first.
+  if (showMachine && g.machine && headLabel) {
+    headLabel.after(el('span', { class: 'section-head-machine' }, g.machine));
+  }
   setIcon(headBtn.querySelector('.section-head-fold'),
           folded ? 'chevron-right' : 'chevron-down');
   // Clicking the row toggles the fold; the + stays "new here".
   headBtn.addEventListener('click', () => {
-    if (folded) state.foldedRepos.delete(g.label);
-    else state.foldedRepos.add(g.label);
+    if (folded) state.foldedRepos.delete(g.key);
+    else state.foldedRepos.add(g.key);
     renderServerList();
   });
   const plusBtn = headBtn.querySelector('.nav-row-actions button');
@@ -853,7 +913,7 @@ function repoSection(g) {
     e.preventDefault();
     openMenu(headBtn, [{ label: 'New session here', action: newHere }]);
   });
-  if (g.cwd) head.title = g.cwd;
+  if (g.cwd) head.title = g.machine ? `${g.machine}: ${g.cwd}` : g.cwd;
 
   const ul = el('ul', { class: cls('menuCls') });
   for (const item of g.items) ul.append(sessionCell(item.serverId, item.entry, item.session));
@@ -2319,10 +2379,15 @@ async function uploadPastedFile(entry, prompt, file, name) {
 }
 
 function buildComposer(ctl, entry) {
+  // The stored label is the fallback, not the source: it was written when the
+  // model was picked and says nothing about which provider it came from, so a
+  // name two of them share reads the same either way.
+  const current = models().find(m => isCurrentModel(m, ctl.session));
   const prompt = buildPromptInput({
     draft: ctl.draft,
     placeholder: 'Send follow-up',
-    modelLabel: ctl.session.model_label || ctl.session.model || 'model',
+    modelLabel: current ? modelDisplay(current)
+                        : (ctl.session.model_label || ctl.session.model || 'model'),
     engine: ctl.session.engine,
     isRunning: () => ctl.session.state === 'running',
     onSend: (text, images) => ctl.send(text, images),
@@ -2334,13 +2399,13 @@ function buildComposer(ctl, entry) {
     onModelMenu: anchor => openMenu(anchor, modelMenuItems(async m => {
       ctl.session = await ctl.api.patchSession(ctl.session.id, Object.assign({
         model: m.modelID, model_label: m.name || m.modelID,
-        provider: providerFor(m),
+        provider: providerFor(m), provider_id: m.providerId,
         // The window belongs to the model, so it moves with it. Left behind,
         // the engine would keep enforcing the old model's limit.
         context_window: m.contextWindow || null,
       }, credentialFor(m)));
       renderMain();
-    }, ctl.session.model, ctl.session.engine)),
+    }, ctl.session, ctl.session.engine)),
   });
   ctl.listeners.add(prompt.update);
 
@@ -2379,7 +2444,12 @@ function credentialFor(m) {
 /// creation and the daemon rejects a cross-protocol change, so a greyed row
 /// reads better than a model that disappears. The new-session composer passes
 /// no engine and gets everything enabled.
-function modelMenuItems(pick, currentId, engine) {
+///
+/// `current` is what identifies the model in use -- a session, or the same
+/// three fields off a draft's chosen row. The rows themselves stay bare: the
+/// section heading above them is the provider's name, so repeating it on
+/// every line would say it twice.
+function modelMenuItems(pick, current, engine) {
   const items = [];
   const byGroup = new Map();
   for (const m of models()) {
@@ -2394,7 +2464,7 @@ function modelMenuItems(pick, currentId, engine) {
     const off = Boolean(engine) && engineOf(list[0].proto) !== engine;
     items.push({ section: group });
     for (const m of list) {
-      items.push({ label: m.name || m.modelID, checked: m.modelID === currentId,
+      items.push({ label: m.name || m.modelID, checked: isCurrentModel(m, current),
                    disabled: off, action: off ? undefined : () => pick(m) });
     }
   }
@@ -2585,7 +2655,7 @@ function renderDraft() {
       const session = await entry.api.createSession(Object.assign({
         title: '', engine: engineOf(model.proto), model: model.modelID,
         model_label: model.name || model.modelID,
-        provider: providerFor(model),
+        provider: providerFor(model), provider_id: model.providerId,
         cwd: d.cwd, create_cwd: true,
         permission_mode: d.permissionMode,
         effort: d.effort,
@@ -2610,7 +2680,7 @@ function renderDraft() {
     // permission); the message it is being written for belongs with them.
     draft: d,
     placeholder: 'Describe the task…',
-    modelLabel: model.name || model.modelID,
+    modelLabel: modelDisplay(model),
     isRunning: () => false,
     onInterrupt: () => {},
     onSend: (text, images) => startSession(text, images),
@@ -2636,7 +2706,8 @@ function renderDraft() {
       modelMenuItems(m => {
         d.modelId = m.id;
         renderMain();
-      }, model.modelID)),
+      }, { model: model.modelID, provider_id: model.providerId,
+           base_url: model.baseURL })),
     effort: {
       label: () => effortLabel(d.effort),
       onMenu: anchor => openMenu(anchor, EFFORTS.map(x => ({

@@ -171,6 +171,10 @@ if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
   result $? "e2e reasoning (visible while it is still arriving)"
   node tests/e2e/goal.mjs
   result $? "e2e goal (a command that never becomes a turn)"
+  node tests/e2e/model.mjs
+  result $? "e2e model (two gateways selling one model under one name)"
+  node tests/e2e/sidebar.mjs
+  result $? "e2e sidebar (one section per directory per machine)"
 else
   echo "   skip  e2e -- npm install && npx playwright install chromium"
 fi

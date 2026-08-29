@@ -1083,6 +1083,13 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
 .section-head-title {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* Which machine the directory is on, shown only when more than one server is
+   connected. Smaller and dimmer, and last in the line, so the ellipsis takes
+   it before it takes the name you were looking for. */
+.section-head-machine {
+  margin-left: 6px;
+  font-size: 11px; color: var(--text-3);
+}
 
 /* ---------- footer ---------- */
 
@@ -1195,7 +1202,7 @@ body.sidebar-hidden [data-component=content-pane-top-bar] {
 .composer-controls-left {
   display: flex; align-items: center; gap: 4px; min-width: 0;
 }
-.model-trigger { max-width: 220px; color: var(--text-2); }
+.model-trigger { max-width: 260px; color: var(--text-2); }
 .model-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- new session ---------- */
