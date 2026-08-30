@@ -182,25 +182,6 @@ reads; anything else — an archive, a video, a 40 MB png — is pushed to the
 server and the message carries the path the agent can open. Attachments are
 capped at 50 MB.
 
-## From a phone
-
-The renderer is a plain web page and the daemon can serve it, so a phone
-reaches a session with the laptop shut — which is the point of the work living
-on the server in the first place. Below 760px the sidebar becomes an overlay
-over the transcript, picking a session puts it away, and the controls a desktop
-only reveals on hover are simply always there.
-
-Reaching it takes a reverse proxy in front of the daemon, because the daemon
-binds loopback and should stay that way. One command writes the configuration:
-
-```
-scripts/web-gateway.cjs caden.example.net
-```
-
-[docs/WEB.md](docs/WEB.md) has the whole arrangement — what runs where, the
-nginx setting that will otherwise hang your event stream, what the console
-stops offering when its host cannot do it, and where your API keys end up.
-
 ## Layout
 
 ```
@@ -221,12 +202,10 @@ server/supervise.sh    crash/reboot supervision: systemd user service or cron wa
 scripts/               build-app.sh, provision.sh, dev-seed.sh, screenshots.mjs,
                        release-notes.sh (the notes a release carries, from CHANGELOG.md)
 tests/                 run-all.sh, the client suite and the offline-install suite
-docs/ARCHITECTURE.md   how the pieces fit, and the event vocabulary
-docs/API.md            the daemon's HTTP surface
-docs/GOALS.md          working toward an objective across turns
+docs/ARCHITECTURE.md   how the pieces fit: sessions, engines, goals, the event
+                       vocabulary, and the daemon's HTTP surface
 docs/DESIGN.md         the visual system
 docs/DEVELOPING.md     working on Caden while using Caden: the two installs
-docs/WEB.md            reaching a daemon from a phone, with the Mac switched off
 ```
 
 ## Development

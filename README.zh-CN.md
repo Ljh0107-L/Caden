@@ -150,9 +150,10 @@ server/supervise.sh    崩溃/重启看护：systemd user service 或 cron 看�
 scripts/               build-app.sh、provision.sh、dev-seed.sh、screenshots.mjs、
                        release-notes.sh（release 用的说明，取自 CHANGELOG.md）
 tests/                 run-all.sh、客户端测试套件、离线安装测试套件
-docs/ARCHITECTURE.md   各部分如何拼在一起，以及事件词汇表
-docs/API.md            daemon 的 HTTP 接口
+docs/ARCHITECTURE.md   各部分如何拼在一起：会话、引擎、goal、事件词汇表，
+                       以及 daemon 的 HTTP 接口
 docs/DESIGN.md         视觉系统
+docs/DEVELOPING.md     一边用 Caden 一边改 Caden：两套安装
 ```
 
 ## 开发
