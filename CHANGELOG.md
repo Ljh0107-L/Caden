@@ -1,7 +1,51 @@
 # Changelog
 
-Notable changes per release. Versions follow [semantic versioning](https://semver.org);
-until 1.0 the minor number carries breaking changes.
+Notable changes per release. Versions follow [semantic versioning](https://semver.org).
+Before 1.0 the minor number carried breaking changes; from 1.0 the major one does.
+
+## 1.0.0
+
+Caden is the desktop app and nothing else.
+
+1.0 is not a feature. It is the version where what Caden is stopped moving:
+a console on your Mac, a daemon on each server, and nothing in between that
+needs a third machine, a certificate or a name in DNS. Everything below is
+something taken away.
+
+- **The web gateway is gone.** The nginx site, the TLS certificate, the reverse
+  tunnels each server dialled out to hold open, the pane that set all of it up,
+  the daemon's own console-serving and the password login in front of it. It
+  was the largest thing in the repository that was not the console itself, and
+  it was the one part that needed root on a machine nobody else needed — a
+  second ssh identity, a DNS record, a certificate to keep alive, and four
+  mechanisms to hold a tunnel up because no two hosts have the same one. The
+  cost of that is real and worth saying plainly: **a phone cannot reach a
+  session any more.** The work still lives on the server and still survives the
+  laptop closing; there is simply no longer a supported way to look at it
+  without the Mac.
+- **The capability contract went with it.** `/host/config` declared what the
+  thing serving the page could do — ssh, the keychain, a native file dialog —
+  and the renderer hid the controls the answer said no to. With the gateway
+  gone that contract had exactly one implementation left, `app/server.js`,
+  which is a Mac and can do all of it, so all eleven `can(…)` branches had a
+  dead half each. The two functions that *were* those halves went too.
+- **`tunnelBase` went with it.** The two installs had to keep their gateway
+  loopback ports apart on a machine neither of them owned. There is no such
+  machine now.
+- **Provisioning stops copying the console.** Every run pushed `app/web/` to
+  the server — 340K of renderer and two fonts through a heredoc — for a daemon
+  to serve to a browser. `scripts/provision.sh` stops rsyncing it for the same
+  reason. What still goes up is `heartbeat.py`, `bootstrap.sh`, `supervise.sh`
+  and the provider keys.
+- **Six documents became three.** `docs/WEB.md` went with the feature it
+  described; `API.md` and `GOALS.md` fold into `ARCHITECTURE.md`, which is
+  where somebody reading about the daemon is already standing. `DESIGN.md` and
+  `DEVELOPING.md` stay — one is the spec `styles.css` implements, the other is
+  the two-installs rule.
+
+Roughly 3,500 lines lighter, six test files lighter, and `npm test` covers what
+is left. Nothing changed about sessions, engines, models, goals or the
+transcript: 0.2.5 upgrades to this without touching a session.
 
 ## 0.2.5
 
