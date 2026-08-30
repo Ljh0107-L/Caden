@@ -7,9 +7,7 @@
 
 import { hostConfig, DaemonAPI, sshHosts, addServer, removeServer, installViaHost,
          serverStatus, provision, startTunnel, stopTunnel,
-         pickFiles, attachFile, attachBytes,
-         webStatus, saveWebSettings, applyWeb, setWebPassword,
-         logoutBrowsers, connectServerToWeb } from './api.js';
+         pickFiles, attachFile, attachBytes } from './api.js';
 import { Transcript, groupRows, toolVerb, toolBucket, visibleFrom } from './transcript.js';
 import { renderMarkdown } from './markdown.js';
 import { renderDiff, diffFromToolInput } from './diff.js';
@@ -45,7 +43,7 @@ const state = {
   controllers: new Map(),      // sessionId -> controller
   selectedServerId: null,
   selectedSessionId: null,
-  pane: null,                  // 'models' | {sessionDetail: id}
+  pane: null,                  // 'models' | 'servers'
   sidebarOpen: !NARROW.matches,   // a phone opens on the content, not the list
   // Archived starts folded: it is where sessions go to stop taking up room.
   // Held by bucket key, which for Archived is the one that is not per-server.
@@ -58,18 +56,7 @@ const state = {
   draft: { cwd: '', modelId: null, permissionMode: '', permissionModeChosen: false },
   editing: false,          // an inline editor owns the keyboard right now
   sidebarStale: false,     // a repaint was skipped while it did
-  web: null,               // the gateway's settings and state, once fetched
-  webBusy: null,           // what applying it is doing right now
 };
-
-/// What the thing serving this page can do on our behalf.
-///
-/// The Mac app's host server can reach ssh, the filesystem and the keychain,
-/// so it offers to add servers, provision them and open forwards. A console
-/// served by a daemon behind a reverse proxy can do none of that, and says so
-/// by declaring nothing. Absent means none, deliberately: a hand-written
-/// config for that arrangement should not have to know the list to be safe.
-const can = name => !!(state.config.capabilities || {})[name];
 
 const $sidebar = document.getElementById('sidebar');
 const $main = document.getElementById('main');
@@ -635,23 +622,8 @@ function select(sessionId, serverId) {
 function openPane(pane) {
   state.pane = pane;
   dismissOverlaySidebar();
-  if (pane === 'web') {
-    state.web = null;                       // so the pane paints "checking…"
-    // The settings and the server list are already on this machine; only the
-    // ticks beside them need asking. Draw what is known first, then fill the
-    // answers in -- waiting for the slowest check before drawing anything is
-    // what made the pane look broken rather than busy.
-    webStatus({ quick: true })
-      .then(w => { if (state.pane === 'web' && !state.web?.probed) {
-                     state.web = w; renderWebPane(); } })
-      .catch(() => {});
-    webStatus().then(w => { state.web = w; renderWebPane(); })
-               .catch(e => { state.web = { error: String(e.message || e) };
-                             renderWebPane(); });
-  }
   if (pane === 'servers') {
-    if (can('servers'))
-      sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
+    sshHosts().then(hosts => { state.sshHosts = hosts; renderServersPane(); }).catch(() => {});
     for (const p of state.config.servers) checkServer(p.id);
   }
   renderSidebar();
@@ -734,18 +706,8 @@ function renderSidebar() {
   fillRow(rows[2], { label: 'Models', icon: 'robot',
                      active: state.pane === 'models',
                      onClick: () => openPane('models') });
-  // Setting a gateway up is ssh and root on somebody else's machine, so it
-  // belongs to the Mac. Served from a daemon there is nothing to configure
-  // and the row would only lead somewhere that says so.
-  if (can('servers')) {
-    fillRow(rows[3], { label: 'Web', icon: 'server',
-                       active: state.pane === 'web',
-                       onClick: () => openPane('web') });
-  } else {
-    rows[3]?.remove();
-  }
   // Only the first row carries a shortcut badge.
-  for (const r of [rows[1], rows[2], rows[3]])
+  for (const r of [rows[1], rows[2]])
     r?.querySelectorAll('.nav-row-end').forEach(n => n.replaceChildren());
 
   const content = el('div', { class: cls('contentCls'), id: 'server-list' });
@@ -1044,7 +1006,6 @@ function renderMain() {
     c.rowNodes = null;
   }
 
-  if (state.pane === 'web') { renderWebPane(); return; }
   if (state.pane === 'models') { renderModelsPane(); return; }
   if (state.pane === 'servers') { renderServersPane(); return; }
   if (state.pane?.sessionDetail) {
@@ -2296,11 +2257,6 @@ function buildStatusRow(ctl, entry, onToggleContext) {
 /// up carrying is a path the agent can open, not a blob the model has to be
 /// handed.
 async function attachFiles(entry, prompt, plus) {
-  // No native panel here: raise the browser's own, and send bytes rather than
-  // paths. Same destination -- the daemon's upload endpoint is what the Mac
-  // route ends up calling too -- so what lands in the message is identical.
-  if (!can('filePicker')) return attachFromBrowser(entry, prompt, plus);
-
   let files;
   try {
     files = await pickFiles();
@@ -2326,46 +2282,6 @@ async function attachFiles(entry, prompt, plus) {
 }
 
 /// The + button where there is no native panel to raise.
-///
-/// A browser gives bytes and a name, never a path, which is the same hand the
-/// paste path is dealt -- so this walks the same road, straight at the
-/// daemon. The input is created per click and dropped afterwards: a hidden
-/// one parked in the DOM keeps its last selection, and picking the same file
-/// twice in a row then fires no change event at all.
-function attachFromBrowser(entry, prompt, plus) {
-  return new Promise(resolve => {
-    const input = el('input', { type: 'file', multiple: true,
-                                style: 'display:none' });
-    input.addEventListener('change', async () => {
-      const files = [...input.files];
-      input.remove();
-      if (!files.length) return resolve();
-      const was = plus?.title;
-      if (plus) { plus.disabled = true; plus.title = 'Attaching…'; }
-      for (const file of files) {
-        prompt.insert(`[uploading ${file.name}…]`);
-        try {
-          const got = await entry.api.attachLocalFile(file);
-          if (got.kind === 'image') {
-            prompt.replace(`[uploading ${file.name}…]`, '');
-            prompt.attach(got);
-          } else {
-            prompt.replace(`[uploading ${file.name}…]`, got.path);
-          }
-        } catch (e) {
-          prompt.replace(`[uploading ${file.name}…]`,
-                         `[could not attach ${file.name}: ${e.message || e}]`);
-        }
-      }
-      if (plus) { plus.disabled = false; plus.title = was || ''; }
-      prompt.focus();
-      resolve();
-    }, { once: true });
-    document.body.append(input);
-    input.click();
-  });
-}
-
 /// A non-image pasted straight out of Finder: the renderer can read its bytes
 /// but not its path, so the bytes are what gets pushed to the server.
 async function uploadPastedFile(entry, prompt, file, name) {
@@ -3001,47 +2917,10 @@ function defaultPermissionFor(entry) {
   return entry?.facts?.root ? 'acceptEdits' : want;
 }
 
-/// The same report, assembled from the daemon instead of from a host.
-///
-/// /host/servers/<id>/status is the Mac answering questions it is uniquely
-/// able to answer -- is the forward up, does the keychain have a token. None
-/// of that exists behind a proxy, but most of what the pane shows does: the
-/// daemon knows its own version and which engines it has, and the fact that it
-/// answered at all is the liveness the host was reporting second-hand.
-///
-/// A forward is not a thing here, so `tunnel` is absent rather than false, and
-/// nothing offers to close one. The token is the proxy's business and it
-/// clearly worked, or none of this would have come back.
-async function statusFromDaemon(entry) {
-  const [health, engines] = await Promise.all([
-    entry.api.health(),
-    entry.api.engines({ latest: true }).catch(() => null),
-  ]);
-  return {
-    daemon: true,
-    token: true,
-    // Claude Code will not run Full access here, so the composer must not
-    // offer it as the default it never asked anyone about.
-    root: !!health?.root,
-    daemonVersion: health?.version || null,
-    daemonRevision: health?.revision || null,
-    engines: {
-      claude: engines?.engines?.claude || { installed: false },
-      codex: engines?.engines?.codex || { installed: false },
-    },
-    arch: engines?.arch,
-    libc: engines?.libc,
-    ready: !!(engines?.engines?.claude?.installed
-              || engines?.engines?.codex?.installed),
-  };
-}
 
 async function checkServer(id, { attempt = 0 } = {}) {
-  const entry = state.servers.get(id);
   try {
-    state.serverStatus.set(id, can('servers') || !entry
-      ? await serverStatus(id)
-      : await statusFromDaemon(entry));
+    state.serverStatus.set(id, await serverStatus(id));
   } catch (e) { state.serverStatus.set(id, { error: String(e.message || e) }); }
   renderServersPane();
 
@@ -3185,9 +3064,9 @@ function serverSection(profile) {
     // Both of these are ssh from this Mac. Without it the row still reports
     // what it found -- which is the useful half -- but offers nothing it
     // cannot do.
-    if (needsWork && can('provisioning'))
+    if (needsWork)
       acts.append(srvBtn('Set up', () => setUpServer(profile)));
-    else if (tunnelMode && !needsWork && can('tunnels'))
+    else if (tunnelMode && !needsWork)
       acts.append(srvBtn('Close forward', async () => {
         await stopTunnel(profile.id); await checkServer(profile.id);
       }));
@@ -3199,25 +3078,21 @@ function serverSection(profile) {
           if (entry) await connectServer(entry);
           await checkServer(profile.id);
         } },
-      ...(can('provisioning')
-        ? [{ label: 'Upgrade the daemon',
-             action: () => setUpServer(profile, { restart: true }) }]
-        : []),
+      { label: 'Upgrade the daemon',
+        action: () => setUpServer(profile, { restart: true }) },
       // The row's button disappears once an engine is current; reinstalling is
       // still worth reaching for -- a broken install, or taking over a copy
       // that lives outside Caden.
       { label: 'Reinstall Claude Code', action: () => installEngineOn(profile, 'claude') },
       { label: 'Reinstall Codex', action: () => installEngineOn(profile, 'codex') },
-      ...(can('servers')
-        ? ['-',
-           { label: 'Remove server', action: async () => {
-               await removeServer(profile.id);
-               state.serverStatus.delete(profile.id);
-               await reloadServers();
-               state.sshHosts = await sshHosts();
-               renderServersPane();
-             } }]
-        : []),
+      '-',
+      { label: 'Remove server', action: async () => {
+          await removeServer(profile.id);
+          state.serverStatus.delete(profile.id);
+          await reloadServers();
+          state.sshHosts = await sshHosts();
+          renderServersPane();
+        } },
     ]);
     acts.append(more);
   }
@@ -3357,250 +3232,15 @@ function renderServersPane() {
     el('div', { class: 'pane-intro' },
       el('div', { class: 'pane-intro-title' }, 'Servers'),
       el('div', { class: 'pane-intro-sub' },
-        // Two different truths. Told from the desktop app this pane is where
-        // servers get added and set up; served from a daemon behind a proxy
-        // none of that is on offer, and describing it anyway sends someone
-        // hunting for a button that was deliberately not drawn.
-        can('servers')
-          ? 'A server runs the agents. Add one, install the daemon over ssh, and '
-            + 'Caden reaches it through a local forward.'
-          : 'A server runs the agents. This console reaches them through the '
-            + 'proxy that served it; adding and setting up servers is done '
-            + 'from the desktop app.')));
+        'A server runs the agents. Add one, install the daemon over ssh, and '
+        + 'Caden reaches it through a local forward.')));
 
   for (const profile of state.config.servers) body.append(serverSection(profile));
-  if (can('servers')) body.append(sshHostSection());
+  body.append(sshHostSection());
 
   paintPane('Servers',
     el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
       body));
-}
-
-// ---------------------------------------------------------------- web pane
-//
-// The gateway is a reverse proxy in front of a daemon, and setting one up is
-// four fiddly things -- a certificate, a password, an nginx block carrying a
-// 44-character token, a ban rule -- of which exactly one is interesting. The
-// pane does them; what it asks for is the three facts only a person knows.
-
-function webField(label, value, hint, onPick) {
-  const btn = el('button', { class: 'srv-btn', type: 'button' },
-                 value || 'choose…');
-  btn.addEventListener('click', e => onPick(e.currentTarget));
-  return srvLine(value ? 'ok' : 'none', label, hint || '', btn);
-}
-
-async function webSet(patch) {
-  state.web = { ...state.web, ...await saveWebSettings(patch) };
-  renderWebPane();
-  webStatus().then(w => { state.web = w; renderWebPane(); }).catch(() => {});
-}
-
-function renderWebPane() {
-  if (state.pane !== 'web') return;
-  const w = state.web;
-  const body = el('div', { class: 'models-pane' },
-    el('div', { class: 'pane-intro' },
-      el('div', { class: 'pane-intro-title' }, 'Web'),
-      el('div', { class: 'pane-intro-sub' },
-        'Reach a server from a phone, with this Mac switched off. A proxy in '
-        + 'front of the daemon holds the certificate and asks for the '
-        + 'password.')));
-
-  if (!w) {
-    body.append(el('div', { class: 'prov-card' }, srvLine('busy', 'Checking…', '')));
-    return paintPane('Web',
-      el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
-         body));
-  }
-  if (w.error) {
-    body.append(el('div', { class: 'prov-card' }, el('div', { class: 'srv-error' }, w.error)));
-    return paintPane('Web',
-      el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
-         body));
-  }
-
-  // -- the three facts only a person knows -----------------------------
-  const setup = el('div', { class: 'prov-card' });
-  const hostInput = el('input', { class: 'inline-edit mono', spellcheck: 'false',
-                                  placeholder: 'caden.example.net',
-                                  style: 'min-width:180px' });
-  hostInput.value = w.hostname || '';
-  const commit = () => {
-    if ((hostInput.value || '').trim() !== (w.hostname || ''))
-      webSet({ hostname: hostInput.value });
-  };
-  hostInput.addEventListener('blur', commit);
-  hostInput.addEventListener('keydown', e => { if (e.key === 'Enter') hostInput.blur(); });
-  setup.append(srvLine(w.hostname ? 'ok' : 'none', 'Address',
-                       'an A record for it, pointing at the proxy', hostInput));
-
-  setup.append(webField('Proxy runs on', w.gatewayHost,
-    'ssh as somebody who can write /etc/nginx', anchor =>
-      openMenu(anchor, (w.sshHosts || []).map(h => ({
-        label: h, checked: h === w.gatewayHost,
-        action: () => webSet({ gatewayHost: h }),
-      })))));
-
-  const chosen = (w.servers || []).find(s => s.id === w.serverId);
-  setup.append(webField('Console from', chosen && chosen.name,
-    'the daemon whose copy of the console is served', anchor =>
-      openMenu(anchor, (w.servers || []).map(s => ({
-        label: s.name, checked: s.id === w.serverId,
-        action: () => webSet({ serverId: s.id }),
-      })))));
-  body.append(el('div', { class: 'prov-section' },
-    el('div', { class: 'prov-title-row' },
-      el('div', { class: 'prov-id' },
-        el('span', { class: 'prov-name' }, 'Settings'))), setup));
-
-  // -- what is true right now ------------------------------------------
-  const state_ = el('div', { class: 'prov-card' });
-  const busy = state.webBusy;
-  if (busy) {
-    state_.append(srvLine('busy', busy, ''));
-  } else {
-    state_.append(srvLine(w.cert ? 'ok' : 'bad', 'Certificate',
-      w.cert ? `expires ${w.cert}` : 'none yet — applying will ask for one'));
-    state_.append(srvLine(w.passwordSet ? 'ok' : 'bad', 'Password',
-      w.passwordSet ? 'set on the console daemon'
-                    : 'not set — nobody can sign in until it is',
-      srvBtn(w.passwordSet ? 'Change' : 'Set', () => webAskPassword())));
-    const reach = w.reachable;
-    state_.append(srvLine(reach === 302 || reach === 200 ? 'ok' : reach ? 'warn' : 'bad',
-      'Address',
-      reach === 302 ? 'answering, and asking to sign in'
-        : reach === 200 ? 'answering'
-        : reach ? `answering with ${reach}`
-        : w.hostname ? 'no answer' : 'no address yet'));
-    if (w.error) state_.append(el('div', { class: 'srv-error' }, w.error));
-  }
-  const acts = el('div', { class: 'prov-acts' });
-  if (!busy) {
-    acts.append(srvBtn(w.cert ? 'Apply' : 'Set up', () => webApply(), 'accent'));
-    if (w.passwordSet) {
-      acts.append(srvBtn('Sign out all browsers', async () => {
-        try { await logoutBrowsers(); setWebBusy('signed everyone out'); }
-        catch (e) { setWebBusy(String(e.message || e)); }
-        setTimeout(() => setWebBusy(null), 2500);
-      }));
-    }
-  }
-  body.append(el('div', { class: 'prov-section' },
-    el('div', { class: 'prov-title-row' },
-      el('div', { class: 'prov-id' },
-        el('span', { class: 'prov-name' }, 'Gateway'),
-        el('span', { class: 'prov-url' }, w.hostname ? `https://${w.hostname}/` : '')),
-      acts), state_));
-
-  // -- which servers the phone can reach -------------------------------
-  //
-  // Every server this Mac knows is listed; being on the web is a decision
-  // made here, one server at a time. Provisioning used to do it as a parting
-  // errand, which meant setting up a machine reached out to a third host and
-  // a gateway that was down turned into a warning on an operation that had
-  // otherwise gone perfectly. Adding a server and publishing it are different
-  // things to want.
-  const reach = w.reach || {};
-  const rows = el('div', { class: 'prov-card' });
-  const listed = (w.servers || []).filter(s => reach[s.id] !== 'local');
-  if (!listed.length) {
-    rows.append(srvLine('busy', 'No servers yet', 'provision one and it appears here'));
-  }
-  for (const s of listed) {
-    const how = reach[s.id];
-    // Reachable or not. Which of the three things is holding the tunnel open
-    // was drawn here for a while, as a third state for the one that had no
-    // supervisor -- but that rung restarts itself now, so the distinction
-    // stopped being one the reader has to act on, and a row that is up should
-    // look like a row that is up.
-    // `null` is the first pass answering from the config alone: this server
-    // has a tunnel and whether it carries anything has not been asked yet.
-    // Drawing that as "not on the web" would offer an Add button for a server
-    // that is already on it, which is worse than saying nothing for a second.
-    const asking = how == null;
-    const mark = asking ? 'busy'
-               : how === 'gateway' || how === 'tunnel' ? 'ok'
-               : how === 'down' ? 'bad' : 'none';
-    const detail = asking ? 'checking…'
-      : how === 'gateway' ? 'its daemon is on the proxy itself'
-      : how === 'tunnel' ? 'reached through the tunnel it opens'
-      : how === 'down' ? 'has a tunnel, but nothing is answering on it'
-      : 'not on the web — add it here';
-    const act = (asking || how === 'gateway') ? null
-      : srvBtn(how === 'none' ? 'Add' : 'Reconnect',
-               () => webConnect(s.id, s.name),
-               how === 'none' ? 'accent' : undefined);
-    rows.append(srvLine(mark, s.name, detail, act));
-    if (state.webRowError?.id === s.id) {
-      rows.append(el('div', { class: 'srv-error' }, state.webRowError.message));
-    }
-  }
-  body.append(el('div', { class: 'prov-section' },
-    el('div', { class: 'prov-title-row' },
-      el('div', { class: 'prov-id' },
-        el('span', { class: 'prov-name' }, 'Servers on the web'),
-        el('span', { class: 'prov-url' },
-           'each one dials the proxy; the proxy never dials back'))),
-    rows));
-
-  paintPane('Web',
-    el('div', { style: 'max-width:720px;margin:0 auto;padding:8px 32px 48px;width:100%' },
-       body));
-}
-
-async function webConnect(serverId, name) {
-  state.webRowError = null;
-  setWebBusy(`connecting ${name}…`);
-  try {
-    await connectServerToWeb(serverId, text => setWebBusy(`${name}: ${text}`));
-    state.web = await webStatus();
-    setWebBusy(null);
-  } catch (e) {
-    // On its own row. Reported as the pane's error, one server that would not
-    // connect took the address, the gateway and every other server off screen
-    // with it -- and the pane is the place you would go to see whether the
-    // rest of it is still fine.
-    state.webRowError = { id: serverId, message: String(e.message || e) };
-    setWebBusy(null);
-  }
-}
-
-function setWebBusy(text) { state.webBusy = text; renderWebPane(); }
-
-async function webApply() {
-  setWebBusy('starting…');
-  try {
-    await applyWeb(text => setWebBusy(text));
-    state.web = await webStatus();
-    setWebBusy(null);
-  } catch (e) {
-    state.web = { ...state.web, error: String(e.message || e) };
-    setWebBusy(null);
-  }
-}
-
-/// Asked for in the pane rather than typed at a terminal, and sent straight
-/// through -- it is never held in the config or the keychain, because the
-/// only thing that needs it is the daemon it is being set on.
-function webAskPassword() {
-  const row = el('div', { class: 'prov-card' });
-  const input = el('input', { class: 'inline-edit', type: 'password',
-                              placeholder: 'at least 8 characters',
-                              style: 'min-width:200px' });
-  const save = srvBtn('Save', async () => {
-    try {
-      await setWebPassword(input.value);
-      setWebBusy('password set — every browser signed out');
-      state.web = await webStatus();
-    } catch (e) { setWebBusy(String(e.message || e)); }
-    setTimeout(() => setWebBusy(null), 2500);
-  });
-  row.append(srvLine('none', 'New password',
-                     'changing it signs out every browser', el('div', {}, input, save)));
-  const scroll = $main.querySelector('.pane-scroll .models-pane');
-  if (scroll) scroll.append(row);
-  input.focus();
 }
 
 function renderModelsPane() {

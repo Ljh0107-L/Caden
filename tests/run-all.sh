@@ -86,14 +86,6 @@ step "SSH provisioning payload (exact file bytes)"
 node tests/provision-upload_test.cjs
 result $? "provision-upload_test.cjs"
 
-step "removing a server (its tunnel and its port go with it)"
-node tests/web_removal_test.cjs >/dev/null 2>&1
-result $? "web_removal_test.cjs"
-
-step "tunnel launchers (whatever the machine has, and saying when it has none)"
-node tests/tunnel_launcher_test.cjs >/dev/null 2>&1
-result $? "tunnel_launcher_test.cjs"
-
 step "forward identity (a port answering is not the daemon you meant)"
 node tests/forward_identity_test.cjs >/dev/null 2>&1
 result $? "forward_identity_test.cjs"
@@ -117,14 +109,6 @@ result $? "fast_mode_test.py"
 step "provider credentials (key_ref resolved by the daemon, not by a proxy)"
 python3 tests/key_ref_test.py >/dev/null 2>&1
 result $? "key_ref_test.py"
-
-step "signing in to the console (password, cookie, and what next= may not do)"
-python3 tests/web_login_test.py >/dev/null 2>&1
-result $? "web_login_test.py"
-
-step "the console over HTTP (served, cached, and no way out of the web root)"
-python3 tests/console_serving_test.py >/dev/null 2>&1
-result $? "console_serving_test.py"
 
 step "event stream (the terminal event survives the close)"
 python3 tests/stream_close_test.py
@@ -161,8 +145,6 @@ if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
   result $? "e2e (playwright)"
   node tests/e2e/narrow.mjs
   result $? "e2e narrow (phone-sized viewport, touch pointer)"
-  node tests/e2e/gateway.mjs
-  result $? "e2e gateway (served by a proxy, with the Mac switched off)"
   node tests/e2e/viewports.mjs
   result $? "e2e viewports (every width a phone reports, and a desktop)"
   node tests/e2e/fast.mjs

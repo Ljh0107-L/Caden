@@ -83,14 +83,12 @@ const BUILD = {
         svgIcon('layout-sidebar-left', 15)))),
 
   /// The three top-level destinations. app.js relabels them and wires the
-  /// clicks; it no longer has to delete four rows it did not ask for.
+  /// clicks; it no longer has to delete rows it did not ask for.
   navHeader: () => el('div', { class: 'sidebar-header' },
     el('div', { class: 'sidebar-header-body' },
       navRow({ label: 'New session', icon: 'agent', badge: '⌘N' }),
       navRow({ label: 'Servers', icon: 'server' }),
-      navRow({ label: 'Models', icon: 'robot' }),
-      // Only shown where it can do anything -- see can('servers') in app.js.
-      navRow({ label: 'Web', icon: 'server' }))),
+      navRow({ label: 'Models', icon: 'robot' }))),
 
   navRow: () => navRow({ label: '', icon: 'agent' }),
 
