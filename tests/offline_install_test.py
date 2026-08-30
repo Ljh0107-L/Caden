@@ -21,7 +21,32 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
+
+
+def wait_ready(port, timeout=20):
+    """Block until the daemon is answering on `port`.
+
+    Starting it returns as soon as the parent of the double fork exits, which
+    is before the child has bound anything -- so the first request could be
+    refused by a daemon that was seconds away from being fine. It came back as
+    a connection error out of the middle of an upload, which reads like the
+    upload endpoint is broken. Rare enough to look like a flake and often
+    enough to lose a CI run.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/v1/ping" % port, timeout=2) as resp:
+                if resp.status == 200:
+                    return
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(0.1)
+    raise SystemExit("the daemon never answered on port %d" % port)
 
 
 class Client(object):
@@ -192,6 +217,7 @@ def main():
     env = dict(os.environ, CADEN_HOME=home)
     subprocess.check_call([sys.executable, os.path.join(home, "heartbeat.py"),
                            "--port", str(args.port)], env=env)
+    wait_ready(args.port)
     token = subprocess.check_output([sys.executable, os.path.join(home, "heartbeat.py"),
                                      "--print-token"], env=env).decode().strip()
 

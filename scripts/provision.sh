@@ -52,17 +52,10 @@ ssh "$TARGET" "mkdir -p $REMOTE && chmod 700 $REMOTE"
 echo "==> uploading heartbeat.py, bootstrap.sh and supervise.sh"
 scp -q server/heartbeat.py server/bootstrap.sh server/supervise.sh "$TARGET:$REMOTE/"
 
-# The console, so the daemon can serve it to a browser -- and the credentials,
-# so it can resolve a key_ref with no host in front of it to do that for it.
-# The app sends both (app/host.js, buildProvisionScript); a server set up with
-# this script has to end up the same, or "provisioned" means two things.
-echo "==> uploading the console"
-# --no-owner/--no-group: `-a` would carry this Mac's uid across, and 501:staff
-# is nobody on a Linux server. Harmless while the daemon runs as root, wrong
-# the moment it does not.
-rsync -a --no-owner --no-group --delete --exclude '.*' app/web/ "$TARGET:$REMOTE/web/"
-ssh "$TARGET" "chmod 700 $REMOTE/web"
-
+# The credentials, so the daemon can resolve a `key_ref` for itself. The app
+# sends them too (app/host.js, buildProvisionScript); a server set up with this
+# script has to end up the same, or "provisioned" means two things.
+#
 # Piped rather than written to a temp file and copied: these are API keys, and
 # the shortest path is the one that leaves no local copy behind. `null` means
 # the config lists providers and the keychain answered for none of them --

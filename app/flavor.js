@@ -47,15 +47,6 @@ const FLAVORS = {
     // port the development daemon listens on -- and development stops working
     // because of how many servers production happens to have.
     localPortEnd: 7897,
-    // Where tunnel ports on the web gateway start. The same reasoning as
-    // `defaultPort`, one machine further along: both installs can be pointed
-    // at the same gateway, both walk up from their base consulting only their
-    // own config, and the gateway's loopback is the one place they would
-    // otherwise meet. They did -- dev's second server and production's third
-    // both landed on 7903, so whichever tunnel bound it first owned it and the
-    // other console reached a daemon holding a different token. It surfaced as
-    // "bad or missing token" on a server that was running perfectly.
-    tunnelBase: 7901,
     remoteHome: '~/.caden',
   },
   dev: {
@@ -76,7 +67,6 @@ const FLAVORS = {
     // have to be far enough apart that the walk never reaches the other's.
     defaultPort: 7938,
     localPortEnd: 7997,
-    tunnelBase: 8901,
     // A sibling of `~/.caden`, never `~/.caden/dev`. The daemon treats its home
     // as its own: it reports disk usage across the whole tree and creates and
     // clears directories inside it, so a nested development home would be
